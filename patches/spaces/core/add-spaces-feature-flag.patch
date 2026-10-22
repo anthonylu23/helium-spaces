@@ -1,0 +1,108 @@
+Add the HeliumSpaces feature and its chrome://flags entry.
+
+Every helium-spaces feature is gated behind spaces::features::kHeliumSpaces,
+disabled by default, exposed as chrome://flags/#helium-spaces (macOS only).
+helium-spaces flags live in chrome/browser/spaces_flag_entries.h so the hook
+into about_flags.cc stays a single include next to Helium's.
+
+--- a/chrome/browser/BUILD.gn
++++ b/chrome/browser/BUILD.gn
+@@ -1392,6 +1392,7 @@ source_set("core") {
+       "//chrome/browser/ui/read_anything:impl",
+       "//chrome/browser/ui/search",
+       "//chrome/browser/ui/tabs",
++      "//chrome/browser/ui/spaces:features",
+       "//chrome/browser/ui/tabs:features",
+       "//chrome/browser/ui/tabs:tab_strip",
+       "//chrome/browser/ui/toasts",
+--- a/chrome/browser/about_flags.cc
++++ b/chrome/browser/about_flags.cc
+@@ -311,6 +311,7 @@
+ #include "chrome/browser/media/router/media_router_feature.h"
+ #include "chrome/browser/password_manager/password_change/features.h"
+ #include "chrome/browser/ui/tabs/features.h"
++#include "chrome/browser/ui/spaces/spaces_features.h"
+ #include "chrome/browser/web_applications/preinstalled_app_install_features.h"
+ #include "components/component_updater/installer_policies/iwa_key_distribution_component_installer_policy.h"
+ #include "components/user_education/common/user_education_features.h"  // nogncheck
+@@ -5214,6 +5215,7 @@ constexpr char kEnterpriseIsolatedModeIn
+ #include "chrome/browser/existing_switch_flag_choices.h"
+ const FeatureEntry kFeatureEntries[] = {
+ #include "chrome/browser/helium_flag_entries.h"
++#include "chrome/browser/spaces_flag_entries.h"
+ #include "chrome/browser/ungoogled_flag_entries.h"
+ #include "chrome/browser/bromite_flag_entries.h"
+ #include "chrome/browser/ungoogled_platform_flag_entries.h"
+--- /dev/null
++++ b/chrome/browser/spaces_flag_entries.h
+@@ -0,0 +1,14 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++// Included inside kFeatureEntries in about_flags.cc. Keep every helium-spaces
++// flag here so the hook into about_flags.cc stays a single include.
++
++#ifndef CHROME_BROWSER_SPACES_FLAG_ENTRIES_H_
++#define CHROME_BROWSER_SPACES_FLAG_ENTRIES_H_
++    {"helium-spaces", "Helium Spaces",
++     "Enables Arc-style Spaces in the vertical tab sidebar. Work in progress. "
++     "helium-spaces flag.",
++     kOsMac, FEATURE_VALUE_TYPE(spaces::features::kHeliumSpaces)},
++#endif  // CHROME_BROWSER_SPACES_FLAG_ENTRIES_H_
+--- /dev/null
++++ b/chrome/browser/ui/spaces/BUILD.gn
+@@ -0,0 +1,11 @@
++# Copyright 2026 The helium-spaces Authors
++# You can use, redistribute, and/or modify this source code under
++# the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++source_set("features") {
++  sources = [
++    "spaces_features.cc",
++    "spaces_features.h",
++  ]
++  public_deps = [ "//base" ]
++}
+--- /dev/null
++++ b/chrome/browser/ui/spaces/spaces_features.cc
+@@ -0,0 +1,15 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/spaces/spaces_features.h"
++
++namespace spaces::features {
++
++BASE_FEATURE(kHeliumSpaces, "HeliumSpaces", base::FEATURE_DISABLED_BY_DEFAULT);
++
++bool IsSpacesEnabled() {
++  return base::FeatureList::IsEnabled(kHeliumSpaces);
++}
++
++}  // namespace spaces::features
+--- /dev/null
++++ b/chrome/browser/ui/spaces/spaces_features.h
+@@ -0,0 +1,21 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_SPACES_SPACES_FEATURES_H_
++#define CHROME_BROWSER_UI_SPACES_SPACES_FEATURES_H_
++
++#include "base/feature_list.h"
++
++namespace spaces::features {
++
++// Gates every helium-spaces feature: Spaces, per-space isolation, and the tab
++// organization features. Disabled by default until each piece is usable.
++BASE_DECLARE_FEATURE(kHeliumSpaces);
++
++// Whether helium-spaces features should be active in this browser session.
++bool IsSpacesEnabled();
++
++}  // namespace spaces::features
++
++#endif  // CHROME_BROWSER_UI_SPACES_SPACES_FEATURES_H_
