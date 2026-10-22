@@ -29,3 +29,4 @@ helium/macos/fix-history-swiper-lifetime.patch
 # Keep this block last. See docs/spaces/development.md.
 spaces/tooling/ts-ignore-out-of-tree-definitions.patch
 spaces/core/add-spaces-feature-flag.patch
+spaces/core/add-space-registry.patch

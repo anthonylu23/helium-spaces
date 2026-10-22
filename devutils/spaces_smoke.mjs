@@ -1,8 +1,12 @@
 // Headless smoke test for a helium-spaces dev build.
 // Usage: node --experimental-websocket devutils/spaces_smoke.mjs [path/to/Helium.app]
 //        (the flag is only needed on Node 20/21)
-// Launches the build with a throwaway profile, then checks over the DevTools
-// protocol that the helium-spaces flag is registered in chrome://flags.
+// Launches the build with throwaway profiles and checks it over the DevTools
+// protocol and the profile's Preferences file:
+//   1. Flag off: the helium-spaces flag is registered and off by default, and
+//      no spaces are written.
+//   2. Flag on: the profile gets exactly one default space.
+//   3. Flag on, same profile: the default space keeps its id.
 // Needs a global WebSocket: Node 22+, or Node 20.10+ with --experimental-websocket.
 // Exits non-zero on any failed check.
 
@@ -12,23 +16,13 @@ if (typeof WebSocket === 'undefined') {
 }
 
 import { spawn } from 'node:child_process';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 
 const app = resolve(process.argv[2] ?? 'build/src/out/Default/Helium.app');
 const binary = join(app, 'Contents/MacOS/Helium');
-const port = 9300 + Math.floor(Math.random() * 500);
-const profile = mkdtempSync(join(tmpdir(), 'spaces-smoke-'));
-
-const browser = spawn(binary, [
-  '--headless=new',
-  `--remote-debugging-port=${port}`,
-  `--user-data-dir=${profile}`,
-  '--use-mock-keychain',
-  '--no-first-run',
-  'about:blank',
-], { stdio: 'ignore' });
+const profiles = [];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
@@ -37,7 +31,13 @@ const check = (name, ok, detail = '') => {
   if (!ok) failures++;
 };
 
-async function devtoolsTarget() {
+function newProfile() {
+  const dir = mkdtempSync(join(tmpdir(), 'spaces-smoke-'));
+  profiles.push(dir);
+  return dir;
+}
+
+async function devtoolsTarget(port) {
   for (let i = 0; i < 60; i++) {
     try {
       const res = await fetch(`http://127.0.0.1:${port}/json/list`);
@@ -67,6 +67,43 @@ function session(wsUrl) {
   return { send, close: () => ws.close() };
 }
 
+// Starts the browser on `profile` and returns a DevTools session for its page,
+// plus close(), which shuts down cleanly so prefs get written to disk.
+async function launch(profile, extraArgs = []) {
+  const port = 9300 + Math.floor(Math.random() * 500);
+  const browser = spawn(binary, [
+    '--headless=new',
+    `--remote-debugging-port=${port}`,
+    `--user-data-dir=${profile}`,
+    '--use-mock-keychain',
+    '--no-first-run',
+    ...extraArgs,
+    'about:blank',
+  ], { stdio: 'ignore' });
+  const exited = new Promise((r) => browser.once('exit', r));
+  try {
+    const cdp = session((await devtoolsTarget(port)).webSocketDebuggerUrl);
+    const close = async () => {
+      // Browser.close shuts down gracefully; never answers, so don't await it.
+      cdp.send('Browser.close');
+      const timedOut = await Promise.race([exited.then(() => false), sleep(15000).then(() => true)]);
+      if (timedOut) browser.kill('SIGKILL');
+      cdp.close();
+    };
+    return { cdp, close };
+  } catch (err) {
+    browser.kill('SIGKILL');
+    throw err;
+  }
+}
+
+// The profile's saved spaces, or undefined if none were written.
+function savedSpaces(profile) {
+  const file = join(profile, 'Default', 'Preferences');
+  if (!existsSync(file)) return undefined;
+  return JSON.parse(readFileSync(file, 'utf8')).helium_spaces?.spaces;
+}
+
 // Finds the <flags-experiment> for `internalName` in chrome://flags (piercing
 // shadow roots) and returns {text, selected} as JSON, or null. The element
 // renders inside its own shadow root, so read text from there.
@@ -89,9 +126,9 @@ const findFlag = (internalName) => `(() => {
   });
 })()`;
 
-try {
-  const target = await devtoolsTarget();
-  const cdp = session(target.webSocketDebuggerUrl);
+async function checkFlagOff() {
+  const profile = newProfile();
+  const { cdp, close } = await launch(profile);
 
   const version = await cdp.send('Browser.getVersion');
   const product = version.result?.product ?? '';
@@ -109,13 +146,35 @@ try {
   check('flag is titled "Helium Spaces"', !!flag && flag.text.includes('Helium Spaces'));
   // Helium labels the default choice with the feature's default state.
   check('flag is off by default on a fresh profile', flag?.selected === 'Default (Disabled)', `selected: ${flag?.selected}`);
-  cdp.close();
+
+  await close();
+  check('flag off: no spaces are saved', savedSpaces(profile) === undefined);
+}
+
+async function checkDefaultSpace() {
+  const profile = newProfile();
+  const enable = ['--enable-features=HeliumSpaces'];
+
+  await (await launch(profile, enable)).close();
+  const first = savedSpaces(profile) ?? [];
+  const defaults = first.filter((s) => s.default);
+  check('flag on: profile gets exactly one space, the default', first.length === 1 && defaults.length === 1,
+        JSON.stringify(first));
+
+  await (await launch(profile, enable)).close();
+  const second = savedSpaces(profile) ?? [];
+  check('default space keeps its id across a restart',
+        defaults.length === 1 && second.length === 1 && second[0].id === defaults[0].id,
+        `${defaults[0]?.id} -> ${second[0]?.id}`);
+}
+
+try {
+  await checkFlagOff();
+  await checkDefaultSpace();
 } catch (err) {
   check('smoke run', false, err.message);
 } finally {
-  browser.kill();
-  await sleep(500);
-  rmSync(profile, { recursive: true, force: true });
+  for (const dir of profiles) rmSync(dir, { recursive: true, force: true });
 }
 
 console.log(failures ? `${failures} check(s) failed` : 'all checks passed');

@@ -1,0 +1,938 @@
+Add SpaceRegistry, the per-profile list of spaces.
+
+A Space is a named, colored set of tabs. SpaceRegistry keeps the profile's
+spaces in the helium_spaces.spaces list pref, always with exactly one
+permanent default space. No UI yet; nothing reads it until tabs carry a space
+id.
+
+The list rules live in SpaceList, which has no Profile or prefs dependency,
+and are tested by the new spaces_unittests target. The service is created with
+the profile when HeliumSpaces is enabled, and never for incognito, guest or
+system profiles. Its prefs are registered by the factory, so the only hook is
+registering the factory.
+
+--- a/chrome/browser/profiles/BUILD.gn
++++ b/chrome/browser/profiles/BUILD.gn
+@@ -941,6 +941,7 @@ source_set("profiles_extra_parts_impl")
+       "//chrome/browser/ui/media_router",
+       "//chrome/browser/ui/performance_controls",
+       "//chrome/browser/ui/read_anything",
++      "//chrome/browser/ui/spaces",
+       "//chrome/browser/ui/tabs/saved_tab_groups",
+       "//chrome/browser/ui/views/profiles:avatar_toolbar_button",
+       "//chrome/browser/ui/views/side_panel",
+--- a/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
++++ b/chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc
+@@ -662,6 +662,10 @@
+ #include "chrome/browser/net/nss_service_factory.h"
+ #endif
+ 
++#if !BUILDFLAG(IS_ANDROID)
++#include "chrome/browser/ui/spaces/space_registry_factory.h"
++#endif
++
+ void AddProfilesExtraParts(ChromeBrowserMainParts* main_parts) {
+   main_parts->AddParts(std::make_unique<ChromeBrowserMainExtraPartsProfiles>());
+ }
+@@ -1586,6 +1590,9 @@ void ChromeBrowserMainExtraPartsProfiles
+ 
+   WebDataServiceFactory::GetInstance();
+   webrtc_event_logging::WebRtcEventLogManagerKeyedServiceFactory::GetInstance();
++#if !BUILDFLAG(IS_ANDROID)
++  spaces::SpaceRegistryFactory::GetInstance();
++#endif
+ }
+ 
+ void ChromeBrowserMainExtraPartsProfiles::PreProfileInit() {
+--- a/chrome/browser/ui/spaces/BUILD.gn
++++ b/chrome/browser/ui/spaces/BUILD.gn
+@@ -2,6 +2,8 @@
+ # You can use, redistribute, and/or modify this source code under
+ # the terms of the GPL-3.0 license that can be found in the LICENSE file.
+ 
++import("//testing/test.gni")
++
+ source_set("features") {
+   sources = [
+     "spaces_features.cc",
+@@ -9,3 +11,52 @@ source_set("features") {
+   ]
+   public_deps = [ "//base" ]
+ }
++
++# Plain data and list rules. No Profile, prefs or UI dependencies, so it can be
++# tested by spaces_unittests without the rest of the browser.
++source_set("model") {
++  sources = [
++    "space.cc",
++    "space.h",
++    "space_list.cc",
++    "space_list.h",
++  ]
++  public_deps = [
++    "//base",
++    "//components/tab_groups",
++  ]
++}
++
++# The per-profile SpaceRegistry service. Depends only on modularized targets,
++# never on //chrome/browser or //chrome/browser/ui, so those can depend on it.
++source_set("spaces") {
++  sources = [
++    "space_registry.cc",
++    "space_registry.h",
++    "space_registry_factory.cc",
++    "space_registry_factory.h",
++  ]
++  public_deps = [
++    ":features",
++    ":model",
++    "//base",
++    "//components/keyed_service/core",
++  ]
++  deps = [
++    "//chrome/browser/profiles:profile",
++    "//components/pref_registry",
++    "//components/prefs",
++  ]
++}
++
++# The tarball we build from ships without Chromium's test data, so unit_tests
++# and browser_tests can't build. This target only needs gtest.
++test("spaces_unittests") {
++  sources = [ "space_list_unittest.cc" ]
++  deps = [
++    ":model",
++    "//base/test:run_all_unittests",
++    "//base/test:test_support",
++    "//testing/gtest",
++  ]
++}
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space.cc
+@@ -0,0 +1,84 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/spaces/space.h"
++
++#include <utility>
++
++#include "base/json/values_util.h"
++
++namespace spaces {
++
++namespace {
++
++constexpr char kIdKey[] = "id";
++constexpr char kNameKey[] = "name";
++constexpr char kColorKey[] = "color";
++constexpr char kIconKey[] = "icon";
++constexpr char kIsolationKey[] = "isolation";
++constexpr char kPartitionKey[] = "partition";
++constexpr char kLastActiveKey[] = "last_active";
++constexpr char kDefaultKey[] = "default";
++
++}  // namespace
++
++Space::Space() = default;
++Space::Space(const Space&) = default;
++Space& Space::operator=(const Space&) = default;
++Space::Space(Space&&) = default;
++Space& Space::operator=(Space&&) = default;
++Space::~Space() = default;
++
++// static
++std::optional<Space> Space::FromValue(const base::DictValue& value) {
++  const std::string* id = value.FindString(kIdKey);
++  if (!id) {
++    return std::nullopt;
++  }
++  Space space;
++  space.id = base::Uuid::ParseLowercase(*id);
++  if (!space.id.is_valid()) {
++    return std::nullopt;
++  }
++
++  if (const std::string* name = value.FindString(kNameKey)) {
++    space.name = *name;
++  }
++  if (std::optional<int> color = value.FindInt(kColorKey);
++      color && *color >= 0 &&
++      *color < std::to_underlying(tab_groups::TabGroupColorId::kNumEntries)) {
++    space.color = static_cast<tab_groups::TabGroupColorId>(*color);
++  }
++  if (const std::string* icon = value.FindString(kIconKey)) {
++    space.icon = *icon;
++  }
++  if (std::optional<int> isolation = value.FindInt(kIsolationKey);
++      isolation && *isolation >= 0 &&
++      *isolation <= std::to_underlying(SpaceIsolation::kMaxValue)) {
++    space.isolation = static_cast<SpaceIsolation>(*isolation);
++  }
++  if (const std::string* partition = value.FindString(kPartitionKey)) {
++    space.partition = *partition;
++  }
++  if (const base::Value* last_active = value.Find(kLastActiveKey)) {
++    space.last_active = base::ValueToTime(*last_active).value_or(base::Time());
++  }
++  space.is_default = value.FindBool(kDefaultKey).value_or(false);
++  return space;
++}
++
++base::DictValue Space::ToValue() const {
++  base::DictValue value;
++  value.Set(kIdKey, id.AsLowercaseString());
++  value.Set(kNameKey, name);
++  value.Set(kColorKey, std::to_underlying(color));
++  value.Set(kIconKey, icon);
++  value.Set(kIsolationKey, std::to_underlying(isolation));
++  value.Set(kPartitionKey, partition);
++  value.Set(kLastActiveKey, base::TimeToValue(last_active));
++  value.Set(kDefaultKey, is_default);
++  return value;
++}
++
++}  // namespace spaces
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space.h
+@@ -0,0 +1,63 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_SPACES_SPACE_H_
++#define CHROME_BROWSER_UI_SPACES_SPACE_H_
++
++#include <optional>
++#include <string>
++
++#include "base/time/time.h"
++#include "base/uuid.h"
++#include "base/values.h"
++#include "components/tab_groups/tab_group_color.h"
++
++namespace spaces {
++
++// How a space's tabs are kept apart from other spaces' tabs. Persisted as an
++// int; never renumber.
++enum class SpaceIsolation {
++  // Shares the profile's default storage partition.
++  kNone = 0,
++  // Uses its own StoragePartition: cookies, cache and site storage.
++  kPartition = 1,
++  // Belongs to a separate Profile. Reserved, not implemented yet.
++  kProfile = 2,
++  kMaxValue = kProfile,
++};
++
++// A named, colored set of tabs. Tabs refer to a space by `id`.
++struct Space {
++  Space();
++  Space(const Space&);
++  Space& operator=(const Space&);
++  Space(Space&&);
++  Space& operator=(Space&&);
++  ~Space();
++
++  // Parses a space written by ToValue(). Returns nullopt if the id is missing
++  // or invalid. Other missing or invalid fields get their defaults.
++  static std::optional<Space> FromValue(const base::DictValue& value);
++  base::DictValue ToValue() const;
++
++  friend bool operator==(const Space&, const Space&) = default;
++
++  // Unique across profiles, so a space can later move to another profile.
++  base::Uuid id;
++  std::string name;
++  tab_groups::TabGroupColorId color = tab_groups::TabGroupColorId::kGrey;
++  // An emoji or symbol name shown in the switcher. Empty means none.
++  std::string icon;
++  SpaceIsolation isolation = SpaceIsolation::kNone;
++  // StoragePartition name. Only used with SpaceIsolation::kPartition.
++  std::string partition;
++  base::Time last_active;
++  // The profile's permanent space. Tabs with no space id, or with the id of a
++  // removed space, belong to it.
++  bool is_default = false;
++};
++
++}  // namespace spaces
++
++#endif  // CHROME_BROWSER_UI_SPACES_SPACE_H_
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_list.cc
+@@ -0,0 +1,138 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/spaces/space_list.h"
++
++#include <algorithm>
++#include <iterator>
++#include <optional>
++#include <set>
++#include <utility>
++
++#include "base/check.h"
++
++namespace spaces {
++
++namespace {
++
++Space NewSpace(std::string name,
++               tab_groups::TabGroupColorId color,
++               std::string icon) {
++  Space space;
++  space.id = base::Uuid::GenerateRandomV4();
++  space.name = std::move(name);
++  space.color = color;
++  space.icon = std::move(icon);
++  return space;
++}
++
++Space NewDefaultSpace() {
++  Space space =
++      NewSpace(kDefaultSpaceName, tab_groups::TabGroupColorId::kGrey, "");
++  space.is_default = true;
++  return space;
++}
++
++}  // namespace
++
++SpaceList::SpaceList() : spaces_({NewDefaultSpace()}) {}
++SpaceList::SpaceList(std::vector<Space> spaces) : spaces_(std::move(spaces)) {}
++SpaceList::SpaceList(const SpaceList&) = default;
++SpaceList& SpaceList::operator=(const SpaceList&) = default;
++SpaceList::SpaceList(SpaceList&&) = default;
++SpaceList& SpaceList::operator=(SpaceList&&) = default;
++SpaceList::~SpaceList() = default;
++
++// static
++SpaceList SpaceList::FromValue(const base::ListValue& value) {
++  std::vector<Space> spaces;
++  std::set<std::string> seen_ids;
++  bool has_default = false;
++  for (const base::Value& entry : value) {
++    const base::DictValue* dict = entry.GetIfDict();
++    if (!dict) {
++      continue;
++    }
++    std::optional<Space> space = Space::FromValue(*dict);
++    if (!space || !seen_ids.insert(space->id.AsLowercaseString()).second) {
++      continue;
++    }
++    if (space->is_default) {
++      space->is_default = !has_default;
++      has_default = true;
++    }
++    spaces.push_back(std::move(*space));
++  }
++  if (!has_default) {
++    spaces.insert(spaces.begin(), NewDefaultSpace());
++  }
++  return SpaceList(std::move(spaces));
++}
++
++base::ListValue SpaceList::ToValue() const {
++  base::ListValue value;
++  for (const Space& space : spaces_) {
++    value.Append(space.ToValue());
++  }
++  return value;
++}
++
++const Space* SpaceList::Find(const base::Uuid& id) const {
++  auto it = std::ranges::find(spaces_, id, &Space::id);
++  return it == spaces_.end() ? nullptr : &*it;
++}
++
++const Space& SpaceList::default_space() const {
++  auto it = std::ranges::find_if(spaces_, &Space::is_default);
++  CHECK(it != spaces_.end());
++  return *it;
++}
++
++const Space& SpaceList::Add(std::string name,
++                            tab_groups::TabGroupColorId color,
++                            std::string icon) {
++  spaces_.push_back(NewSpace(std::move(name), color, std::move(icon)));
++  return spaces_.back();
++}
++
++bool SpaceList::Update(const Space& space) {
++  auto it = FindIterator(space.id);
++  if (it == spaces_.end()) {
++    return false;
++  }
++  const bool is_default = it->is_default;
++  *it = space;
++  it->is_default = is_default;
++  return true;
++}
++
++bool SpaceList::Remove(const base::Uuid& id) {
++  auto it = FindIterator(id);
++  if (it == spaces_.end() || it->is_default) {
++    return false;
++  }
++  spaces_.erase(it);
++  return true;
++}
++
++bool SpaceList::Move(const base::Uuid& id, size_t index) {
++  auto it = FindIterator(id);
++  if (it == spaces_.end()) {
++    return false;
++  }
++  const size_t from = std::distance(spaces_.begin(), it);
++  const size_t to = std::min(index, spaces_.size() - 1);
++  if (from < to) {
++    std::rotate(it, it + 1, spaces_.begin() + to + 1);
++  } else if (from > to) {
++    std::rotate(spaces_.begin() + to, it, it + 1);
++  }
++  return true;
++}
++
++std::vector<Space>::iterator SpaceList::FindIterator(const base::Uuid& id) {
++  return std::ranges::find(spaces_, id, &Space::id);
++}
++
++}  // namespace spaces
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_list.h
+@@ -0,0 +1,70 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_SPACES_SPACE_LIST_H_
++#define CHROME_BROWSER_UI_SPACES_SPACE_LIST_H_
++
++#include <string>
++#include <vector>
++
++#include "base/uuid.h"
++#include "base/values.h"
++#include "chrome/browser/ui/spaces/space.h"
++#include "components/tab_groups/tab_group_color.h"
++
++namespace spaces {
++
++// Name given to a new default space. Not localized; strings arrive with the UI.
++inline constexpr char kDefaultSpaceName[] = "Default";
++
++// The ordered spaces of one profile, and the rules that keep them valid: ids
++// are unique and exactly one space is the default. Order is list position.
++class SpaceList {
++ public:
++  // A list holding only a new default space.
++  SpaceList();
++  SpaceList(const SpaceList&);
++  SpaceList& operator=(const SpaceList&);
++  SpaceList(SpaceList&&);
++  SpaceList& operator=(SpaceList&&);
++  ~SpaceList();
++
++  // Parses a list written by ToValue(). Skips entries that don't parse or
++  // repeat an earlier id. The first default entry stays the default; if there
++  // is none, a new default space is added at the front.
++  static SpaceList FromValue(const base::ListValue& value);
++  base::ListValue ToValue() const;
++
++  const std::vector<Space>& spaces() const { return spaces_; }
++  const Space* Find(const base::Uuid& id) const;
++  const Space& default_space() const;
++
++  // Appends a space with a new id and returns it.
++  const Space& Add(std::string name,
++                   tab_groups::TabGroupColorId color,
++                   std::string icon);
++
++  // Replaces the space with `space.id`, keeping its default flag. Returns
++  // false if there is no such space.
++  bool Update(const Space& space);
++
++  // Removes a space. The default space can't be removed. Returns whether a
++  // space was removed.
++  bool Remove(const base::Uuid& id);
++
++  // Moves a space to `index`, clamped to the end of the list. Returns false if
++  // there is no such space.
++  bool Move(const base::Uuid& id, size_t index);
++
++ private:
++  explicit SpaceList(std::vector<Space> spaces);
++
++  std::vector<Space>::iterator FindIterator(const base::Uuid& id);
++
++  std::vector<Space> spaces_;
++};
++
++}  // namespace spaces
++
++#endif  // CHROME_BROWSER_UI_SPACES_SPACE_LIST_H_
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_list_unittest.cc
+@@ -0,0 +1,164 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/spaces/space_list.h"
++
++#include <vector>
++
++#include "base/time/time.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace spaces {
++
++namespace {
++
++using tab_groups::TabGroupColorId;
++
++std::vector<std::string> Names(const SpaceList& list) {
++  std::vector<std::string> names;
++  for (const Space& space : list.spaces()) {
++    names.push_back(space.name);
++  }
++  return names;
++}
++
++TEST(SpaceListTest, NewListHasOnlyADefaultSpace) {
++  SpaceList list;
++  ASSERT_EQ(list.spaces().size(), 1u);
++  const Space& space = list.spaces()[0];
++  EXPECT_TRUE(space.is_default);
++  EXPECT_TRUE(space.id.is_valid());
++  EXPECT_EQ(space.name, kDefaultSpaceName);
++  EXPECT_EQ(&list.default_space(), &space);
++}
++
++TEST(SpaceListTest, RoundTripsEveryField) {
++  SpaceList list;
++  Space work = list.Add("Work", TabGroupColorId::kBlue, "💼");
++  work.isolation = SpaceIsolation::kPartition;
++  work.partition = "space-work";
++  work.last_active = base::Time::FromSecondsSinceUnixEpoch(1700000000);
++  ASSERT_TRUE(list.Update(work));
++
++  SpaceList parsed = SpaceList::FromValue(list.ToValue());
++  EXPECT_EQ(parsed.spaces(), list.spaces());
++}
++
++TEST(SpaceListTest, EmptyValueGetsADefaultSpace) {
++  SpaceList list = SpaceList::FromValue(base::ListValue());
++  ASSERT_EQ(list.spaces().size(), 1u);
++  EXPECT_TRUE(list.spaces()[0].is_default);
++}
++
++TEST(SpaceListTest, MissingDefaultIsAddedAtTheFront) {
++  SpaceList source;
++  source.Add("Work", TabGroupColorId::kBlue, "");
++  base::ListValue value = source.ToValue();
++  value.erase(value.begin());
++
++  SpaceList list = SpaceList::FromValue(value);
++  EXPECT_EQ(Names(list), (std::vector<std::string>{kDefaultSpaceName, "Work"}));
++  EXPECT_TRUE(list.spaces()[0].is_default);
++  EXPECT_FALSE(list.spaces()[1].is_default);
++}
++
++TEST(SpaceListTest, OnlyTheFirstDefaultStaysDefault) {
++  SpaceList source;
++  Space work = source.Add("Work", TabGroupColorId::kBlue, "");
++  base::ListValue value = source.ToValue();
++  value[1].GetDict().Set("default", true);
++
++  SpaceList list = SpaceList::FromValue(value);
++  ASSERT_EQ(list.spaces().size(), 2u);
++  EXPECT_EQ(list.default_space().id, source.default_space().id);
++  EXPECT_FALSE(list.Find(work.id)->is_default);
++}
++
++TEST(SpaceListTest, SkipsInvalidAndDuplicateEntries) {
++  SpaceList source;
++  source.Add("Work", TabGroupColorId::kBlue, "");
++  base::ListValue value = source.ToValue();
++  value.Append("not a dict");
++  value.Append(base::DictValue().Set("name", "No id"));
++  value.Append(base::DictValue().Set("id", "not-a-uuid"));
++  value.Append(value[1].Clone());
++
++  SpaceList list = SpaceList::FromValue(value);
++  EXPECT_EQ(Names(list), (std::vector<std::string>{kDefaultSpaceName, "Work"}));
++}
++
++TEST(SpaceListTest, OutOfRangeFieldsGetDefaults) {
++  SpaceList source;
++  base::ListValue value = source.ToValue();
++  value[0].GetDict().Set("color", 99);
++  value[0].GetDict().Set("isolation", -1);
++
++  SpaceList list = SpaceList::FromValue(value);
++  EXPECT_EQ(list.spaces()[0].color, TabGroupColorId::kGrey);
++  EXPECT_EQ(list.spaces()[0].isolation, SpaceIsolation::kNone);
++}
++
++TEST(SpaceListTest, AddGivesUniqueIds) {
++  SpaceList list;
++  base::Uuid a = list.Add("A", TabGroupColorId::kRed, "").id;
++  base::Uuid b = list.Add("B", TabGroupColorId::kRed, "").id;
++  EXPECT_NE(a, b);
++  EXPECT_NE(a, list.default_space().id);
++  EXPECT_EQ(Names(list),
++            (std::vector<std::string>{kDefaultSpaceName, "A", "B"}));
++}
++
++TEST(SpaceListTest, UpdateKeepsTheDefaultFlag) {
++  SpaceList list;
++  Space space = list.default_space();
++  space.name = "Personal";
++  space.is_default = false;
++  ASSERT_TRUE(list.Update(space));
++  EXPECT_EQ(list.default_space().name, "Personal");
++
++  Space work = list.Add("Work", TabGroupColorId::kBlue, "");
++  work.is_default = true;
++  ASSERT_TRUE(list.Update(work));
++  EXPECT_FALSE(list.Find(work.id)->is_default);
++}
++
++TEST(SpaceListTest, UpdateUnknownSpaceFails) {
++  SpaceList list;
++  Space stranger;
++  stranger.id = base::Uuid::GenerateRandomV4();
++  EXPECT_FALSE(list.Update(stranger));
++}
++
++TEST(SpaceListTest, DefaultSpaceCanNotBeRemoved) {
++  SpaceList list;
++  base::Uuid work = list.Add("Work", TabGroupColorId::kBlue, "").id;
++  EXPECT_FALSE(list.Remove(list.default_space().id));
++  EXPECT_TRUE(list.Remove(work));
++  EXPECT_FALSE(list.Remove(work));
++  EXPECT_EQ(Names(list), (std::vector<std::string>{kDefaultSpaceName}));
++}
++
++TEST(SpaceListTest, MoveReordersAndClamps) {
++  SpaceList list;
++  base::Uuid a = list.Add("A", TabGroupColorId::kRed, "").id;
++  base::Uuid b = list.Add("B", TabGroupColorId::kRed, "").id;
++
++  ASSERT_TRUE(list.Move(b, 0));
++  EXPECT_EQ(Names(list),
++            (std::vector<std::string>{"B", kDefaultSpaceName, "A"}));
++
++  ASSERT_TRUE(list.Move(b, 100));
++  EXPECT_EQ(Names(list),
++            (std::vector<std::string>{kDefaultSpaceName, "A", "B"}));
++
++  ASSERT_TRUE(list.Move(a, 1));
++  EXPECT_EQ(Names(list),
++            (std::vector<std::string>{kDefaultSpaceName, "A", "B"}));
++
++  EXPECT_FALSE(list.Move(base::Uuid::GenerateRandomV4(), 0));
++}
++
++}  // namespace
++
++}  // namespace spaces
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_registry.cc
+@@ -0,0 +1,94 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/spaces/space_registry.h"
++
++#include <utility>
++
++#include "base/values.h"
++#include "components/prefs/pref_registry_simple.h"
++#include "components/prefs/pref_service.h"
++
++namespace spaces {
++
++SpaceRegistry::SpaceRegistry(PrefService* prefs)
++    : prefs_(prefs),
++      list_(SpaceList::FromValue(prefs->GetList(prefs::kSpaces))) {
++  // Write back anything FromValue() repaired, most importantly a newly created
++  // default space, so its id stays the same across restarts.
++  base::ListValue value = list_.ToValue();
++  if (value != prefs_->GetList(prefs::kSpaces)) {
++    prefs_->SetList(prefs::kSpaces, std::move(value));
++  }
++}
++
++SpaceRegistry::~SpaceRegistry() = default;
++
++// static
++void SpaceRegistry::RegisterProfilePrefs(PrefRegistrySimple* registry) {
++  registry->RegisterListPref(prefs::kSpaces);
++}
++
++const Space* SpaceRegistry::GetSpace(const base::Uuid& id) const {
++  return list_.Find(id);
++}
++
++const Space& SpaceRegistry::GetDefaultSpace() const {
++  return list_.default_space();
++}
++
++base::Uuid SpaceRegistry::AddSpace(std::string name,
++                                   tab_groups::TabGroupColorId color,
++                                   std::string icon) {
++  base::Uuid id = list_.Add(std::move(name), color, std::move(icon)).id;
++  SaveAndNotify();
++  return id;
++}
++
++bool SpaceRegistry::UpdateSpace(const Space& space) {
++  const Space* current = list_.Find(space.id);
++  if (!current) {
++    return false;
++  }
++  const Space before = *current;
++  list_.Update(space);
++  if (*list_.Find(space.id) != before) {
++    SaveAndNotify();
++  }
++  return true;
++}
++
++bool SpaceRegistry::RemoveSpace(const base::Uuid& id) {
++  if (!list_.Remove(id)) {
++    return false;
++  }
++  SaveAndNotify();
++  return true;
++}
++
++bool SpaceRegistry::MoveSpace(const base::Uuid& id, size_t index) {
++  const std::vector<Space> before = list_.spaces();
++  if (!list_.Move(id, index)) {
++    return false;
++  }
++  if (list_.spaces() != before) {
++    SaveAndNotify();
++  }
++  return true;
++}
++
++void SpaceRegistry::AddObserver(Observer* observer) {
++  observers_.AddObserver(observer);
++}
++
++void SpaceRegistry::RemoveObserver(Observer* observer) {
++  observers_.RemoveObserver(observer);
++}
++
++void SpaceRegistry::SaveAndNotify() {
++  prefs_->SetList(prefs::kSpaces, list_.ToValue());
++  observers_.Notify(&Observer::OnSpacesChanged);
++}
++
++}  // namespace spaces
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_registry.h
+@@ -0,0 +1,73 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_SPACES_SPACE_REGISTRY_H_
++#define CHROME_BROWSER_UI_SPACES_SPACE_REGISTRY_H_
++
++#include <string>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "base/observer_list.h"
++#include "base/observer_list_types.h"
++#include "base/uuid.h"
++#include "chrome/browser/ui/spaces/space.h"
++#include "chrome/browser/ui/spaces/space_list.h"
++#include "components/keyed_service/core/keyed_service.h"
++#include "components/tab_groups/tab_group_color.h"
++
++class PrefRegistrySimple;
++class PrefService;
++
++namespace spaces {
++
++namespace prefs {
++// List pref holding the profile's spaces, in switcher order.
++inline constexpr char kSpaces[] = "helium_spaces.spaces";
++}  // namespace prefs
++
++// The spaces of one profile, persisted to prefs. Exists only for regular
++// profiles, and only while the HeliumSpaces feature is enabled.
++class SpaceRegistry : public KeyedService {
++ public:
++  class Observer : public base::CheckedObserver {
++   public:
++    // Called after a space is added, removed, changed or moved.
++    virtual void OnSpacesChanged() {}
++  };
++
++  explicit SpaceRegistry(PrefService* prefs);
++  SpaceRegistry(const SpaceRegistry&) = delete;
++  SpaceRegistry& operator=(const SpaceRegistry&) = delete;
++  ~SpaceRegistry() override;
++
++  static void RegisterProfilePrefs(PrefRegistrySimple* registry);
++
++  const std::vector<Space>& spaces() const { return list_.spaces(); }
++  const Space* GetSpace(const base::Uuid& id) const;
++  const Space& GetDefaultSpace() const;
++
++  // Each mutator saves to prefs and notifies observers when it changes
++  // something. See SpaceList for the rules.
++  base::Uuid AddSpace(std::string name,
++                      tab_groups::TabGroupColorId color,
++                      std::string icon);
++  bool UpdateSpace(const Space& space);
++  bool RemoveSpace(const base::Uuid& id);
++  bool MoveSpace(const base::Uuid& id, size_t index);
++
++  void AddObserver(Observer* observer);
++  void RemoveObserver(Observer* observer);
++
++ private:
++  void SaveAndNotify();
++
++  raw_ptr<PrefService> prefs_;
++  SpaceList list_;
++  base::ObserverList<Observer> observers_;
++};
++
++}  // namespace spaces
++
++#endif  // CHROME_BROWSER_UI_SPACES_SPACE_REGISTRY_H_
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_registry_factory.cc
+@@ -0,0 +1,65 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/spaces/space_registry_factory.h"
++
++#include <memory>
++
++#include "base/no_destructor.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/profiles/profile_selections.h"
++#include "chrome/browser/ui/spaces/space_registry.h"
++#include "chrome/browser/ui/spaces/spaces_features.h"
++#include "components/pref_registry/pref_registry_syncable.h"
++
++namespace spaces {
++
++// static
++SpaceRegistry* SpaceRegistryFactory::GetForProfile(Profile* profile) {
++  return static_cast<SpaceRegistry*>(
++      GetInstance()->GetServiceForBrowserContext(profile, true));
++}
++
++// static
++SpaceRegistryFactory* SpaceRegistryFactory::GetInstance() {
++  static base::NoDestructor<SpaceRegistryFactory> instance;
++  return instance.get();
++}
++
++SpaceRegistryFactory::SpaceRegistryFactory()
++    : ProfileKeyedServiceFactory(
++          "SpaceRegistry",
++          ProfileSelections::Builder()
++              .WithRegular(ProfileSelection::kOriginalOnly)
++              .WithGuest(ProfileSelection::kNone)
++              .WithSystem(ProfileSelection::kNone)
++              .WithAshInternals(ProfileSelection::kNone)
++              .Build()) {}
++
++SpaceRegistryFactory::~SpaceRegistryFactory() = default;
++
++std::unique_ptr<KeyedService>
++SpaceRegistryFactory::BuildServiceInstanceForBrowserContext(
++    content::BrowserContext* context) const {
++  if (!features::IsSpacesEnabled()) {
++    return nullptr;
++  }
++  Profile* profile = Profile::FromBrowserContext(context);
++  return std::make_unique<SpaceRegistry>(profile->GetPrefs());
++}
++
++// Created with the profile so the default space, and its id, exist before any
++// window asks for it.
++bool SpaceRegistryFactory::ServiceIsCreatedWithBrowserContext() const {
++  return features::IsSpacesEnabled();
++}
++
++// Registered even while the feature is disabled, so turning the flag off and
++// on again keeps the user's spaces.
++void SpaceRegistryFactory::RegisterProfilePrefs(
++    user_prefs::PrefRegistrySyncable* registry) {
++  SpaceRegistry::RegisterProfilePrefs(registry);
++}
++
++}  // namespace spaces
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_registry_factory.h
+@@ -0,0 +1,50 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_SPACES_SPACE_REGISTRY_FACTORY_H_
++#define CHROME_BROWSER_UI_SPACES_SPACE_REGISTRY_FACTORY_H_
++
++#include <memory>
++
++#include "base/no_destructor.h"
++#include "chrome/browser/profiles/profile_keyed_service_factory.h"
++
++class Profile;
++
++namespace content {
++class BrowserContext;
++}
++
++namespace user_prefs {
++class PrefRegistrySyncable;
++}
++
++namespace spaces {
++
++class SpaceRegistry;
++
++class SpaceRegistryFactory : public ProfileKeyedServiceFactory {
++ public:
++  // Returns null for incognito, guest and system profiles, and while the
++  // HeliumSpaces feature is disabled.
++  static SpaceRegistry* GetForProfile(Profile* profile);
++  static SpaceRegistryFactory* GetInstance();
++
++ private:
++  friend base::NoDestructor<SpaceRegistryFactory>;
++
++  SpaceRegistryFactory();
++  ~SpaceRegistryFactory() override;
++
++  // BrowserContextKeyedServiceFactory:
++  std::unique_ptr<KeyedService> BuildServiceInstanceForBrowserContext(
++      content::BrowserContext* context) const override;
++  bool ServiceIsCreatedWithBrowserContext() const override;
++  void RegisterProfilePrefs(
++      user_prefs::PrefRegistrySyncable* registry) override;
++};
++
++}  // namespace spaces
++
++#endif  // CHROME_BROWSER_UI_SPACES_SPACE_REGISTRY_FACTORY_H_

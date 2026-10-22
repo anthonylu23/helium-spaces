@@ -14,6 +14,8 @@ New files we add (under `chrome/browser/ui/spaces/` and
 | --- | --- | --- | --- |
 | `chrome/browser/about_flags.cc` | `spaces/core/add-spaces-feature-flag.patch` | Include of `spaces_flag_entries.h` in `kFeatureEntries`, include of `spaces_features.h` | 156.0.8078.47 |
 | `chrome/browser/BUILD.gn` | `spaces/core/add-spaces-feature-flag.patch` | Dep on `//chrome/browser/ui/spaces:features` in `source_set("core")`, desktop block | 156.0.8078.47 |
+| `chrome/browser/profiles/BUILD.gn` | `spaces/core/add-space-registry.patch` | Dep on `//chrome/browser/ui/spaces` in `profiles_extra_parts_impl`, `!is_android` block | 156.0.8078.47 |
+| `chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc` | `spaces/core/add-space-registry.patch` | Include, and `SpaceRegistryFactory::GetInstance()` at the end of `EnsureBrowserContextKeyedServiceFactoriesBuilt()` | 156.0.8078.47 |
 | `tools/typescript/validate_tsconfig.py` | `spaces/tooling/ts-ignore-out-of-tree-definitions.patch` | Skip `.d.ts` files outside the source tree in the undeclared-deps check | 156.0.8078.47 |
 
 ## Planned hooks
@@ -31,7 +33,7 @@ New files we add (under `chrome/browser/ui/spaces/` and
 | `chrome/browser/ui/browser_commands.cc` | Spaces | Ctrl+Tab within space, space switching commands |
 | `chrome/app/chrome_command_ids.h`, macOS accelerator tables | Spaces | Command ids and shortcuts |
 | `chrome/browser/ui/tabs/tab_menu_model.cc` | Spaces, Folders | Move to space, pin to favorites, add to folder |
-| `chrome/browser/prefs/browser_prefs.cc` | Spaces, Archive | Register prefs |
+| `chrome/browser/prefs/browser_prefs.cc` | Archive | Register prefs, only if a pref can't be registered by its service factory. Spaces prefs are registered by `SpaceRegistryFactory` |
 | `chrome/browser/ui/webui/tab_search/` | Tab Search | Space column and filter |
 | `chrome/browser/chrome_content_browser_client.cc` | Isolation | Only if the spike shows a site-to-partition override is needed |
 

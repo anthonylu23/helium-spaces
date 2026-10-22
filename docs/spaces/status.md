@@ -1,7 +1,9 @@
 # Status
 
-**Current phase: 3 (Spaces v1), step 0: tab group focusing spike. Code half
-done; hands-on half open. Scaffolding still pending review and first commit.**
+**Current phase: 3 (Spaces v1). Step 1 (`SpaceRegistry`) committed on branch
+`spaces/registry`; next is step 2. Step 0 spike: code review and
+computer-use checks support option C; actual dragging and human animation
+review remain open.**
 
 Last updated 2026-10-22.
 
@@ -12,7 +14,7 @@ Last updated 2026-10-22.
 | Helium | 0.20.1.1 (core `f29a2596`, macOS `9aa975a`) |
 | Chromium | 156.0.8078.47 |
 | Machine | M3 Pro, 11 cores, 18 GB RAM, Xcode 26.2 (upstream CI uses 26.5) |
-| Our patches | 2, in `patches/spaces/` |
+| Our patches | 3, in `patches/spaces/` |
 
 ## Measured build costs
 
@@ -50,17 +52,22 @@ Last updated 2026-10-22.
 
 ## Next steps
 
-1. Review and commit the scaffolding branch `spaces/scaffolding` in both repos,
-   push core first, then merge into `main`.
+1. Done: scaffolding pushed and fast-forwarded into `main` in both repos
+   (core `d433c10b`, macOS `6fe5a2b`).
 2. Phase 3, Spaces v1, in this order, one patch each:
-    0. Spike: tab group focusing. Finish the hands-on checklist in
-       `spikes/tab-group-focusing.md` and write its result.
-    1. `SpaceRegistry` keyed service and prefs (no UI). Settle the GN target
-       split first; a keyed service depends on `//chrome/browser`.
+    0. Spike: tab group focusing. Computer-use results for Classic and Vertical
+       are recorded in `spikes/tab-group-focusing.md`. Finish actual dragging
+       within a focused group and onto another window, and assess animation
+       smoothness by hand. Deep scroll-position behavior is untested.
+    1. Done: `spaces/core/add-space-registry.patch`.
+       `SpaceRegistry` keyed service and `helium_spaces.spaces` list pref, no
+       UI. GN split: `:model` (pure logic, unit tested), `:spaces` (service,
+       modularized deps only), `spaces_unittests`.
     2. Space id per tab with session round-trip: initial write, the
        session-file rewrite (`BuildCommandsForTab`), and tab restore. Active
        space per window as window extra data. Plus `spaces_unittests` and a
-       minimal `chrome://spaces-internals` for the smoke test.
+       minimal `chrome://spaces-internals` for the smoke test. The smoke
+       test must force a session-file rewrite.
     3. `SpaceController` and filtering, at the focus-mode hook points, in both
        the collection views (Vertical) and the legacy `TabContainerImpl`
        (Classic, Compact, Dynamic).
@@ -73,6 +80,9 @@ Automated (`devutils/spaces_smoke.mjs`):
 
 - Browser starts headless and reports a version.
 - `chrome://flags/#helium-spaces` exists, is named "Helium Spaces", is off by default.
+- Flag off: no spaces are saved. Flag on: one default space, same id after a restart.
+
+Unit (`spaces_unittests`): 12 `SpaceList` tests.
 
 Manual, until automated:
 
