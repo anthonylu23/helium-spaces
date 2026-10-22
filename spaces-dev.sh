@@ -14,4 +14,9 @@ else
     echo "warn: python@3.13 not found; run: brew install python@3.13" >&2
 fi
 
+# `he format` calls clang-format by name; use the one Chromium ships.
+if [ -d "${0:A:h}/build/src/buildtools/mac_arm64-format" ]; then
+    export PATH="${0:A:h}/build/src/buildtools/mac_arm64-format:$PATH"
+fi
+
 source "${0:A:h}/dev.sh"

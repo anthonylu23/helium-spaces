@@ -50,10 +50,18 @@ source spaces-dev.sh
 It puts Homebrew's Python 3.13 first on `PATH` and then sources Helium's
 `dev.sh` unchanged. Run `he` alone to list commands.
 
-`dev.sh` defines `quilt` as an alias for `quilt --quiltrc -`, which is what
-makes patches come out in Helium's `a/` `b/` format with no `Index:` lines.
-Aliases do not expand in scripts or one-shot `zsh -c` commands, so scripts and
-agents must call `quilt --quiltrc -` explicitly.
+`dev.sh` defines `quilt` as an alias for `quilt --quiltrc -` and exports
+`QUILT_*` variables (`devutils/set_quilt_vars.sh`). The variables are what make
+patches come out in Helium's `a/` `b/` format with no `Index:` lines; the
+`--quiltrc -` makes quilt read them. Aliases do not expand in scripts or
+one-shot `zsh -c` commands, so scripts and agents must do both:
+
+```bash
+zsh -c 'source spaces-dev.sh; cd build/src && quilt --quiltrc - refresh'
+```
+
+`spaces-dev.sh` also puts Chromium's bundled `clang-format` on `PATH`, which
+`he format` needs.
 
 ## First-time setup and build
 
@@ -76,7 +84,9 @@ substitution, so patches must never depend on substituted domains.
 | Symptom | Cause | Fix |
 | --- | --- | --- |
 | `Undeclared dependencies to definition files ... node_modules/buffer/index.d.ts` | A `node_modules` folder above the checkout (here `$HOME`) leaks into TypeScript module resolution | Fixed by `patches/spaces/tooling/ts-ignore-out-of-tree-definitions.patch` |
-| Patches refresh with `Index:` and `src.orig/` headers | `quilt` alias not active | Use an interactive shell after `source spaces-dev.sh`, or `quilt --quiltrc -` |
+| Patches refresh with `Index:` and `src.orig/` headers | `QUILT_*` variables from `dev.sh` not set | `source spaces-dev.sh` first, then `quilt --quiltrc -` |
+| `he format`: `Failed to run "clang-format ..."` | No `clang-format` on `PATH` | `spaces-dev.sh` adds `build/src/buildtools/mac_arm64-format` |
+| `browser_tests`, `unit_tests`, `base_unittests` fail on missing inputs | The `-base` source tarball has no test data | Use `spaces_unittests`, below |
 
 ## Where patches live
 
@@ -137,12 +147,30 @@ After `he unmerge`, `quilt` commands no longer see the merged series. Run
 `he merge` before the next quilt session; the source tree itself is untouched
 by merge and unmerge, so no rebuild is needed.
 
+## Unit tests
+
+Chromium's own test targets can't build from the tarball we use, so pure logic
+(no `Profile`, `Browser` or prefs) is kept in small classes and tested by our
+own gtest target. Add new `*_unittest.cc` files to `spaces_unittests` in
+`chrome/browser/ui/spaces/BUILD.gn`.
+
+```bash
+zsh -c 'source spaces-dev.sh; cd build/src && \
+  SISO_PATH=$_siso_path python3 $_depot_tools_dir/autoninja.py -C out/Default spaces_unittests'
+build/src/out/Default/spaces_unittests
+```
+
+The first build takes a few minutes (base's test support); after that it is
+seconds.
+
 ## Smoke test
 
 `devutils/spaces_smoke.mjs` launches the dev build headless with a throwaway
 profile and checks it over the DevTools protocol. Today it checks that the
-browser starts and that `chrome://flags/#helium-spaces` exists, is named
-"Helium Spaces", and is off by default. Add a check for every feature as it
+browser starts, that `chrome://flags/#helium-spaces` exists and is off by
+default, and, with the flag on, that the profile gets one default space whose
+id survives a restart. It reads saved state from the profile's `Preferences`
+file after a clean `Browser.close`. Add a check for every feature as it
 lands.
 
 ```bash

@@ -47,8 +47,12 @@ cross-references.
 
 1. `he build`, then `node --experimental-websocket devutils/spaces_smoke.mjs`
    (headless; extend it as features land). `he run` for anything visual.
+   Pure logic gets gtest coverage in `spaces_unittests` (see
+   `docs/spaces/development.md`); Chromium's own test targets can't build here.
 2. `he unmerge`, then `he validate series` and `he validate config`.
 3. `he validate patches` only works on an unmodified Chromium tree, so run it
    only during an upstream sync, right after `he presetup`.
-4. Run quilt as `quilt --quiltrc -` in scripts; the `quilt` alias from
-   `dev.sh` only exists in interactive shells.
+4. In scripts, run quilt as `zsh -c 'source spaces-dev.sh; cd build/src &&
+   quilt --quiltrc - ...'`. Both parts matter: the alias only exists in
+   interactive shells, and without the `QUILT_*` variables `dev.sh` exports,
+   `quilt refresh` writes `Index:` and `src.orig/` headers.
