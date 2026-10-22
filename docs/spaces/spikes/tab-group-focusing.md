@@ -10,7 +10,8 @@ hooks go so Spaces work in every Helium layout mode?
 focus mode's plumbing: each place that checks the focused group also checks the
 active space. Option A (a space is a tab group with focus mode always on) is
 ruled out because tabs inside a space must still be groupable, and groups can't
-nest. The hands-on half below is still open.
+nest. The computer-use pass below supports reusing the plumbing; actual dragging
+and a human assessment of animation smoothness remain open.
 
 ## Code findings
 
@@ -85,7 +86,7 @@ choices keep it open:
 - Per-window state stores the active space id only; nothing assumes the
   active space's tabs live in this window's `TabStripModel`.
 
-## Hands-on checklist (open)
+## Hands-on checklist (2026-10-22 pass; dragging open)
 
 Launch with a throwaway profile so the dev profile stays clean:
 
@@ -98,20 +99,53 @@ build/src/out/Default/Helium.app/Contents/MacOS/Helium \
 Make 3 groups of about 5 tabs, plus 2 pinned tabs and a few ungrouped tabs.
 Then, in Vertical and in Classic:
 
-- [ ] Focus a group (group context menu, or the ribbon). Do the other tabs
-      hide cleanly, with no gaps, flicker or wrong scroll position?
-- [ ] Switch focus between groups. Does it feel fast enough to build space
-      switching on?
-- [ ] Ctrl+Tab, Cmd+1..9, close the last tab in the focused group. What
+- [x] Focus a group through its context menu. Other tabs hide without gaps
+      in the captured layouts; see the animation and scrolling limits below.
+- [x] Switch focus between groups and verify the resulting visible tabs.
+- [ ] Assess perceived switching speed, brief flicker and deep scroll-position
+      behavior by hand.
+- [x] Ctrl+Tab, Cmd+1..9, close the last tab in the focused group. What
       activates?
 - [ ] Drag a tab within the focused group, and onto another window.
-- [ ] New tab (Cmd+T) while focused. Where does it land?
-- [ ] Quit and relaunch with the same `--user-data-dir`. Is focus restored?
-- [ ] Anything that crashes or looks broken. That code is what we would hook.
+- [x] New tab (Cmd+T) while focused. Where does it land?
+- [x] Quit and relaunch with the same `--user-data-dir`. Is focus restored?
+- [x] Anything that crashes or looks broken. That code is what we would hook.
 
 Optional: add `TabStripUnification` to `--enable-features` and repeat in
 Classic to see the newer horizontal views.
 
 ## Result
 
-To fill in after the hands-on pass.
+Computer-use pass on 2026-10-22, using the existing local component build
+(Helium 0.20.1.1, Chromium 156.0.8078.47). Launched with the command above,
+verified the executable, command line and throwaway profile in `chrome://version`,
+and created A/B/C groups of five labeled local data-URL tabs each, two pinned
+tabs (P1/P2), and three ungrouped tabs (U1/U2/U3). Used the same profile in
+Classic and Vertical. No source or patch changes were needed for this pass.
+
+| Check | Classic and Vertical observations |
+| --- | --- |
+| Enter focus | Group context menu works. Only the focused group's tabs and P1/P2 remain in the strip. Captured layouts have no holes left by hidden tabs. |
+| Switch groups | Ctrl+Cmd+X/Z rotates forward/backward, including wraparound. The next captured state has the expected group and active tab. No reproducible stuck strip or wrong group was observed. |
+| Ctrl+Tab | Moves within the focused group and pinned tabs. From the group's final tab it wraps to P1; hidden groups and U1/U2/U3 are skipped. |
+| Cmd+1..9 | P1/P2 occupy positions 1/2; positions 3..7 select the five focused tabs. Cmd+8 is a no-op with seven visible tabs; Cmd+9 selects the last focused tab. |
+| Cmd+T | Joins the focused group at its end with the default “Open new tabs next to the active tab” setting off. Also joins that group when a pinned tab is active. |
+| Close final group tab | Saved groups first show “Close Tab and Delete Group?”. After the human authorized deletion of the disposable fixture groups, confirming it exits focus, reveals the remaining tabs, and activates P2 in both layouts. Spaces must supply their own empty-space behavior. |
+| Move to another window via menu | Works in both layouts. The destination receives an ungrouped tab; the source activates another tab in the group and stays focused. This exercises transfer behavior, not pointer dragging. |
+| Restart | `chrome://restart` preserves focus in both layouts. A separate full quit (holding Cmd+Q), verified browser-process exit, and relaunch with the same arguments also preserves group C focus: C5 in Classic, C3 in Vertical. “Continue where you left off” was enabled for these tests. The restored fixture window was selected through Window; a foreground blank window alone does not establish restore failure. |
+
+**Decision:** proceed with option C for model, command and visibility plumbing.
+The tested state transitions support building space switching on these hooks.
+No reproducible application crash or persistent layout break was established.
+The confirmation and focus exit when the last group tab closes are expected
+group semantics, and must not become Spaces semantics.
+
+**Limits and remaining work:** this was sampled UI automation, not a frame-time
+measurement or a human animation review. It supports correct, prompt state
+changes at this fixture size; it cannot certify the absence of brief flicker or
+judge perceived smoothness. The focused lists fit without scrolling, so deep
+scroll-position behavior is also untested. Pointer-drag attempts in both layouts
+produced no observable reorder, so actual within-group dragging and dropping
+onto another window remain unchecked; do not count the successful menu moves
+as a drag pass. Repeat those two actions by hand before closing the spike.
+The optional unified horizontal tab strip was not tested.
