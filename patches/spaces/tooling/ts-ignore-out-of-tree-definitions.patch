@@ -1,0 +1,29 @@
+Ignore TypeScript definition files from outside the source tree.
+
+TypeScript resolves bare module imports by walking up every parent folder
+looking for node_modules. When the checkout lives under a folder that has its
+own node_modules (for example $HOME with a package.json), files from there
+show up in --listFilesOnly and fail the undeclared-dependency check, even
+though type checking succeeded. Such files can never be GN inputs, so skip
+them in the check.
+
+helium-spaces build fix. Safe to drop if no node_modules exists above the
+checkout.
+
+--- a/tools/typescript/validate_tsconfig.py
++++ b/tools/typescript/validate_tsconfig.py
+@@ -315,8 +315,14 @@ def validateDefinitionDeps(
+     f_from_cwd = os.path.relpath(f, _CWD).replace('\\', '/')
+     is_gen_file = f_from_cwd.startswith(gen_dir_from_build)
+     f_from_gen = os.path.relpath(f, gen_dir).replace('\\', '/')
++    # A node_modules folder in a parent of the source tree (for example a
++    # package.json in $HOME) leaks into TypeScript's module resolution. Files
++    # outside the source tree can never be GN inputs, so do not require them.
++    is_outside_src = os.path.relpath(
++      os.path.abspath(f), _SRC_DIR).replace('\\', '/').startswith('../')
+     if (
+       not is_gen_file
++      and not is_outside_src
+       and f_from_gen not in definitions_normalized
+       and not any(f_from_cwd.startswith(exception) for exception in exceptions)
+     ):

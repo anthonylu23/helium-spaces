@@ -24,3 +24,7 @@ helium/macos/lockdown-mode-imageio.patch
 helium/macos/disable-chromium-immersive-fullscreen.patch
 helium/macos/helium-immersive-fullscreen.patch
 helium/macos/fix-history-swiper-lifetime.patch
+
+# helium-spaces: our patches, applied after every Helium patch.
+# Keep this block last. See docs/spaces/development.md.
+spaces/tooling/ts-ignore-out-of-tree-definitions.patch
