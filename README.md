@@ -1,36 +1,47 @@
-# helium-macos
-macOS packaging & development tooling for the
-[Helium Browser](https://github.com/imputnet/helium).
+# helium-spaces
 
-## Building and development
-macOS is our primary development platform, so it's the recommended environment
-for developing new Helium features.
+A personal fork of [Helium](https://github.com/imputnet/helium) that adds
+Arc-style Spaces to a single window, per-space login isolation, and tab
+organization features. Working name; a public build will get its own name and
+icon before release.
 
-[> See docs/building.md](docs/building.md)
+This repo is a fork of [imputnet/helium-macos](https://github.com/imputnet/helium-macos)
+(macOS packaging and dev tooling). Our feature patches live in
+[patches/spaces/](patches/spaces/). Helium's shared patches come from the
+`helium-chromium` submodule, which points at our fork of the core repo,
+[anthonylu23/helium-spaces-core](https://github.com/anthonylu23/helium-spaces-core).
 
-## Contributing
-Before contributing to this repo, please read the guidelines in the main repo's
-[CONTRIBUTING.md](https://github.com/imputnet/helium/blob/main/CONTRIBUTING.md).
+**This is not an official Helium build and is not affiliated with imputnet.**
+Nothing from this fork is contributed back upstream; see [AGENTS.md](AGENTS.md).
 
-## Credits
+## Docs
 
-### Depot
-Big thank you to [Depot](https://depot.dev/) for sponsoring our runners,
-which handle the macOS builds of Helium. Their high-performance infrastructure
-lets us compile, package, and release new builds of Helium within hours,
-not days.
+| Doc | What it covers |
+| --- | --- |
+| [docs/spaces/spec.md](docs/spaces/spec.md) | What we are building, architecture, phased plan |
+| [docs/spaces/status.md](docs/spaces/status.md) | Current phase, what is done, next steps |
+| [docs/spaces/development.md](docs/spaces/development.md) | Setup, build, patch workflow, syncing upstream |
+| [docs/spaces/chromium-map.md](docs/spaces/chromium-map.md) | Chromium files each feature hooks, and the version they were verified on |
+| [docs/spaces/rebase-log.md](docs/spaces/rebase-log.md) | Cost of every upstream sync |
+| [docs/building.md](docs/building.md) | Upstream Helium build guide |
 
-### ungoogled-chromium-macos
-This repo is based on
-[ungoogled-chromium-macos](https://github.com/ungoogled-software/ungoogled-chromium-macos),
-but heavily modified for Helium. Special thanks to everyone behind
-ungoogled-chromium, they made working with Chromium infinitely easier.
+## Quick start
+
+```bash
+git clone --recurse-submodules https://github.com/anthonylu23/helium-spaces.git
+cd helium-spaces
+source spaces-dev.sh   # zsh only; wraps Helium's dev.sh
+he setup               # download Chromium, apply patches, configure
+he build               # component build, several hours the first time
+he run                 # launches with its own dev profile
+node --experimental-websocket devutils/spaces_smoke.mjs   # headless checks
+```
+
+See [docs/spaces/development.md](docs/spaces/development.md) for prerequisites.
 
 ## License
-All code, patches, modified portions of imported code or patches, and
-any other content that is unique to Helium and not imported from other
-repositories is licensed under GPL-3.0. See [LICENSE](LICENSE).
 
-Any content imported from other projects retains its original license (for
-example, any original unmodified code imported from ungoogled-chromium remains
-licensed under their [BSD 3-Clause license](LICENSE.ungoogled_chromium)).
+GPL-3.0, inherited from Helium. See [LICENSE](LICENSE). Content imported from
+ungoogled-chromium keeps its [BSD 3-Clause license](LICENSE.ungoogled_chromium).
+Helium's name and icons belong to imputnet and are not licensed for use in a
+public build of this fork.
