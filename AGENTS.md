@@ -35,6 +35,9 @@ Read `docs/spaces/status.md` first, then the docs it points to for the task.
 - New files carry the GPL-3.0 header used by Helium's own new files.
 - Update `docs/spaces/chromium-map.md` whenever a patch starts or stops
   touching a Chromium file.
+- Record anything deferred, or decided on purpose (a known gap, a behavior
+  chosen over an alternative, an unverified check), in
+  `docs/spaces/deferred.md` before committing the work it came from.
 
 ## Searching Chromium
 
