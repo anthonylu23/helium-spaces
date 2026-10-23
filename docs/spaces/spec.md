@@ -30,7 +30,8 @@ model, so session restore, drag and drop, and tab commands keep working.
 
 - Each tab stores its space id in session extra data, so Chromium's own restore
   puts it back. Tab extra data is not rewritten when Chromium compacts the
-  session file, so we also hook the rewrite and tab restore paths. Each profile
+  session file, so we also hook the rewrite and tab restore paths. A tab's
+  space is assigned once it is in a window. Each profile
   has one permanent default space with a fixed id; a tab with no space id
   belongs to it. Pinned with no space id = a favorite, shown in every space.
 - Tab groups work inside a space, as in Arc. Spaces are not tab groups.

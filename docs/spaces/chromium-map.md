@@ -16,6 +16,11 @@ New files we add (under `chrome/browser/ui/spaces/` and
 | `chrome/browser/BUILD.gn` | `spaces/core/add-spaces-feature-flag.patch` | Dep on `//chrome/browser/ui/spaces:features` in `source_set("core")`, desktop block | 156.0.8078.47 |
 | `chrome/browser/profiles/BUILD.gn` | `spaces/core/add-space-registry.patch` | Dep on `//chrome/browser/ui/spaces` in `profiles_extra_parts_impl`, `!is_android` block | 156.0.8078.47 |
 | `chrome/browser/profiles/chrome_browser_main_extra_parts_profiles.cc` | `spaces/core/add-space-registry.patch` | Include, and `SpaceRegistryFactory::GetInstance()` at the end of `EnsureBrowserContextKeyedServiceFactoriesBuilt()` | 156.0.8078.47 |
+| `chrome/browser/sessions/BUILD.gn` | `spaces/core/add-space-tab-helper.patch` | Dep on `//chrome/browser/ui/spaces:tab_space` in `impl`, `enable_session_service` block | 156.0.8078.47 |
+| `chrome/browser/sessions/session_service_base.cc` | `spaces/core/add-space-tab-helper.patch` | Include; `CreateSpaceIdSessionCommand()` in `BuildCommandsForTab()`, after the pinned state. Runs on session-file rewrites and for every restored tab | 156.0.8078.47 |
+| `chrome/browser/ui/BUILD.gn` | `spaces/core/add-space-tab-helper.patch` | Dep on `:tab_space` in `browser_tabrestore_impl` and `browser_live_tab_context_impl` | 156.0.8078.47 |
+| `chrome/browser/ui/browser_tabrestore.cc` | `spaces/core/add-space-tab-helper.patch` | Include; `RestoreSpaceIdFromExtraData()` next to glic and send-tab-to-self in `CreateRestoredTab()` | 156.0.8078.47 |
+| `chrome/browser/ui/browser_live_tab_context.cc` | `spaces/core/add-space-tab-helper.patch` | Include; `AddSpaceIdToExtraData()` in `GetExtraDataForTab()`. Helium's `core.patch` also edits this file | 156.0.8078.47 |
 | `tools/typescript/validate_tsconfig.py` | `spaces/tooling/ts-ignore-out-of-tree-definitions.patch` | Skip `.d.ts` files outside the source tree in the undeclared-deps check | 156.0.8078.47 |
 
 ## Planned hooks
@@ -26,8 +31,7 @@ New files we add (under `chrome/browser/ui/spaces/` and
 | `chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc`, `pinned_tab_container_view.cc` | Spaces | Hide tabs outside the active space, next to the focused-group check (Vertical, and horizontal with `kTabStripUnification`) |
 | `chrome/browser/ui/views/tabs/tab_container_impl.cc`, `tab_strip.cc` | Spaces | Same, for the legacy horizontal strip (Classic, Compact, Dynamic) |
 | `chrome/browser/ui/tabs/tab_strip_model.cc` | Spaces | Next tab to activate on close, Ctrl+Tab, next to the focused-group checks |
-| `chrome/browser/sessions/session_service_base.cc` | Spaces | Rewrite tab space id in `BuildCommandsForTab`, active space in `BuildCommandsForBrowser` |
-| `chrome/browser/ui/browser_live_tab_context.cc`, `browser_tabrestore.cc` | Spaces | Space id through reopen-closed-tab |
+| `chrome/browser/sessions/session_service_base.cc`, `session_restore.cc` | Spaces | Active space per window: write in `BuildCommandsForBrowser`, read when restoring the window (step 3) |
 | `chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h` | Spaces | Read collapse/width state next to space state |
 | `chrome/browser/ui/browser_tabstrip.cc` and tab creation path | Spaces, Isolation | New tabs join the active space; isolated spaces pass a SiteInstance |
 | `chrome/browser/ui/browser_commands.cc` | Spaces | Ctrl+Tab within space, space switching commands |
