@@ -203,6 +203,17 @@ node --experimental-websocket devutils/spaces_smoke.mjs
 
 The flag is only needed on Node 20 and 21; Node 22+ has WebSocket built in.
 
+Headless mode draws no tab strip, so `devutils/spaces_screenshots.mjs` opens a
+real window instead, builds a fixture of favorites, space-pinned tabs and a
+tab group across three spaces, and saves a screenshot for each of the four
+layouts and three spaces. The terminal running it needs Screen Recording
+permission (System Settings > Privacy & Security); without it `screencapture`
+fails or captures black, and the script still checks that nothing crashes.
+
+```bash
+node --experimental-websocket devutils/spaces_screenshots.mjs out-dir
+```
+
 ## Syncing with upstream Helium
 
 Do this when Helium ships a release. Record the result in `rebase-log.md`.

@@ -8,7 +8,7 @@ enabled.
 
 --- a/chrome/browser/ui/spaces/BUILD.gn
 +++ b/chrome/browser/ui/spaces/BUILD.gn
-@@ -100,6 +100,30 @@ source_set("controller") {
+@@ -101,6 +101,31 @@ source_set("controller") {
    ]
  }
  
@@ -30,6 +30,7 @@ enabled.
 +    "//chrome/browser/sessions",
 +    "//chrome/browser/ui:browser_commands",
 +    "//chrome/browser/ui/browser_window",
++    "//chrome/browser/ui/helium:helium_layout_state_controller",
 +    "//chrome/browser/ui/tabs:tab_enums",
 +    "//chrome/browser/ui/tabs:tab_strip",
 +    "//components/sessions",
@@ -41,7 +42,7 @@ enabled.
  test("spaces_unittests") {
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/spaces_internals_ui.cc
-@@ -0,0 +1,366 @@
+@@ -0,0 +1,416 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -52,6 +53,7 @@ enabled.
 +#include <memory>
 +#include <optional>
 +#include <string>
++#include <vector>
 +
 +#include "base/functional/bind.h"
 +#include "base/json/json_writer.h"
@@ -68,6 +70,7 @@ enabled.
 +#include "chrome/browser/ui/browser_commands.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 +#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/helium/helium_layout_state_controller.h"
 +#include "chrome/browser/ui/spaces/space_controller.h"
 +#include "chrome/browser/ui/spaces/space_registry.h"
 +#include "chrome/browser/ui/spaces/space_registry_factory.h"
@@ -207,6 +210,12 @@ enabled.
 +    web_ui()->RegisterMessageCallback(
 +        "runCommand", base::BindRepeating(&SpacesInternalsHandler::RunCommand,
 +                                          base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "groupTabs", base::BindRepeating(&SpacesInternalsHandler::GroupTabs,
++                                         base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "setLayout", base::BindRepeating(&SpacesInternalsHandler::SetLayout,
++                                         base::Unretained(this)));
 +  }
 +
 + private:
@@ -338,6 +347,48 @@ enabled.
 +    }
 +  }
 +
++  // groupTabs(window_session_id, [tab_index, ...]): a new tab group.
++  void GroupTabs(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 2 ? args[0].GetIfInt() : std::nullopt;
++    const base::ListValue* list =
++        args.size() == 2 ? args[1].GetIfList() : nullptr;
++    BrowserWindowInterface* browser =
++        window_id ? FindBrowser(profile_, *window_id) : nullptr;
++    if (!browser || !list || list->empty() ||
++        !browser->GetTabStripModel()->SupportsTabGroups()) {
++      return;
++    }
++    std::vector<int> indices;
++    for (const base::Value& value : *list) {
++      std::optional<int> index = value.GetIfInt();
++      if (!index || !browser->GetTabStripModel()->ContainsIndex(*index)) {
++        return;
++      }
++      indices.push_back(*index);
++    }
++    browser->GetTabStripModel()->AddToNewGroup(indices);
++  }
++
++  // setLayout(window_session_id, layout): Helium's tab layout, 0 Classic,
++  // 1 Compact, 2 Vertical, 3 Dynamic.
++  void SetLayout(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 2 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> layout =
++        args.size() == 2 ? args[1].GetIfInt() : std::nullopt;
++    if (!window_id || !layout || *layout < 0 ||
++        *layout > static_cast<int>(HeliumLayoutType::kMaxValue)) {
++      return;
++    }
++    BrowserWindowInterface* browser = FindBrowser(profile_, *window_id);
++    if (HeliumLayoutStateController* layout_controller =
++            browser ? HeliumLayoutStateController::From(browser) : nullptr) {
++      layout_controller->SetBrowserLayout(
++          static_cast<HeliumLayoutType>(*layout));
++    }
++  }
++
 +  // Closes a tab the way the user would, so it can be reopened.
 +  void CloseTab(const base::ListValue& args) {
 +    std::optional<int> window_id =
@@ -410,7 +461,7 @@ enabled.
 +}  // namespace spaces
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/spaces_internals_ui.h
-@@ -0,0 +1,61 @@
+@@ -0,0 +1,64 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -455,6 +506,9 @@ enabled.
 +//   closeOtherTabs(window_session_id, tab_index)  From the tab context menu.
 +//   runCommand(window_session_id, name)  newTab, closeTab, selectNextTab,
 +//       selectPreviousTab, selectFirstTab or selectLastTab.
++//   groupTabs(window_session_id, [tab_index, ...])
++//   setLayout(window_session_id, layout)  0 Classic, 1 Compact, 2 Vertical,
++//       3 Dynamic.
 +//   reopenClosedTab(window_session_id)  Like Cmd+Shift+T.
 +//   rewriteSession()  Rewrites the session file from the open windows.
 +// Reload the page to see the new state.
