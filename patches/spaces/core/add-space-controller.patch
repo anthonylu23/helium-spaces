@@ -98,6 +98,7 @@
 +    ":tab_space_filter",
 +    "//base",
 +    "//chrome/browser/ui/tabs:tab_strip_model_observer",
++    "//components/tabs:public",
 +    "//ui/base/unowned_user_data",
 +  ]
 +  deps = [
@@ -107,7 +108,6 @@
 +    "//chrome/browser/tab_list",
 +    "//chrome/browser/ui/browser_window",
 +    "//chrome/browser/ui/tabs:tab_strip",
-+    "//components/tabs:public",
 +    "//content/public/browser",
 +    "//url",
 +  ]
@@ -118,7 +118,7 @@
  test("spaces_unittests") {
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/space_controller.cc
-@@ -0,0 +1,239 @@
+@@ -0,0 +1,287 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -249,28 +249,62 @@
 +      break;
 +  }
 +
-+  // While a favorite is active, inserted tabs can change which space was used
-+  // last. Session restore activates the first tab before inserting the rest.
-+  const tabs::TabInterface* active_tab = tab_strip_model_->GetActiveTab();
-+  const bool inserted_behind_favorite =
-+      change.type() == TabStripModelChange::kInserted && active_tab &&
-+      IsFavorite(active_tab);
-+  if ((!selection.active_tab_changed() && !inserted_behind_favorite) ||
-+      !active_tab || tab_strip_model_->closing_all()) {
-+    return;
-+  }
-+  const base::Uuid space = GetSpaceForActiveTab();
-+  if (space == active_space_id_) {
++  if (tab_strip_model_->closing_all()) {
 +    return;
 +  }
 +  if (emptied_active_space) {
-+    // The tab strip can't be changed while it notifies observers.
++    // WillCloseTabs() opens a tab first when tabs are closed through the tab
++    // strip; this covers tabs deleted any other way. The tab strip can't be
++    // changed while it notifies observers.
 +    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
 +        FROM_HERE, base::BindOnce(&SpaceController::OpenTabInEmptiedSpace,
 +                                  weak_factory_.GetWeakPtr()));
 +    return;
 +  }
-+  active_space_id_ = space;
++
++  tabs::TabInterface* active_tab = tab_strip_model_->GetActiveTab();
++  if (!active_tab) {
++    return;
++  }
++  if (selection.active_tab_changed() && !IsFavorite(active_tab)) {
++    active_space_id_ = GetSpaceOfTab(active_tab);
++    last_active_tabs_[active_space_id_] = active_tab->GetHandle();
++  } else if (change.type() == TabStripModelChange::kInserted &&
++             IsFavorite(active_tab)) {
++    // While a favorite is active, inserted tabs can change which space was
++    // used last: session restore activates the first tab before inserting the
++    // rest.
++    active_space_id_ = GetSpaceForActiveTab();
++  }
++}
++
++void SpaceController::OnTabPinnedStateChanged(tabs::TabInterface* tab,
++                                              int index) {
++  // Unpinning the active favorite makes it an ordinary tab of the default
++  // space, which may not be the active one.
++  const tabs::TabInterface* active_tab = tab_strip_model_->GetActiveTab();
++  if (active_tab && !IsTabInActiveSpace(active_tab)) {
++    active_space_id_ = GetSpaceOfTab(active_tab);
++  }
++}
++
++void SpaceController::WillCloseTabs(
++    const std::vector<tabs::TabInterface*>& tabs) {
++  const tabs::TabInterface* active_tab = tab_strip_model_->GetActiveTab();
++  if (!active_tab || !std::ranges::contains(tabs, active_tab) ||
++      static_cast<int>(tabs.size()) >= tab_strip_model_->count()) {
++    return;
++  }
++  const bool space_keeps_a_tab =
++      FindMostRecentTab([this, &tabs](const tabs::TabInterface* tab) {
++        return GetSpaceOfTab(tab) == active_space_id_ &&
++               !std::ranges::contains(tabs, tab);
++      }) != nullptr;
++  if (!space_keeps_a_tab) {
++    // Opened in the foreground, so closing `tabs` doesn't activate a tab of
++    // another space first. It joins the active space when inserted.
++    tab_strip_model_->delegate()->AddTabAt(GURL(), -1, /*foreground=*/true);
++  }
 +}
 +
 +void SpaceController::OnSpacesChanged() {
@@ -321,10 +355,24 @@
 +}
 +
 +void SpaceController::ActivateTabInActiveSpace() {
-+  tabs::TabInterface* tab =
-+      FindMostRecentTab([this](const tabs::TabInterface* tab) {
-+        return GetSpaceOfTab(tab) == active_space_id_;
-+      });
++  // Prefer the tab last active in the space. Last-active times alone would
++  // favor a tab opened in the background after it, which was never shown.
++  tabs::TabInterface* tab = nullptr;
++  if (auto it = last_active_tabs_.find(active_space_id_);
++      it != last_active_tabs_.end()) {
++    tabs::TabInterface* remembered = it->second.Get();
++    if (remembered &&
++        tab_strip_model_->GetIndexOfTab(remembered) != TabStripModel::kNoTab &&
++        !IsFavorite(remembered) &&
++        GetSpaceOfTab(remembered) == active_space_id_) {
++      tab = remembered;
++    }
++  }
++  if (!tab) {
++    tab = FindMostRecentTab([this](const tabs::TabInterface* tab) {
++      return GetSpaceOfTab(tab) == active_space_id_;
++    });
++  }
 +  if (!tab) {
 +    // An empty URL opens the New Tab page. The new tab joins the active space
 +    // when it is inserted.
@@ -360,7 +408,7 @@
 +}  // namespace spaces
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/space_controller.h
-@@ -0,0 +1,131 @@
+@@ -0,0 +1,137 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -368,7 +416,9 @@
 +#ifndef CHROME_BROWSER_UI_SPACES_SPACE_CONTROLLER_H_
 +#define CHROME_BROWSER_UI_SPACES_SPACE_CONTROLLER_H_
 +
++#include <map>
 +#include <memory>
++#include <vector>
 +
 +#include "base/functional/function_ref.h"
 +#include "base/memory/raw_ptr.h"
@@ -378,6 +428,7 @@
 +#include "chrome/browser/ui/spaces/space_registry.h"
 +#include "chrome/browser/ui/spaces/tab_space_filter.h"
 +#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "components/tabs/public/tab_interface.h"
 +#include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
 +
 +class BrowserWindowInterface;
@@ -387,21 +438,18 @@
 +class WebContents;
 +}
 +
-+namespace tabs {
-+class TabInterface;
-+}
-+
 +namespace spaces {
 +
 +// Shows one space at a time in a normal browser window, and keeps the window's
 +// tabs in their spaces:
 +// - The active space follows the active tab, so activating a tab in another
 +//   space, by any means, switches to that space.
-+// - While a favorite is active, the active space is the space of the most
-+//   recently active tab that isn't one. That is how it survives a restart.
++// - Activating a favorite keeps the active space. After a restart, it is the
++//   space of the most recently active tab that isn't a favorite.
++// - Switching to a space activates the tab last active there.
 +// - New tabs join the active space. Restored tabs keep the space they had.
-+// - Closing the last tab of the active space opens a new tab there, as in Arc,
-+//   instead of leaving the space.
++// - Closing the last tab of the active space opens a new tab there first, as
++//   in Arc, instead of leaving the space.
 +// Owned by EmbedderBrowserWindowFeatures.
 +class SpaceController : public TabSpaceFilter,
 +                        public TabStripModelObserver,
@@ -444,12 +492,14 @@
 +
 +  // TabSpaceFilter:
 +  bool IsTabInActiveSpace(const tabs::TabInterface* tab) const override;
++  void WillCloseTabs(const std::vector<tabs::TabInterface*>& tabs) override;
 +
 +  // TabStripModelObserver:
 +  void OnTabStripModelChanged(
 +      TabStripModel* tab_strip_model,
 +      const TabStripModelChange& change,
 +      const TabStripSelectionChange& selection) override;
++  void OnTabPinnedStateChanged(tabs::TabInterface* tab, int index) override;
 +
 +  // SpaceRegistry::Observer:
 +  void OnSpacesChanged() override;
@@ -459,6 +509,8 @@
 +  base::Uuid ResolveSpace(const base::Uuid& space_id) const;
 +
 +  // The space the active tab says should be shown. See the class comment.
++  // While a favorite is active this goes by last-active times, which is what
++  // session restore has.
 +  base::Uuid GetSpaceForActiveTab() const;
 +
 +  // The most recently active tab, not a favorite, that `predicate` accepts.
@@ -482,6 +534,8 @@
 +  const raw_ptr<TabStripModel> tab_strip_model_;
 +  const raw_ptr<SpaceRegistry> registry_;
 +  base::Uuid active_space_id_;
++  // The last tab activated in each space, to return to when switching back.
++  std::map<base::Uuid, tabs::TabHandle> last_active_tabs_;
 +
 +  base::ScopedObservation<SpaceRegistry, SpaceRegistry::Observer>
 +      registry_observation_{this};
@@ -494,13 +548,15 @@
 +#endif  // CHROME_BROWSER_UI_SPACES_SPACE_CONTROLLER_H_
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/tab_space_filter.h
-@@ -0,0 +1,30 @@
+@@ -0,0 +1,38 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#ifndef CHROME_BROWSER_UI_SPACES_TAB_SPACE_FILTER_H_
 +#define CHROME_BROWSER_UI_SPACES_TAB_SPACE_FILTER_H_
++
++#include <vector>
 +
 +namespace tabs {
 +class TabInterface;
@@ -517,6 +573,12 @@
 +  // Whether `tab` is shown in the active space: it belongs to that space, or
 +  // it is a favorite, which shows in every space.
 +  virtual bool IsTabInActiveSpace(const tabs::TabInterface* tab) const = 0;
++
++  // Called before `tabs` are closed, outside the TabStripModel's re-entrancy
++  // guard, so the tab strip can still be changed: if they include the active
++  // tab and the active space's last other tabs, a new tab is opened there
++  // first, so the window stays in the space.
++  virtual void WillCloseTabs(const std::vector<tabs::TabInterface*>& tabs) = 0;
 +
 + protected:
 +  virtual ~TabSpaceFilter() = default;
@@ -547,7 +609,18 @@
  using base::UserMetricsAction;
  using content::WebContents;
  
-@@ -2277,6 +2280,18 @@ std::optional<tab_groups::TabGroupId> Ta
+@@ -1389,6 +1392,10 @@ void TabStripModel::CloseWebContents(con
+ 
+   CHECK(contents);
+   CHECK_NE(GetIndexOfWebContents(contents), kNoTab);
++  // helium-spaces
++  if (space_filter_ && !closing_all_) {
++    space_filter_->WillCloseTabs({GetTabForWebContents(contents)});
++  }
+   CloseTabs({contents}, close_types);
+ }
+ 
+@@ -2277,6 +2284,18 @@ std::optional<tab_groups::TabGroupId> Ta
    return selection_model_.focused_group();
  }
  
@@ -566,7 +639,30 @@
  void TabStripModel::EnterFocusMode(const tab_groups::TabGroupId& group) {
    CHECK(base::FeatureList::IsEnabled(features::kTabGroupsFocusing));
  
-@@ -3979,6 +3994,10 @@ std::vector<int> TabStripModel::GetIndic
+@@ -3546,6 +3565,10 @@ void TabStripModel::ExecuteCloseTabs(
+           "close-window-with-last-tab") == "never") {
+     delegate()->AddTabAt(GURL(), -1, true);
+   }
++  // helium-spaces
++  if (space_filter_ && !closing_all_) {
++    space_filter_->WillCloseTabs(tabs_to_close);
++  }
+   ReentrancyCheck reentrancy_check(&reentrancy_guard_);
+ 
+   CreateHistoricalSplitIfClosing(tabs_to_close, close_types);
+@@ -3821,7 +3844,10 @@ std::optional<int> TabStripModel::GetNex
+   CHECK(group_model()->ContainsTabGroup(collapsing_group));
+   gfx::Range group_tab_indices =
+       group_model()->GetTabGroup(collapsing_group)->ListTabs();
+-  return GetNextExpandedActiveTab(group_tab_indices, [](int) { return true; });
++  // helium-spaces: Stay in the active space.
++  return GetNextExpandedActiveTab(group_tab_indices, [this](int index) {
++    return IsTabInActiveSpace(index);
++  });
+ }
+ 
+ void TabStripModel::ForgetAllOpeners() {
+@@ -3979,6 +4005,10 @@ std::vector<int> TabStripModel::GetIndic
      if (focused_group.has_value() && GetTabGroupForTab(i) != focused_group) {
        continue;
      }
@@ -577,18 +673,19 @@
      if (!indices_to_exclude.Contains(gfx::Range(i, i + 1)) && !IsTabPinned(i) &&
          (!is_selected || !IsTabSelected(i))) {
        indices.push_back(i);
-@@ -4016,6 +4035,10 @@ std::vector<tabs::TabInterface*> TabStri
-     if (focused_group.has_value() && tab->GetGroup() != focused_group) {
+@@ -4025,6 +4055,11 @@ std::vector<tabs::TabInterface*> TabStri
        continue;
      }
+ 
 +    // helium-spaces: And in the active space.
 +    if (!IsTabInActiveSpace(tab)) {
 +      continue;
 +    }
- 
-     if (tab == invoked_tab || tab->IsPinned()) {
-       if (id == CommandCloseTabsToLeft && tab == invoked_tab) {
-@@ -4529,7 +4552,13 @@ void TabStripModel::SelectMRUTab(TabRela
++
+     // If the tab that the context menu command is invoked on is not selected
+     // and also in a split, also exclude tabs from that split from being closed.
+     // We don't have to worry about the case when a split is selected, because
+@@ -4529,7 +4564,13 @@ void TabStripModel::SelectMRUTab(TabRela
      }
  
      for (int i = 0; i < count(); ++i) {
@@ -603,7 +700,7 @@
      }
  
      std::sort(mru_cycle_list_.begin(), mru_cycle_list_.end(),
-@@ -4585,6 +4614,11 @@ void TabStripModel::SelectRelativeTab(Ta
+@@ -4585,6 +4626,11 @@ void TabStripModel::SelectRelativeTab(Ta
        return true;
      }
  
@@ -615,7 +712,7 @@
      // Do not select the tab if it is not part of the focused state.
      return focused_group.has_value() &&
             !tabs::TabStripModelSelectionState::IsTabValidInFocusedGroup(
-@@ -6110,7 +6144,9 @@ std::optional<int> TabStripModel::Determ
+@@ -6110,7 +6156,9 @@ std::optional<int> TabStripModel::Determ
      // otherwise a legitimate selection, so it is kept separate from the
      // visibility check below.
      auto is_valid_for_focus = [this, &focused_group](int index) {
@@ -626,6 +723,27 @@
          return false;
        }
        return !focused_group.has_value() ||
+@@ -6211,6 +6259,20 @@ std::optional<int> TabStripModel::Determ
+     return new_selected_index;
+   }
+ 
++  // helium-spaces: Rather than leave the active space, take its nearest tab,
++  // even one in a collapsed group, as the sibling preference above does. If it
++  // has none left, SpaceController has opened one or opens one next.
++  if (space_filter_) {
++    for (int distance = 1; distance < count(); ++distance) {
++      for (int index : {static_cast<int>(block_tabs.end()) - 1 + distance,
++                        static_cast<int>(block_tabs.start()) - distance}) {
++        if (ContainsIndex(index) && IsTabInActiveSpace(index)) {
++          return GetTabIndexAfterClosing(index, block_tabs);
++        }
++      }
++    }
++  }
++
+   // Otherwise, prefer picking the tab after the last tab in the block.
+   const int first_tab_in_block = static_cast<int>(block_tabs.start());
+   const int last_tab_in_block = static_cast<int>(block_tabs.end() - 1);
 --- a/chrome/browser/ui/tabs/tab_strip_model.h
 +++ b/chrome/browser/ui/tabs/tab_strip_model.h
 @@ -56,6 +56,10 @@ class TabGroupModel;

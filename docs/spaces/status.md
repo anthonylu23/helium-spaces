@@ -80,8 +80,16 @@ Last updated 2026-10-23.
           tab, so it needs no session data of its own. New tabs join the
           active space. Closing a space's last tab opens a new tab there.
           Ctrl+Tab (and Helium's MRU cycling), Cmd+1..9, the tab activated
-          after a close, and close-other/close-to-the-side tabs stay in the
-          active space. Mutation-tested like step 2.
+          after a close, collapsing a group, and close-other/close-to-the-side
+          tabs stay in the active space. Mutation-tested like step 2. A
+          review workflow (3 reviewers, adversarial verify) found 7 real
+          issues, all fixed: unpinning the active favorite, returning to a
+          background tab instead of the last active one, briefly showing
+          another space's tab when closing a space's last tab (now a new tab
+          opens before the close), group collapse and collapsed-group close
+          fallbacks, close-tabs-to-the-left on an out-of-space tab, and a
+          smoke check that could not fail. The last three have no smoke
+          check: the internals page can't drive groups or the tab menu.
        b. Filtering in the views, at the focus-mode hook points: the
           collection views (Vertical) and the legacy `TabContainerImpl`
           (Classic, Compact, Dynamic). Then range selection, keyboard tab
