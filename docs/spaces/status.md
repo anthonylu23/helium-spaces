@@ -2,11 +2,14 @@
 
 **Current phase: 3 (Spaces v1). Steps 1 and 2 committed on branch
 `spaces/registry`. Step 3a (`SpaceController`, model and command hooks)
-committed on branch `spaces/controller`; next is 3b, the tab strip views. Step 0 spike: code review and
+pushed on branch `spaces/controller`. Step 3b (hiding tabs in the tab
+strip views) visually checked in all four layouts and pushed there too; next
+is 3c. Step 0 spike: code review and
 computer-use checks support option C; actual dragging and human animation
 review remain open.**
 
-Last updated 2026-10-23.
+Last updated 2026-10-23. Deferred work and deliberate decisions are in
+`deferred.md`.
 
 ## Baseline
 
@@ -15,7 +18,7 @@ Last updated 2026-10-23.
 | Helium | 0.20.1.1 (core `f29a2596`, macOS `9aa975a`) |
 | Chromium | 156.0.8078.47 |
 | Machine | M3 Pro, 11 cores, 18 GB RAM, Xcode 26.2 (upstream CI uses 26.5) |
-| Our patches | 6, in `patches/spaces/` |
+| Our patches | 7, in `patches/spaces/` |
 
 ## Measured build costs
 
@@ -90,11 +93,27 @@ Last updated 2026-10-23.
           fallbacks, close-tabs-to-the-left on an out-of-space tab, and a
           smoke check that could not fail. The last three have no smoke
           check: the internals page can't drive groups or the tab menu.
-       b. Filtering in the views, at the focus-mode hook points: the
-          collection views (Vertical) and the legacy `TabContainerImpl`
-          (Classic, Compact, Dynamic). Then range selection, keyboard tab
-          moves and the contiguity rule, which matter once hidden tabs are
-          hidden.
+       b. Done:
+          `spaces/ui/hide-tabs-outside-active-space.patch`. Tabs outside the
+          active space, their group headers, and pinned tabs of other spaces
+          are hidden next to the focus-mode checks: `TabStripLayoutHelper`
+          and `TabContainerImpl` (Classic, Compact, Dynamic), and the
+          collection containers (Vertical). Both stacks relayout through
+          `TabSpaceFilter::RegisterTabVisibilityChanged()`. A tab moved to
+          another space leaves its group, so groups stay in one space.
+          `devutils/spaces_screenshots.mjs` exercises every layout and space
+          in a real window and screenshots them, given Screen Recording
+          permission. Codex's visual check and recheck (2026-10-23) passed in
+          all four layouts: settled and immediate switches (no other-space
+          tabs, slivers or headers once the horizontal strip snapped instead
+          of animating), layout changes, resizing, Cmd+T/W, Ctrl+Tab,
+          Cmd+1..9, favorites, groups, pinning, and quit and restore seen on
+          screen. Dynamic's new-tab button sits in the toolbar by Helium's
+          design. Open: a hover card already showing for a tab fades out over
+          the new space instead of vanishing, and keyboard focus on hidden
+          tabs is untested; both are in `deferred.md`.
+       c. Range selection, keyboard tab moves, drag targets and the
+          contiguity rule.
     4. Switcher strip, keyboard switching, tab context menu.
 3. Consider Xcode 26.5 to match upstream CI before the first rebase.
 

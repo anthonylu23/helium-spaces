@@ -32,4 +32,5 @@ spaces/core/add-spaces-feature-flag.patch
 spaces/core/add-space-registry.patch
 spaces/core/add-space-tab-helper.patch
 spaces/core/add-space-controller.patch
+spaces/ui/hide-tabs-outside-active-space.patch
 spaces/tooling/add-spaces-internals.patch

@@ -1,0 +1,413 @@
+--- /dev/null
++++ b/chrome/browser/ui/views/spaces/space_tab_views.cc
+@@ -0,0 +1,44 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/spaces/space_tab_views.h"
++
++#include "chrome/browser/ui/spaces/space_controller.h"
++#include "chrome/browser/ui/views/tabs/common/split_tab_view.h"
++#include "chrome/browser/ui/views/tabs/common/tab_group_view.h"
++#include "chrome/browser/ui/views/tabs/common/tab_view.h"
++#include "components/tabs/public/tab_group.h"
++#include "components/tabs/public/tab_interface.h"
++#include "ui/views/view.h"
++#include "ui/views/view_utils.h"
++
++namespace spaces {
++
++namespace {
++
++// The first tab shown by `child`, or null if it has none.
++const tabs::TabInterface* GetFirstTab(const views::View* child) {
++  if (const auto* tab_view = views::AsViewClass<TabView>(child)) {
++    return tab_view->GetTabInterface();
++  }
++  if (const auto* group_view = views::AsViewClass<TabGroupView>(child)) {
++    return group_view->GetTabGroup().GetFirstTab();
++  }
++  if (views::IsViewClass<SplitTabView>(child)) {
++    for (const views::View* split_child : child->children()) {
++      if (const auto* tab_view = views::AsViewClass<TabView>(split_child)) {
++        return tab_view->GetTabInterface();
++      }
++    }
++  }
++  return nullptr;
++}
++
++}  // namespace
++
++bool IsTabContainerChildHiddenBySpace(const views::View* child) {
++  return IsTabHiddenBySpace(GetFirstTab(child));
++}
++
++}  // namespace spaces
+--- /dev/null
++++ b/chrome/browser/ui/views/spaces/space_tab_views.h
+@@ -0,0 +1,21 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_SPACES_SPACE_TAB_VIEWS_H_
++#define CHROME_BROWSER_UI_VIEWS_SPACES_SPACE_TAB_VIEWS_H_
++
++namespace views {
++class View;
++}
++
++namespace spaces {
++
++// Whether a child of a pinned or unpinned tab container in the collection tab
++// strip (a TabView, TabGroupView or SplitTabView) is outside the active space,
++// so the container hides it. A group's or split's tabs are all in one space.
++bool IsTabContainerChildHiddenBySpace(const views::View* child);
++
++}  // namespace spaces
++
++#endif  // CHROME_BROWSER_UI_VIEWS_SPACES_SPACE_TAB_VIEWS_H_
+--- a/chrome/browser/ui/views/tabs/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/BUILD.gn
+@@ -219,6 +219,7 @@ source_set("tab_container_impl") {
+     "//base",
+     "//base:i18n",
+     "//chrome/browser/ui:layout_constants",
++    "//chrome/browser/ui/spaces:controller",
+     "//chrome/browser/ui/tabs",
+     "//chrome/browser/ui/tabs:tab_strip",
+     "//chrome/browser/ui/views/frame",
+@@ -440,6 +441,7 @@ source_set("tab_strip_impl") {
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/color:color_headers",
+     "//chrome/browser/ui/navigator",
++    "//chrome/browser/ui/spaces:tab_space_filter",
+     "//chrome/browser/ui/tabs",
+     "//chrome/browser/ui/tabs:features",
+     "//chrome/browser/ui/tabs:tab_group",
+--- a/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
++++ b/chrome/browser/ui/views/tabs/browser_tab_strip_controller.cc
+@@ -97,6 +97,9 @@
+ #include "ui/aura/window.h"
+ #endif
+ 
++// helium-spaces
++#include "chrome/browser/ui/spaces/tab_space_filter.h"
++
+ using base::UserMetricsAction;
+ using content::WebContents;
+ 
+@@ -197,6 +200,23 @@ void BrowserTabStripController::InitFrom
+   if (base::FeatureList::IsEnabled(features::kTabGroupsFocusing)) {
+     UpdateAllTabsFocusFreezing();
+   }
++
++  // helium-spaces: Lay out again when the active space changes, the way a
++  // focus change does; OnTabGroupFocusChanged() ignores its arguments. Then
++  // skip the animation: switching spaces is instant, and animating would
++  // show the other space's tabs shrinking away.
++  if (spaces::TabSpaceFilter* space_filter = model_->space_filter()) {
++    space_visibility_subscription_ =
++        space_filter->RegisterTabVisibilityChanged(base::BindRepeating(
++            [](BrowserTabStripController* controller) {
++              if (controller->tabstrip_) {
++                controller->tabstrip_->OnTabGroupFocusChanged(std::nullopt,
++                                                              std::nullopt);
++                controller->tabstrip_->StopAnimating();
++              }
++            },
++            base::Unretained(this)));
++  }
+ }
+ 
+ void BrowserTabStripController::Reset() {
+--- a/chrome/browser/ui/views/tabs/browser_tab_strip_controller.h
++++ b/chrome/browser/ui/views/tabs/browser_tab_strip_controller.h
+@@ -186,6 +186,9 @@ class BrowserTabStripController : public
+   std::unique_ptr<ImmersiveRevealedLock> immersive_reveal_lock_;
+ 
+   base::CallbackListSubscription glass_frame_service_subscription_;
++
++  // helium-spaces
++  base::CallbackListSubscription space_visibility_subscription_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_VIEWS_TABS_BROWSER_TAB_STRIP_CONTROLLER_H_
+--- a/chrome/browser/ui/views/tabs/common/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/common/BUILD.gn
+@@ -46,6 +46,9 @@ source_set("common") {
+ 
+ source_set("impl") {
+   sources = [
++    # helium-spaces: Built here, since it needs this target's view headers.
++    "//chrome/browser/ui/views/spaces/space_tab_views.cc",
++    "//chrome/browser/ui/views/spaces/space_tab_views.h",
+     "dragged_tabs_container.cc",
+     "horizontal_tab_style_views.cc",
+     "horizontal_tab_style_views.h",
+@@ -105,6 +108,8 @@ source_set("impl") {
+     "//chrome/browser/ui/actions:actions_headers",
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/color:color_headers",
++    "//chrome/browser/ui/spaces:controller",
++    "//chrome/browser/ui/spaces:tab_space_filter",
+     "//chrome/browser/ui/tab_contents",
+     "//chrome/browser/ui/tabs",
+     "//chrome/browser/ui/tabs:tab_group",
+--- a/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
++++ b/chrome/browser/ui/views/tabs/common/pinned_tab_container_view.cc
+@@ -26,6 +26,9 @@
+ #include "ui/views/view_class_properties.h"
+ #include "ui/views/view_utils.h"
+ 
++// helium-spaces
++#include "chrome/browser/ui/views/spaces/space_tab_views.h"
++
+ namespace {
+ constexpr int kTabPadding = 4;
+ }  // namespace
+@@ -96,7 +99,10 @@ gfx::Size PinnedTabContainerView::GetMin
+     int min_width = 0;
+     size_t count = 0;
+     for (const auto* child : collection_node_->GetDirectChildren()) {
+-      if (!layout_manager_->CanBeVisible(child)) {
++      // helium-spaces: Pinned tabs of other spaces are hidden; favorites
++      // aren't.
++      if (!layout_manager_->CanBeVisible(child) ||
++          spaces::IsTabContainerChildHiddenBySpace(child)) {
+         continue;
+       }
+       auto drag_data = GetVisualDataForDraggedView(*child);
+@@ -116,7 +122,13 @@ gfx::Size PinnedTabContainerView::GetMin
+ 
+   // The minimum size should be enough to show a row and a half, if needed.
+   auto collapse_state = GetTabStripCollapseState();
+-  const int num_children = collection_node_->GetDirectChildren().size();
++  // helium-spaces: Count only the tabs shown in the active space.
++  int num_children = 0;
++  for (const auto* child : collection_node_->GetDirectChildren()) {
++    if (!spaces::IsTabContainerChildHiddenBySpace(child)) {
++      num_children++;
++    }
++  }
+   const float min_rows = std::min(
+       (collapse_state != tabs::VerticalTabStripCollapseState::kExpanded ? 1.5f
+                                                                         : 1.0f),
+@@ -348,8 +360,11 @@ views::ProposedLayout PinnedTabContainer
+     bounds.set_height(container_height);
+ 
+     auto drag_data = GetVisualDataForDraggedView(*child);
+-    const bool should_show_child = layout_manager_->CanBeVisible(child) &&
+-                                   !(drag_data && drag_data->should_hide);
++    // helium-spaces: Hide pinned tabs of other spaces.
++    const bool should_show_child =
++        layout_manager_->CanBeVisible(child) &&
++        !(drag_data && drag_data->should_hide) &&
++        !spaces::IsTabContainerChildHiddenBySpace(child);
+     if (!should_show_child) {
+       layouts.child_layouts.emplace_back(child, false, gfx::Rect());
+       continue;
+@@ -382,7 +397,13 @@ views::ProposedLayout PinnedTabContainer
+ 
+   int x = 0;
+   int y = 0;
+-  int children_on_row = children.size();
++  // helium-spaces: Count only the tabs shown in the active space.
++  int children_on_row = 0;
++  for (const auto* child : children) {
++    if (!spaces::IsTabContainerChildHiddenBySpace(child)) {
++      children_on_row++;
++    }
++  }
+ 
+   if (children_on_row == 0) {
+     layouts.host_size = gfx::Size(0, 0);
+@@ -437,7 +458,10 @@ views::ProposedLayout PinnedTabContainer
+     bounds.set_width(child_width);
+ 
+     auto drag_data = GetVisualDataForDraggedView(*child);
+-    const bool should_show_child = !(drag_data && drag_data->should_hide);
++    // helium-spaces: Hide pinned tabs of other spaces.
++    const bool should_show_child =
++        !(drag_data && drag_data->should_hide) &&
++        !spaces::IsTabContainerChildHiddenBySpace(child);
+     if (!should_show_child) {
+       layouts.child_layouts.emplace_back(child, false, gfx::Rect());
+       continue;
+--- a/chrome/browser/ui/views/tabs/common/root_tab_collection_node.cc
++++ b/chrome/browser/ui/views/tabs/common/root_tab_collection_node.cc
+@@ -19,6 +19,9 @@
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/navigation_controller.h"
+ 
++// helium-spaces
++#include "chrome/browser/ui/spaces/tab_space_filter.h"
++
+ namespace {
+ 
+ tabs::ConstChildPtr GetNodeFromHandle(
+@@ -53,9 +56,26 @@ void RootTabCollectionNode::Init() {
+   tab_strip_model_->Root()->AddObserver(this);
+   tab_strip_model_->SetTabStripUI(this);
+   add_node_view_to_parent_.Run(Initialize());
++
++  // helium-spaces: Lay the tab containers out again when the active space
++  // changes. Invalidating the root alone doesn't reach them.
++  if (spaces::TabSpaceFilter* space_filter = tab_strip_model_->space_filter()) {
++    space_visibility_subscription_ =
++        space_filter->RegisterTabVisibilityChanged(base::BindRepeating(
++            [](RootTabCollectionNode* root) {
++              for (const Type type : {Type::PINNED, Type::UNPINNED}) {
++                TabCollectionNode* node = root->GetChildNodeOfType(type);
++                if (node && node->view()) {
++                  node->view()->InvalidateLayout();
++                }
++              }
++            },
++            base::Unretained(this)));
++  }
+ }
+ 
+ void RootTabCollectionNode::Reset() {
++  space_visibility_subscription_ = {};
+   tab_strip_model_->Root()->RemoveObserver(this);
+   tab_strip_model_->RemoveObserver(this);
+   Deinitialize();
+--- a/chrome/browser/ui/views/tabs/common/root_tab_collection_node.h
++++ b/chrome/browser/ui/views/tabs/common/root_tab_collection_node.h
+@@ -98,6 +98,9 @@ class RootTabCollectionNode : public Tab
+       base::RepeatingCallbackList<void(const tabs::TabInterface*)>;
+   ActiveTabChangedCallbackList on_active_tab_changed_callback_list_;
+ 
++  // helium-spaces
++  base::CallbackListSubscription space_visibility_subscription_;
++
+   base::WeakPtrFactory<RootTabCollectionNode> weak_ptr_factory_{this};
+ };
+ 
+--- a/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
++++ b/chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc
+@@ -24,6 +24,9 @@
+ #include "ui/views/view.h"
+ #include "ui/views/view_utils.h"
+ 
++// helium-spaces
++#include "chrome/browser/ui/views/spaces/space_tab_views.h"
++
+ namespace {
+ constexpr int kTabVerticalPadding = 2;
+ }  // namespace
+@@ -363,6 +366,10 @@ gfx::Size UnpinnedTabContainerViewLayout
+         should_show = false;
+       }
+     }
++    // helium-spaces
++    if (spaces::IsTabContainerChildHiddenBySpace(child)) {
++      should_show = false;
++    }
+     if (should_show) {
+       num_children++;
+     }
+@@ -391,6 +398,10 @@ bool UnpinnedTabContainerViewLayout::IsC
+       GetGroupIdForChild(child) != focused_group_id.value()) {
+     return false;
+   }
++  // helium-spaces: Hide tabs outside the active space.
++  if (spaces::IsTabContainerChildHiddenBySpace(child)) {
++    return false;
++  }
+   return true;
+ }
+ 
+--- a/chrome/browser/ui/views/tabs/tab_container_impl.cc
++++ b/chrome/browser/ui/views/tabs/tab_container_impl.cc
+@@ -39,6 +39,9 @@
+ #include "ui/views/rect_based_targeting_utils.h"
+ #include "ui/views/view_utils.h"
+ 
++// helium-spaces
++#include "chrome/browser/ui/spaces/space_controller.h"
++
+ namespace {
+ // When the window has a top drag handle, a thin strip at the top of
+ // inactive tabs and the new tab button can be treated as part of the window
+@@ -741,6 +744,8 @@ void TabContainerImpl::SetTabSlotVisibil
+ 
+   std::set<tab_groups::TabGroupId> visibility_changed_groups;
+   bool last_tab_visible = false;
++  // helium-spaces
++  bool last_tab_hidden_by_space = false;
+   std::optional<tab_groups::TabGroupId> last_tab_group;
+   std::vector<Tab*> tabs = layout_helper_->GetTabs();
+   for (auto it = tabs.rbegin(); true; ++it) {
+@@ -755,6 +760,10 @@ void TabContainerImpl::SetTabSlotVisibil
+       if (focused_group.has_value() && last_tab_group != focused_group) {
+         should_header_be_visible = false;
+       }
++      // helium-spaces: A group's tabs are all in one space.
++      if (last_tab_hidden_by_space) {
++        should_header_be_visible = false;
++      }
+       if (should_header_be_visible != group_view->header()->GetVisible()) {
+         visibility_changed_groups.insert(last_tab_group.value());
+       }
+@@ -793,8 +802,13 @@ void TabContainerImpl::SetTabSlotVisibil
+         current_group.has_value() &&
+         controller_->IsGroupCollapsed(current_group.value());
+ 
++    // helium-spaces: So are tabs outside the active space, pinned or not.
++    last_tab_hidden_by_space =
++        spaces::IsTabHiddenBySpace(tab->tab_handle().Get());
++
+     const bool is_collapsed =
+-        (is_collapsed_by_group || is_collapsed_by_focus_mode) &&
++        (is_collapsed_by_group || is_collapsed_by_focus_mode ||
++         last_tab_hidden_by_space) &&
+         (tab->bounds().width() <= tab->tab_style()->GetTabOverlap());
+     const bool should_be_visible = is_collapsed ? false : last_tab_visible;
+ 
+@@ -1464,6 +1478,10 @@ bool TabContainerImpl::IsTabVisible(cons
+   if (!tab) {
+     return false;
+   }
++  // helium-spaces
++  if (spaces::IsTabHiddenBySpace(tab->tab_handle().Get())) {
++    return false;
++  }
+   if (tab->data().pinned) {
+     return true;
+   }
+--- a/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
++++ b/chrome/browser/ui/views/tabs/tab_strip_layout_helper.cc
+@@ -25,6 +25,9 @@
+ #include "ui/views/view_model.h"
+ #include "ui/views/view_utils.h"
+ 
++// helium-spaces
++#include "chrome/browser/ui/spaces/space_controller.h"
++
+ struct TabStripLayoutHelper::TabSlot {
+   static TabStripLayoutHelper::TabSlot CreateForTabSlotView(TabSlotView* view,
+                                                             TabPinned pinned) {
+@@ -416,6 +419,19 @@ std::optional<int> TabStripLayoutHelper:
+ }
+ 
+ bool TabStripLayoutHelper::SlotIsCollapsedTab(int i) const {
++  // helium-spaces: Tabs outside the active space collapse like tabs outside a
++  // focused group, pinned ones too, and so does the header of a group of them.
++  // A group's tabs are all in one space, and its header comes first.
++  const int tab_slot =
++      slots_[i].type == TabSlotView::ViewType::kTabGroupHeader ? i + 1 : i;
++  if (tab_slot < static_cast<int>(slots_.size()) &&
++      slots_[tab_slot].type == TabSlotView::ViewType::kTab &&
++      slots_[tab_slot].view->group() == slots_[i].view->group() &&
++      spaces::IsTabHiddenBySpace(
++          static_cast<Tab*>(slots_[tab_slot].view)->tab_handle().Get())) {
++    return true;
++  }
++
+   const std::optional<tab_groups::TabGroupId> focused_group =
+       controller_->GetFocusedGroup();
+ 
