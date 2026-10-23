@@ -7,6 +7,9 @@
 //      no spaces are written.
 //   2. Flag on: the profile gets exactly one default space.
 //   3. Flag on, same profile: the default space keeps its id.
+//   4. Flag on: tabs assigned to spaces through chrome://spaces-internals keep
+//      their space across restarts, including a restart with no changes and
+//      one after a forced rewrite of the session file.
 // Needs a global WebSocket: Node 22+, or Node 20.10+ with --experimental-websocket.
 // Exits non-zero on any failed check.
 
@@ -37,11 +40,12 @@ function newProfile() {
   return dir;
 }
 
-async function devtoolsTarget(port) {
+// Returns the first page target whose URL starts with `url`.
+async function devtoolsTarget(port, url) {
   for (let i = 0; i < 60; i++) {
     try {
       const res = await fetch(`http://127.0.0.1:${port}/json/list`);
-      const page = (await res.json()).find((t) => t.type === 'page');
+      const page = (await res.json()).find((t) => t.type === 'page' && t.url.startsWith(url));
       if (page) return page;
     } catch {}
     await sleep(500);
@@ -67,9 +71,10 @@ function session(wsUrl) {
   return { send, close: () => ws.close() };
 }
 
-// Starts the browser on `profile` and returns a DevTools session for its page,
-// plus close(), which shuts down cleanly so prefs get written to disk.
-async function launch(profile, extraArgs = []) {
+// Starts the browser on `profile` with `url` and returns a DevTools session for
+// that page, plus close(), which shuts down cleanly so prefs and the session
+// get written to disk.
+async function launch(profile, extraArgs = [], url = 'about:blank') {
   const port = 9300 + Math.floor(Math.random() * 500);
   const browser = spawn(binary, [
     '--headless=new',
@@ -78,12 +83,16 @@ async function launch(profile, extraArgs = []) {
     '--use-mock-keychain',
     '--no-first-run',
     ...extraArgs,
-    'about:blank',
+    url,
   ], { stdio: 'ignore' });
   const exited = new Promise((r) => browser.once('exit', r));
   try {
-    const cdp = session((await devtoolsTarget(port)).webSocketDebuggerUrl);
-    const close = async () => {
+    const cdp = session((await devtoolsTarget(port, url)).webSocketDebuggerUrl);
+    const close = async ({ waitForSessionSave = false } = {}) => {
+      // Session commands are written 2.5 s after a change (kSaveDelay in
+      // command_storage_manager.cc), and a headless quit drops any still
+      // pending, so let them land first.
+      if (waitForSessionSave) await sleep(3500);
       // Browser.close shuts down gracefully; never answers, so don't await it.
       cdp.send('Browser.close');
       const timedOut = await Promise.race([exited.then(() => false), sleep(15000).then(() => true)]);
@@ -168,9 +177,117 @@ async function checkDefaultSpace() {
         `${defaults[0]?.id} -> ${second[0]?.id}`);
 }
 
+// Reloads chrome://spaces-internals in `cdp` and returns its state.
+async function internalsState(cdp) {
+  await cdp.send('Page.navigate', { url: INTERNALS });
+  for (let i = 0; i < 20; i++) {
+    await sleep(250);
+    const r = await cdp.send('Runtime.evaluate', {
+      expression: "document.getElementById('state')?.textContent ?? ''", returnByValue: true });
+    const text = r.result?.result?.value;
+    if (text) return JSON.parse(text);
+  }
+  throw new Error('chrome://spaces-internals did not render');
+}
+
+// Sends a chrome.send() message to chrome://spaces-internals, which must be
+// loaded in `cdp`.
+async function internalsSend(cdp, message, args) {
+  await cdp.send('Runtime.evaluate', { expression: `chrome.send(${JSON.stringify(message)}, ${JSON.stringify(args)})` });
+}
+
+const INTERNALS = 'chrome://spaces-internals/';
+
+// Maps every test tab ("T1".."T6", from the end of its URL) to its space name,
+// or "default". Other tabs are ignored. Matches on URL because a restored
+// background tab has no title until it loads.
+function tabSpaces(state) {
+  const names = new Map(state.spaces.map((s) => [s.id, s.default ? 'default' : s.name]));
+  const result = {};
+  for (const window of state.windows) {
+    for (const tab of window.tabs) {
+      const name = /^data:.*(T\d)$/.exec(tab.url)?.[1];
+      if (name) result[name] = tab.space_id ? names.get(tab.space_id) : 'default';
+    }
+  }
+  return result;
+}
+
+// Reloads chrome://spaces-internals until all `count` test tabs have loaded
+// (background tabs take a few seconds), and returns its state.
+async function waitForTestTabs(cdp, count) {
+  let state;
+  for (let i = 0; i < 40; i++) {
+    state = await internalsState(cdp);
+    if (Object.keys(tabSpaces(state)).length === count) return state;
+    await sleep(250);
+  }
+  return state;
+}
+
+async function checkTabSpaces() {
+  const profile = newProfile();
+  const args = ['--enable-features=HeliumSpaces'];
+  const restore = [...args, '--restore-last-session'];
+  const expected = { T1: 'Work', T2: 'Work', T3: 'Play', T4: 'Play', T5: 'default', T6: 'default' };
+
+  let { cdp, close } = await launch(profile, args);
+  await internalsState(cdp);
+  await internalsSend(cdp, 'addSpace', ['Work']);
+  await internalsSend(cdp, 'addSpace', ['Play']);
+  for (const title of Object.keys(expected)) {
+    await cdp.send('Target.createTarget', { url: `data:text/html,<title>${title}</title>${title}` });
+  }
+  let state = await waitForTestTabs(cdp, Object.keys(expected).length);
+  const ids = Object.fromEntries(state.spaces.map((s) => [s.name, s.id]));
+  const window = state.windows[0];
+  const index = Object.fromEntries(window.tabs.map((t) => [/(T\d)$/.exec(t.url)?.[1], t.index]));
+  // T5 goes to Work and back, to check that moving to the default space
+  // overrides the earlier id in the same session file.
+  for (const [title, space] of [...Object.entries(expected), ['T5', 'Work'], ['T5', 'default']]) {
+    await internalsSend(cdp, 'assignTab', [window.session_id, index[title], space === 'default' ? '' : ids[space]]);
+  }
+  state = await internalsState(cdp);
+  check('tabs take the space they are assigned', JSON.stringify(tabSpaces(state)) === JSON.stringify(expected),
+        JSON.stringify(tabSpaces(state)));
+  await close({ waitForSessionSave: true });
+
+  ({ cdp, close } = await launch(profile, restore));
+  state = await waitForTestTabs(cdp, Object.keys(expected).length);
+  check('tabs keep their space after a restart', JSON.stringify(tabSpaces(state)) === JSON.stringify(expected),
+        JSON.stringify(tabSpaces(state)));
+  await close({ waitForSessionSave: true });
+
+  // Restored tabs are written to the new session file by BuildCommandsForTab(),
+  // which drops tab extra data without our hook; a second restart with no
+  // changes checks that.
+  ({ cdp, close } = await launch(profile, restore));
+  state = await waitForTestTabs(cdp, Object.keys(expected).length);
+  check('tabs keep their space after a second restart', JSON.stringify(tabSpaces(state)) === JSON.stringify(expected),
+        JSON.stringify(tabSpaces(state)));
+  await internalsSend(cdp, 'rewriteSession', []);
+  await close({ waitForSessionSave: true });
+
+  ({ cdp, close } = await launch(profile, restore));
+  state = await waitForTestTabs(cdp, Object.keys(expected).length);
+  check('tabs keep their space after the session file is rewritten',
+        JSON.stringify(tabSpaces(state)) === JSON.stringify(expected), JSON.stringify(tabSpaces(state)));
+
+  // Reopening a closed tab (Cmd+Shift+T) goes through tab restore instead.
+  const t3 = state.windows.flatMap((w) => w.tabs.map((t) => ({ window: w.session_id, ...t })))
+      .find((t) => t.url.endsWith('T3'));
+  await internalsSend(cdp, 'closeTab', [t3.window, t3.index]);
+  state = await waitForTestTabs(cdp, Object.keys(expected).length - 1);
+  await internalsSend(cdp, 'reopenClosedTab', [t3.window]);
+  state = await waitForTestTabs(cdp, Object.keys(expected).length);
+  check('a closed tab reopens in its space', tabSpaces(state).T3 === 'Play', `T3: ${tabSpaces(state).T3}`);
+  await close();
+}
+
 try {
   await checkFlagOff();
   await checkDefaultSpace();
+  await checkTabSpaces();
 } catch (err) {
   check('smoke run', false, err.message);
 } finally {

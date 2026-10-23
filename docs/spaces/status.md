@@ -1,11 +1,11 @@
 # Status
 
-**Current phase: 3 (Spaces v1). Step 1 (`SpaceRegistry`) committed on branch
-`spaces/registry`; next is step 2. Step 0 spike: code review and
+**Current phase: 3 (Spaces v1). Steps 1 and 2 committed on branch
+`spaces/registry`; next is step 3. Step 0 spike: code review and
 computer-use checks support option C; actual dragging and human animation
 review remain open.**
 
-Last updated 2026-10-22.
+Last updated 2026-10-23.
 
 ## Baseline
 
@@ -14,7 +14,7 @@ Last updated 2026-10-22.
 | Helium | 0.20.1.1 (core `f29a2596`, macOS `9aa975a`) |
 | Chromium | 156.0.8078.47 |
 | Machine | M3 Pro, 11 cores, 18 GB RAM, Xcode 26.2 (upstream CI uses 26.5) |
-| Our patches | 3, in `patches/spaces/` |
+| Our patches | 5, in `patches/spaces/` |
 
 ## Measured build costs
 
@@ -63,12 +63,17 @@ Last updated 2026-10-22.
        `SpaceRegistry` keyed service and `helium_spaces.spaces` list pref, no
        UI. GN split: `:model` (pure logic, unit tested), `:spaces` (service,
        modularized deps only), `spaces_unittests`.
-    2. Space id per tab with session round-trip: initial write, the
-       session-file rewrite (`BuildCommandsForTab`), and tab restore. Active
-       space per window as window extra data. Plus `spaces_unittests` and a
-       minimal `chrome://spaces-internals` for the smoke test. The smoke
-       test must force a session-file rewrite.
-    3. `SpaceController` and filtering, at the focus-mode hook points, in both
+    2. Done: `spaces/core/add-space-tab-helper.patch` and
+       `spaces/tooling/add-spaces-internals.patch`. Space id per tab, written
+       when it changes and in `BuildCommandsForTab()` (session-file rewrites
+       and restored tabs), and through reopen-closed-tab. Each hook has a
+       smoke check that fails without it (verified by removing each one).
+       A `TabInserted()` hook turned out to be unnecessary and was dropped:
+       step 3 must assign a tab's space after it is in a window.
+       Active space per window moved to step 3, with `SpaceController`.
+    3. `SpaceController`, active space per window (window extra data,
+       written in `BuildCommandsForBrowser`), and filtering, at the
+       focus-mode hook points, in both
        the collection views (Vertical) and the legacy `TabContainerImpl`
        (Classic, Compact, Dynamic).
     4. Switcher strip, keyboard switching, tab context menu.
@@ -81,6 +86,8 @@ Automated (`devutils/spaces_smoke.mjs`):
 - Browser starts headless and reports a version.
 - `chrome://flags/#helium-spaces` exists, is named "Helium Spaces", is off by default.
 - Flag off: no spaces are saved. Flag on: one default space, same id after a restart.
+- Tabs assigned to spaces keep them after a restart, a second restart, a
+  forced session-file rewrite, and close plus reopen (Cmd+Shift+T).
 
 Unit (`spaces_unittests`): 12 `SpaceList` tests.
 

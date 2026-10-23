@@ -21,6 +21,8 @@ New files we add (under `chrome/browser/ui/spaces/` and
 | `chrome/browser/ui/BUILD.gn` | `spaces/core/add-space-tab-helper.patch` | Dep on `:tab_space` in `browser_tabrestore_impl` and `browser_live_tab_context_impl` | 156.0.8078.47 |
 | `chrome/browser/ui/browser_tabrestore.cc` | `spaces/core/add-space-tab-helper.patch` | Include; `RestoreSpaceIdFromExtraData()` next to glic and send-tab-to-self in `CreateRestoredTab()` | 156.0.8078.47 |
 | `chrome/browser/ui/browser_live_tab_context.cc` | `spaces/core/add-space-tab-helper.patch` | Include; `AddSpaceIdToExtraData()` in `GetExtraDataForTab()`. Helium's `core.patch` also edits this file | 156.0.8078.47 |
+| `chrome/browser/ui/webui/BUILD.gn` | `spaces/tooling/add-spaces-internals.patch` | Dep on `//chrome/browser/ui/spaces:internals` in `configs`, `enable_session_service` block | 156.0.8078.47 |
+| `chrome/browser/ui/webui/chrome_web_ui_configs.cc` | `spaces/tooling/add-spaces-internals.patch` | Include and `AddWebUIConfig()` for `SpacesInternalsUIConfig`, `ENABLE_SESSION_SERVICE` block | 156.0.8078.47 |
 | `tools/typescript/validate_tsconfig.py` | `spaces/tooling/ts-ignore-out-of-tree-definitions.patch` | Skip `.d.ts` files outside the source tree in the undeclared-deps check | 156.0.8078.47 |
 
 ## Planned hooks

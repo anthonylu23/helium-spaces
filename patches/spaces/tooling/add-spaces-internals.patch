@@ -1,0 +1,362 @@
+Add chrome://spaces-internals, a debugging page for the smoke test.
+
+Prints the profile's spaces and every tab's space as JSON, and takes
+chrome.send() messages to add a space, assign, close and reopen tabs, and
+rewrite the session file. devutils/spaces_smoke.mjs drives it to check that
+tabs keep their space across restarts. Only available while HeliumSpaces is
+enabled.
+
+--- a/chrome/browser/ui/spaces/BUILD.gn
++++ b/chrome/browser/ui/spaces/BUILD.gn
+@@ -69,6 +69,28 @@ source_set("tab_space") {
+   ]
+ }
+ 
++# chrome://spaces-internals, a debugging page the smoke test drives.
++source_set("internals") {
++  sources = [
++    "spaces_internals_ui.cc",
++    "spaces_internals_ui.h",
++  ]
++  public_deps = [ "//content/public/browser" ]
++  deps = [
++    ":features",
++    ":spaces",
++    ":tab_space",
++    "//base",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/sessions",
++    "//chrome/browser/ui:browser_commands",
++    "//chrome/browser/ui/browser_window",
++    "//chrome/browser/ui/tabs:tab_enums",
++    "//chrome/browser/ui/tabs:tab_strip",
++    "//components/sessions",
++  ]
++}
++
+ # The tarball we build from ships without Chromium's test data, so unit_tests
+ # and browser_tests can't build. This target only needs gtest.
+ test("spaces_unittests") {
+--- /dev/null
++++ b/chrome/browser/ui/spaces/spaces_internals_ui.cc
+@@ -0,0 +1,235 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/spaces/spaces_internals_ui.h"
++
++#include <memory>
++#include <optional>
++#include <string>
++
++#include "base/functional/bind.h"
++#include "base/json/json_writer.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/ref_counted_memory.h"
++#include "base/strings/escape.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/uuid.h"
++#include "base/values.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/sessions/session_service.h"
++#include "chrome/browser/sessions/session_service_factory.h"
++#include "chrome/browser/ui/browser_commands.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/spaces/space_registry.h"
++#include "chrome/browser/ui/spaces/space_registry_factory.h"
++#include "chrome/browser/ui/spaces/space_tab_helper.h"
++#include "chrome/browser/ui/spaces/spaces_features.h"
++#include "chrome/browser/ui/tabs/tab_enums.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/sessions/core/session_id.h"
++#include "content/public/browser/web_contents.h"
++#include "content/public/browser/web_ui.h"
++#include "content/public/browser/web_ui_data_source.h"
++#include "content/public/browser/web_ui_message_handler.h"
++#include "content/public/common/url_constants.h"
++
++namespace spaces {
++
++namespace {
++
++base::DictValue BuildState(Profile* profile) {
++  base::DictValue state;
++
++  base::ListValue spaces;
++  if (SpaceRegistry* registry = SpaceRegistryFactory::GetForProfile(profile)) {
++    for (const Space& space : registry->spaces()) {
++      spaces.Append(space.ToValue());
++    }
++  }
++  state.Set("spaces", std::move(spaces));
++
++  base::ListValue windows;
++  ProfileBrowserCollection::GetForProfile(profile)->ForEach(
++      [&windows](BrowserWindowInterface* browser) {
++        TabStripModel* tab_strip = browser->GetTabStripModel();
++        base::ListValue tabs;
++        for (int i = 0; i < tab_strip->count(); ++i) {
++          content::WebContents* contents = tab_strip->GetWebContentsAt(i);
++          const base::Uuid space_id = SpaceTabHelper::GetSpaceId(contents);
++          tabs.Append(
++              base::DictValue()
++                  .Set("index", i)
++                  .Set("url", contents->GetVisibleURL().spec())
++                  .Set("title", base::UTF16ToUTF8(contents->GetTitle()))
++                  .Set("pinned", tab_strip->IsTabPinned(i))
++                  .Set("grouped", tab_strip->GetTabGroupForTab(i).has_value())
++                  .Set("space_id", space_id.is_valid()
++                                       ? space_id.AsLowercaseString()
++                                       : std::string()));
++        }
++        windows.Append(base::DictValue()
++                           .Set("session_id", browser->GetSessionID().id())
++                           .Set("tabs", std::move(tabs)));
++        return true;
++      });
++  state.Set("windows", std::move(windows));
++  return state;
++}
++
++BrowserWindowInterface* FindBrowser(Profile* profile, int session_id) {
++  BrowserWindowInterface* found = nullptr;
++  ProfileBrowserCollection::GetForProfile(profile)->ForEach(
++      [&](BrowserWindowInterface* browser) {
++        if (browser->GetSessionID().id() == session_id) {
++          found = browser;
++        }
++        return !found;
++      });
++  return found;
++}
++
++void ServePage(Profile* profile,
++               const std::string& path,
++               content::WebUIDataSource::GotDataCallback callback) {
++  std::string json =
++      base::WriteJsonWithOptions(BuildState(profile),
++                                 base::JsonOptions::OPTIONS_PRETTY_PRINT)
++          .value_or("{}");
++  std::string html =
++      "<!doctype html><meta charset=\"utf-8\">"
++      "<title>Spaces internals</title><pre id=\"state\">" +
++      base::EscapeForHTML(json) + "</pre>";
++  std::move(callback).Run(
++      base::MakeRefCounted<base::RefCountedString>(std::move(html)));
++}
++
++class SpacesInternalsHandler : public content::WebUIMessageHandler {
++ public:
++  explicit SpacesInternalsHandler(Profile* profile) : profile_(profile) {}
++  SpacesInternalsHandler(const SpacesInternalsHandler&) = delete;
++  SpacesInternalsHandler& operator=(const SpacesInternalsHandler&) = delete;
++  ~SpacesInternalsHandler() override = default;
++
++  // content::WebUIMessageHandler:
++  void RegisterMessages() override {
++    web_ui()->RegisterMessageCallback(
++        "addSpace", base::BindRepeating(&SpacesInternalsHandler::AddSpace,
++                                        base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "assignTab", base::BindRepeating(&SpacesInternalsHandler::AssignTab,
++                                         base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "closeTab", base::BindRepeating(&SpacesInternalsHandler::CloseTab,
++                                        base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "reopenClosedTab",
++        base::BindRepeating(&SpacesInternalsHandler::ReopenClosedTab,
++                            base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "rewriteSession",
++        base::BindRepeating(&SpacesInternalsHandler::RewriteSession,
++                            base::Unretained(this)));
++  }
++
++ private:
++  void AddSpace(const base::ListValue& args) {
++    SpaceRegistry* registry = SpaceRegistryFactory::GetForProfile(profile_);
++    const std::string* name =
++        args.size() == 1 ? args[0].GetIfString() : nullptr;
++    if (registry && name) {
++      registry->AddSpace(*name, tab_groups::TabGroupColorId::kBlue, "");
++    }
++  }
++
++  void AssignTab(const base::ListValue& args) {
++    if (args.size() != 3) {
++      return;
++    }
++    std::optional<int> window_id = args[0].GetIfInt();
++    std::optional<int> index = args[1].GetIfInt();
++    const std::string* space = args[2].GetIfString();
++    SpaceRegistry* registry = SpaceRegistryFactory::GetForProfile(profile_);
++    if (!window_id || !index || !space || !registry) {
++      return;
++    }
++    base::Uuid space_id = base::Uuid::ParseLowercase(*space);
++    if (!space->empty() && !registry->GetSpace(space_id)) {
++      return;
++    }
++    if (TabStripModel* tab_strip = FindTabStrip(*window_id, *index)) {
++      SpaceTabHelper::SetSpaceId(tab_strip->GetWebContentsAt(*index), space_id);
++    }
++  }
++
++  // Closes a tab the way the user would, so it can be reopened.
++  void CloseTab(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 2 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> index =
++        args.size() == 2 ? args[1].GetIfInt() : std::nullopt;
++    if (!window_id || !index) {
++      return;
++    }
++    if (TabStripModel* tab_strip = FindTabStrip(*window_id, *index)) {
++      tab_strip->CloseWebContentsAt(
++          *index, TabCloseTypes::CLOSE_USER_GESTURE |
++                      TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
++    }
++  }
++
++  // Reopens the most recently closed tab, like Cmd+Shift+T.
++  void ReopenClosedTab(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 1 ? args[0].GetIfInt() : std::nullopt;
++    if (BrowserWindowInterface* browser =
++            window_id ? FindBrowser(profile_, *window_id) : nullptr) {
++      chrome::RestoreTab(browser);
++    }
++  }
++
++  void RewriteSession(const base::ListValue& args) {
++    if (SessionService* session_service =
++            SessionServiceFactory::GetForProfile(profile_)) {
++      session_service->ResetFromCurrentBrowsers();
++    }
++  }
++
++  // Returns the tab strip of window `window_id` if it has a tab at `index`.
++  TabStripModel* FindTabStrip(int window_id, int index) {
++    BrowserWindowInterface* browser = FindBrowser(profile_, window_id);
++    TabStripModel* tab_strip = browser ? browser->GetTabStripModel() : nullptr;
++    return tab_strip && tab_strip->ContainsIndex(index) ? tab_strip : nullptr;
++  }
++
++  raw_ptr<Profile> profile_;
++};
++
++}  // namespace
++
++SpacesInternalsUIConfig::SpacesInternalsUIConfig()
++    : DefaultWebUIConfig(content::kChromeUIScheme,
++                         kChromeUISpacesInternalsHost) {}
++
++bool SpacesInternalsUIConfig::IsWebUIEnabled(
++    content::BrowserContext* browser_context) {
++  return features::IsSpacesEnabled();
++}
++
++SpacesInternalsUI::SpacesInternalsUI(content::WebUI* web_ui)
++    : content::WebUIController(web_ui) {
++  Profile* profile = Profile::FromWebUI(web_ui);
++  content::WebUIDataSource* source = content::WebUIDataSource::CreateAndAdd(
++      profile, kChromeUISpacesInternalsHost);
++  source->SetRequestFilter(
++      base::BindRepeating([](const std::string& path) { return true; }),
++      base::BindRepeating(&ServePage, base::Unretained(profile)));
++  web_ui->AddMessageHandler(std::make_unique<SpacesInternalsHandler>(profile));
++}
++
++SpacesInternalsUI::~SpacesInternalsUI() = default;
++
++WEB_UI_CONTROLLER_TYPE_IMPL(SpacesInternalsUI)
++
++}  // namespace spaces
+--- /dev/null
++++ b/chrome/browser/ui/spaces/spaces_internals_ui.h
+@@ -0,0 +1,54 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_SPACES_SPACES_INTERNALS_UI_H_
++#define CHROME_BROWSER_UI_SPACES_SPACES_INTERNALS_UI_H_
++
++#include "content/public/browser/web_ui_controller.h"
++#include "content/public/browser/webui_config.h"
++
++namespace content {
++class BrowserContext;
++class WebUI;
++}  // namespace content
++
++namespace spaces {
++
++inline constexpr char kChromeUISpacesInternalsHost[] = "spaces-internals";
++
++class SpacesInternalsUI;
++
++// Only available while HeliumSpaces is enabled.
++class SpacesInternalsUIConfig
++    : public content::DefaultWebUIConfig<SpacesInternalsUI> {
++ public:
++  SpacesInternalsUIConfig();
++
++  // content::WebUIConfig:
++  bool IsWebUIEnabled(content::BrowserContext* browser_context) override;
++};
++
++// chrome://spaces-internals, a debugging page for devutils/spaces_smoke.mjs.
++// It prints the profile's spaces and every tab's space as JSON inside
++// <pre id="state">, and takes these chrome.send() messages:
++//   addSpace(name)
++//   assignTab(window_session_id, tab_index, space_id or "" for default)
++//   closeTab(window_session_id, tab_index)
++//   reopenClosedTab(window_session_id)  Like Cmd+Shift+T.
++//   rewriteSession()  Rewrites the session file from the open windows.
++// Reload the page to see the new state.
++class SpacesInternalsUI : public content::WebUIController {
++ public:
++  explicit SpacesInternalsUI(content::WebUI* web_ui);
++  SpacesInternalsUI(const SpacesInternalsUI&) = delete;
++  SpacesInternalsUI& operator=(const SpacesInternalsUI&) = delete;
++  ~SpacesInternalsUI() override;
++
++ private:
++  WEB_UI_CONTROLLER_TYPE_DECL();
++};
++
++}  // namespace spaces
++
++#endif  // CHROME_BROWSER_UI_SPACES_SPACES_INTERNALS_UI_H_
+--- a/chrome/browser/ui/webui/BUILD.gn
++++ b/chrome/browser/ui/webui/BUILD.gn
+@@ -200,6 +200,7 @@ source_set("configs") {
+ 
+   if (enable_session_service) {
+     deps += [
++      "//chrome/browser/ui/spaces:internals",
+       "//chrome/browser/ui/webui/internals",
+       "//chrome/browser/ui/webui/tab_strip_internals",
+     ]
+--- a/chrome/browser/ui/webui/chrome_web_ui_configs.cc
++++ b/chrome/browser/ui/webui/chrome_web_ui_configs.cc
+@@ -107,6 +107,7 @@
+ #include "chrome/browser/ui/webui/infobar_internals/infobar_internals_ui.h"
+ #include "chrome/browser/ui/webui/inspect/inspect_ui.h"
+ #if BUILDFLAG(ENABLE_SESSION_SERVICE)
++#include "chrome/browser/ui/spaces/spaces_internals_ui.h"
+ #include "chrome/browser/ui/webui/internals/internals_ui.h"
+ #include "chrome/browser/ui/webui/tab_strip_internals/tab_strip_internals_ui.h"
+ #endif  // BUILDFLAG(ENABLE_SESSION_SERVICE)
+@@ -370,6 +371,7 @@ void RegisterChromeWebUIConfigs() {
+ #if BUILDFLAG(ENABLE_SESSION_SERVICE)
+   map.AddWebUIConfig(std::make_unique<InternalsUIConfig>());
+   map.AddWebUIConfig(std::make_unique<TabStripInternalsUIConfig>());
++  map.AddWebUIConfig(std::make_unique<spaces::SpacesInternalsUIConfig>());
+ #endif  // BUILDFLAG(ENABLE_SESSION_SERVICE)
+   map.AddWebUIConfig(std::make_unique<IwaDevUIConfig>());
+   map.AddWebUIConfig(

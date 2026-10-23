@@ -169,9 +169,21 @@ seconds.
 profile and checks it over the DevTools protocol. Today it checks that the
 browser starts, that `chrome://flags/#helium-spaces` exists and is off by
 default, and, with the flag on, that the profile gets one default space whose
-id survives a restart. It reads saved state from the profile's `Preferences`
-file after a clean `Browser.close`. Add a check for every feature as it
-lands.
+id survives a restart, and that tabs keep their space through restarts,
+session-file rewrites and reopen-closed-tab. Add a check for every feature as
+it lands.
+
+It reads state from `chrome://spaces-internals` (flag on only), which prints
+spaces and tabs as JSON and takes `chrome.send()` messages; see
+`spaces_internals_ui.h`. Things that bit us writing it:
+
+- Headless mode won't open a `chrome://` URL from the command line. Start on
+  `about:blank` and navigate.
+- A background tab takes seconds to load, and a restored one has no title
+  until it does. Poll, and identify tabs by URL.
+- Session commands are written 2.5 s after a change, and a quick headless quit
+  drops any still pending. `close({ waitForSessionSave: true })` waits first.
+- Restart with `--restore-last-session` to get the tabs back.
 
 ```bash
 node --experimental-websocket devutils/spaces_smoke.mjs
