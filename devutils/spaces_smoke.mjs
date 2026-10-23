@@ -217,8 +217,8 @@ const INTERNALS = 'chrome://spaces-internals/';
 const testTabName = (url) => /^data:.*([A-Z]\d)$/.exec(url)?.[1];
 
 // Opens a test tab named `name`, the way a link or tab API would.
-async function openTestTab(cdp, name) {
-  await cdp.send('Target.createTarget', { url: `data:text/html,<title>${name}</title>${name}` });
+async function openTestTab(cdp, name, { background = false } = {}) {
+  await cdp.send('Target.createTarget', { url: `data:text/html,<title>${name}</title>${name}`, background });
 }
 
 // Every tab of the first window, with its space as a name: a space's name, or
@@ -345,24 +345,38 @@ async function checkSwitching() {
         active(state)?.name === 'D1' && activeSpace(state) === 'Work',
         `active ${active(state)?.name}, space ${activeSpace(state)}`);
 
+  // Unpinned, D1 is an ordinary default-space tab, so the window follows it.
+  await send('pinTab', win, find(state, 'D1').index, false);
+  state = await internalsState(cdp);
+  check('unpinning the active favorite moves to its space',
+        activeSpace(state) === 'default' && active(state)?.name === 'D1' && active(state)?.in_active_space,
+        `active space ${activeSpace(state)}`);
+  await send('pinTab', win, find(state, 'D1').index, true);
+
   await send('switchSpace', win, ids.Play);
   await openTestTab(cdp, 'P1');
   state = await waitForNamedTabs(cdp, ['P1']);
   check('switching away from a favorite moves to the new space',
         activeSpace(state) === 'Play' && find(state, 'P1')?.space === 'Play', activeSpace(state));
 
+  // W4 opens in the background after W2 was last shown, so it is newer by
+  // last-active time but was never viewed.
   await send('activateTab', win, find(state, 'W2').index);
+  await openTestTab(cdp, 'W4', { background: true });
+  state = await waitForNamedTabs(cdp, ['W4']);
   await send('switchSpace', win, ids.Play);
   await send('switchSpace', win, ids.Work);
   state = await internalsState(cdp);
-  check('switching back activates the space\'s most recent tab', active(state)?.name === 'W2',
-        `active ${active(state)?.name ?? active(state)?.url}`);
+  check('switching back activates the tab last active in the space', active(state)?.name === 'W2',
+        `active ${active(state)?.name ?? active(state)?.url}, W4 in ${find(state, 'W4')?.space}`);
 
-  // The last Work tab's right neighbor is in Play, which Chromium would
-  // activate after closing it.
+  // Close a Work tab whose right neighbor is in Play, which Chromium would
+  // activate next.
   const workBefore = spaceTabs(state, 'Work');
-  const neighbor = tabList(state).find((t) => t.index === workBefore.at(-1).index + 1);
-  await send('activateTab', win, workBefore.at(-1).index);
+  const rightOf = (t) => tabList(state).find((u) => u.index === t.index + 1);
+  const closing = workBefore.find((t) => rightOf(t)?.space === 'Play');
+  const neighbor = closing && rightOf(closing);
+  await send('activateTab', win, closing?.index ?? -1);
   await send('runCommand', win, 'closeTab');
   state = await internalsState(cdp);
   check('closing a tab activates another tab of the same space',
@@ -377,16 +391,25 @@ async function checkSwitching() {
         ['D1', 'D2', 'P1'].every((n) => find(state, n)),
         JSON.stringify(tabList(state).map((t) => t.name ?? t.url)));
 
-  // Closing W1 leaves Work empty but for the favorite: stay in Work, with a
-  // new tab, instead of jumping to another space.
+  // Closing W1 leaves Work empty: stay in Work, with a new tab, instead of
+  // jumping to another space, and without showing a tab of another space on
+  // the way, which would bump its last-active time. D1 is unpinned so no
+  // favorite can stand in.
+  await send('pinTab', win, find(state, 'D1').index, false);
+  state = await internalsState(cdp);
   await send('activateTab', win, find(state, 'W1').index);
+  state = await internalsState(cdp);
+  const othersBefore = tabList(state).filter((t) => t.space !== 'Work' && !t.pinned);
   await send('runCommand', win, 'closeTab');
   await sleep(500);
   state = await internalsState(cdp);
+  const shownOnTheWay = othersBefore.filter((t) => tabList(state).find((u) => u.url === t.url)?.last_active !== t.last_active);
   check('closing the last tab of a space opens a new tab there',
         activeSpace(state) === 'Work' && active(state)?.space === 'Work' && !active(state)?.pinned &&
-        spaceTabs(state, 'Work').length === 1,
-        `active space ${activeSpace(state)}, active tab ${active(state)?.name ?? active(state)?.url} in ${active(state)?.space}`);
+        spaceTabs(state, 'Work').length === 1 && shownOnTheWay.length === 0,
+        `active space ${activeSpace(state)}, active tab ${active(state)?.name ?? active(state)?.url} in ${active(state)?.space}, ` +
+        `shown on the way: ${shownOnTheWay.map((t) => t.name ?? t.url)}`);
+  await send('pinTab', win, find(state, 'D1').index, true);
 
   await send('activateTab', win, find(state, 'P1').index);
   state = await internalsState(cdp);
@@ -395,8 +418,8 @@ async function checkSwitching() {
   await send('removeSpace', ids.Play);
   state = await internalsState(cdp);
   check('removing the active space moves to the default space, with its tabs',
-        activeSpace(state) === 'default' && find(state, 'P1')?.space === 'default',
-        `active space ${activeSpace(state)}, P1 in ${find(state, 'P1')?.space}`);
+        activeSpace(state) === 'default' && find(state, 'P1')?.active && find(state, 'P1')?.in_active_space,
+        `active space ${activeSpace(state)}, P1 active ${find(state, 'P1')?.active}, shown ${find(state, 'P1')?.in_active_space}`);
 
   // Restart with a favorite active while in Work.
   await send('switchSpace', win, ids.Work);
