@@ -10,6 +10,9 @@
 //   4. Flag on: tabs assigned to spaces through chrome://spaces-internals keep
 //      their space across restarts, including a restart with no changes and
 //      one after a forced rewrite of the session file.
+//   5. Flag on: switching spaces, new tabs joining the active space, tab
+//      commands staying inside it, favorites, closing a space's last tab,
+//      removing the active space, and the active space after a restart.
 // Needs a global WebSocket: Node 22+, or Node 20.10+ with --experimental-websocket.
 // Exits non-zero on any failed check.
 
@@ -26,6 +29,7 @@ import { join, resolve } from 'node:path';
 const app = resolve(process.argv[2] ?? 'build/src/out/Default/Helium.app');
 const binary = join(app, 'Contents/MacOS/Helium');
 const profiles = [];
+const browsers = [];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 let failures = 0;
@@ -62,19 +66,27 @@ function session(wsUrl) {
     if (pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); }
   };
   const ready = new Promise((r) => (ws.onopen = r));
+  // Rejects after 30 s, e.g. when a bug closes the tab this session drives.
   const send = async (method, params = {}) => {
     await ready;
     const msgId = ++id;
     ws.send(JSON.stringify({ id: msgId, method, params }));
-    return new Promise((r) => pending.set(msgId, r));
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        pending.delete(msgId);
+        reject(new Error(`${method} got no reply`));
+      }, 30000);
+      pending.set(msgId, (msg) => { clearTimeout(timer); resolve(msg); });
+    });
   };
   return { send, close: () => ws.close() };
 }
 
 // Starts the browser on `profile` with `url` and returns a DevTools session for
 // that page, plus close(), which shuts down cleanly so prefs and the session
-// get written to disk.
-async function launch(profile, extraArgs = [], url = 'about:blank') {
+// get written to disk. With `attachTo` instead of a URL, opens no extra tab and
+// attaches to the first restored page whose URL starts with it.
+async function launch(profile, extraArgs = [], url = 'about:blank', attachTo = undefined) {
   const port = 9300 + Math.floor(Math.random() * 500);
   const browser = spawn(binary, [
     '--headless=new',
@@ -83,18 +95,19 @@ async function launch(profile, extraArgs = [], url = 'about:blank') {
     '--use-mock-keychain',
     '--no-first-run',
     ...extraArgs,
-    url,
+    ...(attachTo ? [] : [url]),
   ], { stdio: 'ignore' });
+  browsers.push(browser);
   const exited = new Promise((r) => browser.once('exit', r));
   try {
-    const cdp = session((await devtoolsTarget(port, url)).webSocketDebuggerUrl);
+    const cdp = session((await devtoolsTarget(port, attachTo ?? url)).webSocketDebuggerUrl);
     const close = async ({ waitForSessionSave = false } = {}) => {
       // Session commands are written 2.5 s after a change (kSaveDelay in
       // command_storage_manager.cc), and a headless quit drops any still
       // pending, so let them land first.
       if (waitForSessionSave) await sleep(3500);
       // Browser.close shuts down gracefully; never answers, so don't await it.
-      cdp.send('Browser.close');
+      cdp.send('Browser.close').catch(() => {});
       const timedOut = await Promise.race([exited.then(() => false), sleep(15000).then(() => true)]);
       if (timedOut) browser.kill('SIGKILL');
       cdp.close();
@@ -198,16 +211,43 @@ async function internalsSend(cdp, message, args) {
 
 const INTERNALS = 'chrome://spaces-internals/';
 
-// Maps every test tab ("T1".."T6", from the end of its URL) to its space name,
-// or "default". Other tabs are ignored. Matches on URL because a restored
-// background tab has no title until it loads.
-function tabSpaces(state) {
+// A test tab's name ("T1", "W2", ...) from the end of its data: URL, or
+// undefined. Matches on URL because a restored background tab has no title
+// until it loads.
+const testTabName = (url) => /^data:.*([A-Z]\d)$/.exec(url)?.[1];
+
+// Opens a test tab named `name`, the way a link or tab API would.
+async function openTestTab(cdp, name) {
+  await cdp.send('Target.createTarget', { url: `data:text/html,<title>${name}</title>${name}` });
+}
+
+// Every tab of the first window, with its space as a name: a space's name, or
+// "default" for the default space, no space, or a removed space.
+function tabList(state) {
   const names = new Map(state.spaces.map((s) => [s.id, s.default ? 'default' : s.name]));
+  const window = state.windows[0];
+  return window.tabs.map((tab) => ({
+    ...tab, window: window.session_id, name: testTabName(tab.url),
+    space: names.get(tab.space_id) ?? 'default',
+  }));
+}
+
+// The name of the first window's active space.
+function activeSpace(state) {
+  const space = state.spaces.find((s) => s.id === state.windows[0].active_space_id);
+  return space ? (space.default ? 'default' : space.name) : undefined;
+}
+
+// Maps every test tab in a "T" name to its space name. Other tabs are ignored.
+function tabSpaces(state) {
   const result = {};
   for (const window of state.windows) {
     for (const tab of window.tabs) {
-      const name = /^data:.*(T\d)$/.exec(tab.url)?.[1];
-      if (name) result[name] = tab.space_id ? names.get(tab.space_id) : 'default';
+      const name = testTabName(tab.url);
+      if (name?.startsWith('T')) {
+        const space = state.spaces.find((s) => s.id === tab.space_id);
+        result[name] = space && !space.default ? space.name : 'default';
+      }
     }
   }
   return result;
@@ -223,6 +263,157 @@ async function waitForTestTabs(cdp, count) {
     await sleep(250);
   }
   return state;
+}
+
+// Reloads chrome://spaces-internals until every named test tab has loaded, and
+// returns its state.
+async function waitForNamedTabs(cdp, names) {
+  let state;
+  for (let i = 0; i < 40; i++) {
+    state = await internalsState(cdp);
+    const loaded = new Set(tabList(state).map((t) => t.name));
+    if (names.every((n) => loaded.has(n))) return state;
+    await sleep(250);
+  }
+  return state;
+}
+
+async function checkSwitching() {
+  const profile = newProfile();
+  const args = ['--enable-features=HeliumSpaces'];
+  let { cdp, close } = await launch(profile, args);
+  let state = await internalsState(cdp);
+  const win = state.windows[0].session_id;
+  const send = (message, ...rest) => internalsSend(cdp, message, rest);
+  const find = (state, name) => tabList(state).find((t) => t.name === name);
+  const active = (state) => tabList(state).find((t) => t.active);
+  const spaceTabs = (state, space) => tabList(state).filter((t) => t.space === space && !t.pinned);
+
+  await send('addSpace', 'Work');
+  await send('addSpace', 'Play');
+  await openTestTab(cdp, 'D1');
+  await openTestTab(cdp, 'D2');
+  state = await waitForNamedTabs(cdp, ['D1', 'D2']);
+  const ids = Object.fromEntries(state.spaces.map((s) => [s.name, s.id]));
+  check('a window starts in the default space', activeSpace(state) === 'default', activeSpace(state));
+
+  await send('switchSpace', win, ids.Work);
+  state = await internalsState(cdp);
+  check('switching to an empty space opens a new tab in it',
+        activeSpace(state) === 'Work' && active(state)?.space === 'Work' && spaceTabs(state, 'Work').length === 1,
+        `active space ${activeSpace(state)}, active tab in ${active(state)?.space}`);
+
+  await openTestTab(cdp, 'W1');
+  await openTestTab(cdp, 'W2');
+  await send('runCommand', win, 'newTab');
+  state = await waitForNamedTabs(cdp, ['W1', 'W2']);
+  check('new tabs join the active space',
+        find(state, 'W1')?.space === 'Work' && find(state, 'W2')?.space === 'Work' &&
+        spaceTabs(state, 'Work').length === 4,
+        JSON.stringify(spaceTabs(state, 'Work').map((t) => t.name ?? t.url)));
+
+  // Ctrl+Tab from W1 must visit exactly the Work tabs.
+  const workIndices = spaceTabs(state, 'Work').map((t) => t.index).sort((a, b) => a - b);
+  await send('activateTab', win, find(state, 'W1').index);
+  const visited = new Set();
+  for (let i = 0; i < workIndices.length + 2; i++) {
+    await send('runCommand', win, 'selectNextTab');
+    state = await internalsState(cdp);
+    visited.add(active(state)?.index);
+  }
+  check('Ctrl+Tab stays in the active space',
+        JSON.stringify([...visited].sort((a, b) => a - b)) === JSON.stringify(workIndices),
+        `visited ${[...visited]}, Work tabs ${workIndices}`);
+
+  await send('runCommand', win, 'selectFirstTab');
+  state = await internalsState(cdp);
+  const first = active(state)?.index;
+  await send('runCommand', win, 'selectLastTab');
+  state = await internalsState(cdp);
+  const last = active(state)?.index;
+  check('Cmd+1 and Cmd+9 pick the first and last tab of the active space',
+        first === workIndices[0] && last === workIndices.at(-1), `got ${first}, ${last}; Work tabs ${workIndices}`);
+
+  // A pinned tab in the default space is a favorite, shown in every space.
+  await send('pinTab', win, find(state, 'D1').index, true);
+  state = await internalsState(cdp);
+  check('a pinned default tab is shown in other spaces',
+        find(state, 'D1')?.pinned && find(state, 'D1')?.in_active_space && !find(state, 'D2')?.in_active_space);
+  await send('runCommand', win, 'selectFirstTab');
+  state = await internalsState(cdp);
+  check('activating a favorite keeps the active space',
+        active(state)?.name === 'D1' && activeSpace(state) === 'Work',
+        `active ${active(state)?.name}, space ${activeSpace(state)}`);
+
+  await send('switchSpace', win, ids.Play);
+  await openTestTab(cdp, 'P1');
+  state = await waitForNamedTabs(cdp, ['P1']);
+  check('switching away from a favorite moves to the new space',
+        activeSpace(state) === 'Play' && find(state, 'P1')?.space === 'Play', activeSpace(state));
+
+  await send('activateTab', win, find(state, 'W2').index);
+  await send('switchSpace', win, ids.Play);
+  await send('switchSpace', win, ids.Work);
+  state = await internalsState(cdp);
+  check('switching back activates the space\'s most recent tab', active(state)?.name === 'W2',
+        `active ${active(state)?.name ?? active(state)?.url}`);
+
+  // The last Work tab's right neighbor is in Play, which Chromium would
+  // activate after closing it.
+  const workBefore = spaceTabs(state, 'Work');
+  const neighbor = tabList(state).find((t) => t.index === workBefore.at(-1).index + 1);
+  await send('activateTab', win, workBefore.at(-1).index);
+  await send('runCommand', win, 'closeTab');
+  state = await internalsState(cdp);
+  check('closing a tab activates another tab of the same space',
+        neighbor?.space === 'Play' && activeSpace(state) === 'Work' && active(state)?.space === 'Work' &&
+        spaceTabs(state, 'Work').length === workBefore.length - 1,
+        `neighbor in ${neighbor?.space}, active space ${activeSpace(state)}, active tab in ${active(state)?.space}`);
+
+  await send('closeOtherTabs', win, find(state, 'W1').index);
+  state = await internalsState(cdp);
+  check('"Close other tabs" only closes tabs in the active space',
+        spaceTabs(state, 'Work').map((t) => t.name).join() === 'W1' &&
+        ['D1', 'D2', 'P1'].every((n) => find(state, n)),
+        JSON.stringify(tabList(state).map((t) => t.name ?? t.url)));
+
+  // Closing W1 leaves Work empty but for the favorite: stay in Work, with a
+  // new tab, instead of jumping to another space.
+  await send('activateTab', win, find(state, 'W1').index);
+  await send('runCommand', win, 'closeTab');
+  await sleep(500);
+  state = await internalsState(cdp);
+  check('closing the last tab of a space opens a new tab there',
+        activeSpace(state) === 'Work' && active(state)?.space === 'Work' && !active(state)?.pinned &&
+        spaceTabs(state, 'Work').length === 1,
+        `active space ${activeSpace(state)}, active tab ${active(state)?.name ?? active(state)?.url} in ${active(state)?.space}`);
+
+  await send('activateTab', win, find(state, 'P1').index);
+  state = await internalsState(cdp);
+  check('activating a tab in another space switches to it', activeSpace(state) === 'Play', activeSpace(state));
+
+  await send('removeSpace', ids.Play);
+  state = await internalsState(cdp);
+  check('removing the active space moves to the default space, with its tabs',
+        activeSpace(state) === 'default' && find(state, 'P1')?.space === 'default',
+        `active space ${activeSpace(state)}, P1 in ${find(state, 'P1')?.space}`);
+
+  // Restart with a favorite active while in Work.
+  await send('switchSpace', win, ids.Work);
+  await openTestTab(cdp, 'W3');
+  state = await waitForNamedTabs(cdp, ['W3']);
+  await send('activateTab', win, find(state, 'D1').index);
+  state = await internalsState(cdp);
+  await close({ waitForSessionSave: true });
+
+  // A startup URL would open a tab that joins the active space and becomes
+  // active, so attach to the restored chrome://spaces-internals tab instead.
+  ({ cdp, close } = await launch(profile, [...args, '--restore-last-session'], undefined, INTERNALS));
+  state = await waitForNamedTabs(cdp, ['D1', 'D2', 'W3', 'P1']);
+  check('the active space survives a restart with a favorite active',
+        activeSpace(state) === 'Work' && active(state)?.name === 'D1' && find(state, 'D1')?.pinned,
+        `active space ${activeSpace(state)}, active tab ${active(state)?.name ?? active(state)?.url}`);
+  await close();
 }
 
 async function checkTabSpaces() {
@@ -288,9 +479,12 @@ try {
   await checkFlagOff();
   await checkDefaultSpace();
   await checkTabSpaces();
+  await checkSwitching();
 } catch (err) {
   check('smoke run', false, err.message);
 } finally {
+  // A failed check can leave a browser running.
+  for (const browser of browsers) if (browser.exitCode === null) browser.kill('SIGKILL');
   for (const dir of profiles) rmSync(dir, { recursive: true, force: true });
 }
 

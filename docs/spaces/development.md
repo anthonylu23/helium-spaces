@@ -169,8 +169,9 @@ seconds.
 profile and checks it over the DevTools protocol. Today it checks that the
 browser starts, that `chrome://flags/#helium-spaces` exists and is off by
 default, and, with the flag on, that the profile gets one default space whose
-id survives a restart, and that tabs keep their space through restarts,
-session-file rewrites and reopen-closed-tab. Add a check for every feature as
+id survives a restart, that tabs keep their space through restarts,
+session-file rewrites and reopen-closed-tab, and that switching and tab
+commands follow the `SpaceController` rules. Add a check for every feature as
 it lands.
 
 It reads state from `chrome://spaces-internals` (flag on only), which prints
@@ -183,7 +184,18 @@ spaces and tabs as JSON and takes `chrome.send()` messages; see
   until it does. Poll, and identify tabs by URL.
 - Session commands are written 2.5 s after a change, and a quick headless quit
   drops any still pending. `close({ waitForSessionSave: true })` waits first.
-- Restart with `--restore-last-session` to get the tabs back.
+- Restart with `--restore-last-session` to get the tabs back. A startup URL
+  also opens a new tab, which joins the active space and becomes active, so
+  checks about the restored active space pass `attachTo` to `launch()` and
+  drive a restored `chrome://spaces-internals` tab instead.
+- Keyboard shortcuts go through `runCommand`, not CDP key events, which only
+  reach the page.
+- Every DevTools call times out after 30 s. A bug that closes the tab the test
+  drives otherwise hangs the run.
+
+To check that a hook is needed, remove it, rebuild, and confirm a check fails.
+Rebuild again after putting it back: restoring the source doesn't restore the
+binary.
 
 ```bash
 node --experimental-websocket devutils/spaces_smoke.mjs

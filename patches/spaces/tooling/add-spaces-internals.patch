@@ -8,7 +8,7 @@ enabled.
 
 --- a/chrome/browser/ui/spaces/BUILD.gn
 +++ b/chrome/browser/ui/spaces/BUILD.gn
-@@ -69,6 +69,28 @@ source_set("tab_space") {
+@@ -100,6 +100,30 @@ source_set("controller") {
    ]
  }
  
@@ -20,10 +20,12 @@ enabled.
 +  ]
 +  public_deps = [ "//content/public/browser" ]
 +  deps = [
++    ":controller",
 +    ":features",
 +    ":spaces",
 +    ":tab_space",
 +    "//base",
++    "//chrome/app:command_ids",
 +    "//chrome/browser/profiles:profile",
 +    "//chrome/browser/sessions",
 +    "//chrome/browser/ui:browser_commands",
@@ -39,13 +41,14 @@ enabled.
  test("spaces_unittests") {
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/spaces_internals_ui.cc
-@@ -0,0 +1,235 @@
+@@ -0,0 +1,366 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#include "chrome/browser/ui/spaces/spaces_internals_ui.h"
 +
++#include <map>
 +#include <memory>
 +#include <optional>
 +#include <string>
@@ -58,12 +61,14 @@ enabled.
 +#include "base/strings/utf_string_conversions.h"
 +#include "base/uuid.h"
 +#include "base/values.h"
++#include "chrome/app/chrome_command_ids.h"
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/sessions/session_service.h"
 +#include "chrome/browser/sessions/session_service_factory.h"
 +#include "chrome/browser/ui/browser_commands.h"
 +#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 +#include "chrome/browser/ui/browser_window/public/profile_browser_collection.h"
++#include "chrome/browser/ui/spaces/space_controller.h"
 +#include "chrome/browser/ui/spaces/space_registry.h"
 +#include "chrome/browser/ui/spaces/space_registry_factory.h"
 +#include "chrome/browser/ui/spaces/space_tab_helper.h"
@@ -105,15 +110,25 @@ enabled.
 +                  .Set("index", i)
 +                  .Set("url", contents->GetVisibleURL().spec())
 +                  .Set("title", base::UTF16ToUTF8(contents->GetTitle()))
++                  .Set("active", i == tab_strip->active_index())
++                  .Set("last_active", contents->GetLastActiveTime()
++                                          .InMillisecondsFSinceUnixEpoch())
 +                  .Set("pinned", tab_strip->IsTabPinned(i))
 +                  .Set("grouped", tab_strip->GetTabGroupForTab(i).has_value())
 +                  .Set("space_id", space_id.is_valid()
 +                                       ? space_id.AsLowercaseString()
-+                                       : std::string()));
++                                       : std::string())
++                  .Set("in_active_space", tab_strip->IsTabInActiveSpace(i)));
 +        }
-+        windows.Append(base::DictValue()
-+                           .Set("session_id", browser->GetSessionID().id())
-+                           .Set("tabs", std::move(tabs)));
++        SpaceController* controller = SpaceController::From(browser);
++        windows.Append(
++            base::DictValue()
++                .Set("session_id", browser->GetSessionID().id())
++                .Set("active_space_id",
++                     controller
++                         ? controller->active_space_id().AsLowercaseString()
++                         : std::string())
++                .Set("tabs", std::move(tabs)));
 +        return true;
 +      });
 +  state.Set("windows", std::move(windows));
@@ -173,6 +188,25 @@ enabled.
 +        "rewriteSession",
 +        base::BindRepeating(&SpacesInternalsHandler::RewriteSession,
 +                            base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "removeSpace", base::BindRepeating(&SpacesInternalsHandler::RemoveSpace,
++                                           base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "switchSpace", base::BindRepeating(&SpacesInternalsHandler::SwitchSpace,
++                                           base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "activateTab", base::BindRepeating(&SpacesInternalsHandler::ActivateTab,
++                                           base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "pinTab", base::BindRepeating(&SpacesInternalsHandler::PinTab,
++                                      base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "closeOtherTabs",
++        base::BindRepeating(&SpacesInternalsHandler::CloseOtherTabs,
++                            base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "runCommand", base::BindRepeating(&SpacesInternalsHandler::RunCommand,
++                                          base::Unretained(this)));
 +  }
 +
 + private:
@@ -200,8 +234,107 @@ enabled.
 +    if (!space->empty() && !registry->GetSpace(space_id)) {
 +      return;
 +    }
-+    if (TabStripModel* tab_strip = FindTabStrip(*window_id, *index)) {
++    TabStripModel* tab_strip = FindTabStrip(*window_id, *index);
++    if (!tab_strip) {
++      return;
++    }
++    if (SpaceController* controller =
++            SpaceController::From(FindBrowser(profile_, *window_id))) {
++      controller->MoveTabToSpace(tab_strip->GetTabAtIndex(*index), space_id);
++    } else {
 +      SpaceTabHelper::SetSpaceId(tab_strip->GetWebContentsAt(*index), space_id);
++    }
++  }
++
++  void RemoveSpace(const base::ListValue& args) {
++    SpaceRegistry* registry = SpaceRegistryFactory::GetForProfile(profile_);
++    const std::string* space =
++        args.size() == 1 ? args[0].GetIfString() : nullptr;
++    if (registry && space) {
++      registry->RemoveSpace(base::Uuid::ParseLowercase(*space));
++    }
++  }
++
++  // switchSpace(window_session_id, space_id or "" for default)
++  void SwitchSpace(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 2 ? args[0].GetIfInt() : std::nullopt;
++    const std::string* space =
++        args.size() == 2 ? args[1].GetIfString() : nullptr;
++    if (!window_id || !space) {
++      return;
++    }
++    BrowserWindowInterface* browser = FindBrowser(profile_, *window_id);
++    if (SpaceController* controller =
++            browser ? SpaceController::From(browser) : nullptr) {
++      controller->SwitchToSpace(base::Uuid::ParseLowercase(*space));
++    }
++  }
++
++  // activateTab(window_session_id, tab_index)
++  void ActivateTab(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 2 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> index =
++        args.size() == 2 ? args[1].GetIfInt() : std::nullopt;
++    if (!window_id || !index) {
++      return;
++    }
++    if (TabStripModel* tab_strip = FindTabStrip(*window_id, *index)) {
++      tab_strip->ActivateTabAt(*index);
++    }
++  }
++
++  // pinTab(window_session_id, tab_index, pinned)
++  void PinTab(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 3 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> index =
++        args.size() == 3 ? args[1].GetIfInt() : std::nullopt;
++    std::optional<bool> pinned =
++        args.size() == 3 ? args[2].GetIfBool() : std::nullopt;
++    if (!window_id || !index || !pinned) {
++      return;
++    }
++    if (TabStripModel* tab_strip = FindTabStrip(*window_id, *index)) {
++      tab_strip->SetTabPinned(*index, *pinned);
++    }
++  }
++
++  // closeOtherTabs(window_session_id, tab_index), from the tab context menu.
++  void CloseOtherTabs(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 2 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> index =
++        args.size() == 2 ? args[1].GetIfInt() : std::nullopt;
++    if (!window_id || !index) {
++      return;
++    }
++    if (TabStripModel* tab_strip = FindTabStrip(*window_id, *index)) {
++      tab_strip->ExecuteContextMenuCommand(
++          *index, TabStripModel::CommandCloseOtherTabs);
++    }
++  }
++
++  // runCommand(window_session_id, name), as if from a keyboard shortcut.
++  void RunCommand(const base::ListValue& args) {
++    static const std::map<std::string, int> kCommands = {
++        {"newTab", IDC_NEW_TAB},
++        {"closeTab", IDC_CLOSE_TAB},
++        {"selectNextTab", IDC_SELECT_NEXT_TAB},
++        {"selectPreviousTab", IDC_SELECT_PREVIOUS_TAB},
++        {"selectFirstTab", IDC_SELECT_TAB_0},
++        {"selectLastTab", IDC_SELECT_LAST_TAB},
++    };
++    std::optional<int> window_id =
++        args.size() == 2 ? args[0].GetIfInt() : std::nullopt;
++    const std::string* name =
++        args.size() == 2 ? args[1].GetIfString() : nullptr;
++    if (!window_id || !name || !kCommands.contains(*name)) {
++      return;
++    }
++    if (BrowserWindowInterface* browser = FindBrowser(profile_, *window_id)) {
++      chrome::ExecuteCommand(browser, kCommands.at(*name));
 +    }
 +  }
 +
@@ -277,7 +410,7 @@ enabled.
 +}  // namespace spaces
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/spaces_internals_ui.h
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,61 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -313,8 +446,15 @@ enabled.
 +// It prints the profile's spaces and every tab's space as JSON inside
 +// <pre id="state">, and takes these chrome.send() messages:
 +//   addSpace(name)
++//   removeSpace(space_id)
 +//   assignTab(window_session_id, tab_index, space_id or "" for default)
++//   switchSpace(window_session_id, space_id or "" for default)
++//   activateTab(window_session_id, tab_index)
++//   pinTab(window_session_id, tab_index, pinned)
 +//   closeTab(window_session_id, tab_index)
++//   closeOtherTabs(window_session_id, tab_index)  From the tab context menu.
++//   runCommand(window_session_id, name)  newTab, closeTab, selectNextTab,
++//       selectPreviousTab, selectFirstTab or selectLastTab.
 +//   reopenClosedTab(window_session_id)  Like Cmd+Shift+T.
 +//   rewriteSession()  Rewrites the session file from the open windows.
 +// Reload the page to see the new state.
