@@ -31,4 +31,5 @@ spaces/tooling/ts-ignore-out-of-tree-definitions.patch
 spaces/core/add-spaces-feature-flag.patch
 spaces/core/add-space-registry.patch
 spaces/core/add-space-tab-helper.patch
+spaces/core/add-space-controller.patch
 spaces/tooling/add-spaces-internals.patch

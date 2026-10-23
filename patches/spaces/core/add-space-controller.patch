@@ -1,0 +1,667 @@
+--- a/chrome/browser/ui/browser_commands.cc
++++ b/chrome/browser/ui/browser_commands.cc
+@@ -619,7 +619,8 @@ bool IsTabSelectable(
+     return false;
+   }
+ 
+-  return true;
++  // helium-spaces: Or outside the active space.
++  return model->IsTabInActiveSpace(tab);
+ }
+ 
+ void FocusAdjacentTabGroupInFocusMode(TabStripModel* tab_strip_model,
+--- a/chrome/browser/ui/browser_window/internal/BUILD.gn
++++ b/chrome/browser/ui/browser_window/internal/BUILD.gn
+@@ -121,6 +121,7 @@ source_set("internal") {
+       "//chrome/browser/ui/sessions",
+       "//chrome/browser/ui/sharing_hub",
+       "//chrome/browser/ui/signin",
++      "//chrome/browser/ui/spaces:controller",
+       "//chrome/browser/ui/sync",
+       "//chrome/browser/ui/tabs",
+       "//chrome/browser/ui/tabs:tab_list_bridge",
+--- a/chrome/browser/ui/browser_window/internal/embedder_browser_window_features.cc
++++ b/chrome/browser/ui/browser_window/internal/embedder_browser_window_features.cc
+@@ -7,6 +7,9 @@
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+ 
++// helium-spaces
++#include "chrome/browser/ui/spaces/space_controller.h"
++
+ DEFINE_USER_DATA(EmbedderBrowserWindowFeatures);
+ 
+ EmbedderBrowserWindowFeatures::EmbedderBrowserWindowFeatures(
+@@ -22,6 +25,7 @@ EmbedderBrowserWindowFeatures* EmbedderB
+ 
+ void EmbedderBrowserWindowFeatures::Init(BrowserWindowInterface* browser) {
+   // Embedder implementation goes here.
++  space_controller_ = spaces::SpaceController::MaybeCreate(browser);
+ }
+ 
+ void EmbedderBrowserWindowFeatures::InitPostWindowConstruction(
+@@ -36,4 +40,5 @@ void EmbedderBrowserWindowFeatures::Init
+ 
+ void EmbedderBrowserWindowFeatures::TearDownPreBrowserWindowDestruction() {
+   // Embedder implementation goes here.
++  space_controller_.reset();
+ }
+--- a/chrome/browser/ui/browser_window/public/embedder_browser_window_features.h
++++ b/chrome/browser/ui/browser_window/public/embedder_browser_window_features.h
+@@ -5,11 +5,17 @@
+ #ifndef CHROME_BROWSER_UI_BROWSER_WINDOW_PUBLIC_EMBEDDER_BROWSER_WINDOW_FEATURES_H_
+ #define CHROME_BROWSER_UI_BROWSER_WINDOW_PUBLIC_EMBEDDER_BROWSER_WINDOW_FEATURES_H_
+ 
++#include <memory>
++
+ #include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
+ 
+ class BrowserView;
+ class BrowserWindowInterface;
+ 
++namespace spaces {
++class SpaceController;
++}  // namespace spaces
++
+ // This class should only be used by Chromium embedders, where it will own
+ // embedder-specific browser window features.
+ // Chromium features themselves should not be added to this class, rather to
+@@ -44,6 +50,9 @@ class EmbedderBrowserWindowFeatures {
+ 
+  private:
+   // Embedder-specific feature members:
++
++  // helium-spaces
++  std::unique_ptr<spaces::SpaceController> space_controller_;
+ };
+ 
+ #endif  // CHROME_BROWSER_UI_BROWSER_WINDOW_PUBLIC_EMBEDDER_BROWSER_WINDOW_FEATURES_H_
+--- a/chrome/browser/ui/spaces/BUILD.gn
++++ b/chrome/browser/ui/spaces/BUILD.gn
+@@ -69,6 +69,37 @@ source_set("tab_space") {
+   ]
+ }
+ 
++# Header only, so //chrome/browser/ui/tabs:tab_strip_impl can depend on it.
++source_set("tab_space_filter") {
++  sources = [ "tab_space_filter.h" ]
++}
++
++# SpaceController, which shows one space at a time in a browser window.
++source_set("controller") {
++  sources = [
++    "space_controller.cc",
++    "space_controller.h",
++  ]
++  public_deps = [
++    ":spaces",
++    ":tab_space_filter",
++    "//base",
++    "//chrome/browser/ui/tabs:tab_strip_model_observer",
++    "//ui/base/unowned_user_data",
++  ]
++  deps = [
++    ":features",
++    ":tab_space",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/tab_list",
++    "//chrome/browser/ui/browser_window",
++    "//chrome/browser/ui/tabs:tab_strip",
++    "//components/tabs:public",
++    "//content/public/browser",
++    "//url",
++  ]
++}
++
+ # The tarball we build from ships without Chromium's test data, so unit_tests
+ # and browser_tests can't build. This target only needs gtest.
+ test("spaces_unittests") {
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_controller.cc
+@@ -0,0 +1,239 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/spaces/space_controller.h"
++
++#include <algorithm>
++
++#include "base/functional/bind.h"
++#include "base/location.h"
++#include "base/task/sequenced_task_runner.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/tab_list/tab_removed_reason.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/spaces/space_registry_factory.h"
++#include "chrome/browser/ui/spaces/space_tab_helper.h"
++#include "chrome/browser/ui/spaces/spaces_features.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
++#include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/web_contents.h"
++#include "url/gurl.h"
++
++namespace spaces {
++
++DEFINE_USER_DATA(SpaceController);
++
++// static
++std::unique_ptr<SpaceController> SpaceController::MaybeCreate(
++    BrowserWindowInterface* browser) {
++  if (!features::IsSpacesEnabled() ||
++      browser->GetType() != BrowserWindowInterface::TYPE_NORMAL) {
++    return nullptr;
++  }
++  // Null for incognito and guest profiles.
++  SpaceRegistry* registry =
++      SpaceRegistryFactory::GetForProfile(browser->GetProfile());
++  if (!registry) {
++    return nullptr;
++  }
++  return std::make_unique<SpaceController>(browser, registry);
++}
++
++// static
++SpaceController* SpaceController::From(BrowserWindowInterface* browser) {
++  return ui::ScopedUnownedUserData<SpaceController>::Get(
++      browser->GetUnownedUserDataHost());
++}
++
++SpaceController::SpaceController(BrowserWindowInterface* browser,
++                                 SpaceRegistry* registry)
++    : tab_strip_model_(browser->GetTabStripModel()),
++      registry_(registry),
++      active_space_id_(registry->GetDefaultSpace().id),
++      scoped_data_(browser->GetUnownedUserDataHost(), *this) {
++  tab_strip_model_->AddObserver(this);
++  tab_strip_model_->SetSpaceFilter(this);
++  registry_observation_.Observe(registry_);
++}
++
++SpaceController::~SpaceController() {
++  tab_strip_model_->SetSpaceFilter(nullptr);
++  tab_strip_model_->RemoveObserver(this);
++}
++
++void SpaceController::SwitchToSpace(const base::Uuid& space_id) {
++  const base::Uuid space = ResolveSpace(space_id);
++  if (space == active_space_id_) {
++    return;
++  }
++  active_space_id_ = space;
++  ActivateTabInActiveSpace();
++}
++
++void SpaceController::MoveTabToSpace(tabs::TabInterface* tab,
++                                     const base::Uuid& space_id) {
++  SetTabSpace(tab->GetContents(), ResolveSpace(space_id));
++  if (tab == tab_strip_model_->GetActiveTab() && !IsTabInActiveSpace(tab)) {
++    ActivateTabInActiveSpace();
++  }
++}
++
++base::Uuid SpaceController::GetSpaceOfTab(const tabs::TabInterface* tab) const {
++  return ResolveSpace(SpaceTabHelper::GetSpaceId(tab->GetContents()));
++}
++
++bool SpaceController::IsFavorite(const tabs::TabInterface* tab) const {
++  return tab->IsPinned() &&
++         GetSpaceOfTab(tab) == registry_->GetDefaultSpace().id;
++}
++
++bool SpaceController::IsTabInActiveSpace(const tabs::TabInterface* tab) const {
++  return IsFavorite(tab) || GetSpaceOfTab(tab) == active_space_id_;
++}
++
++void SpaceController::OnTabStripModelChanged(
++    TabStripModel* tab_strip_model,
++    const TabStripModelChange& change,
++    const TabStripSelectionChange& selection) {
++  bool emptied_active_space = false;
++  switch (change.type()) {
++    case TabStripModelChange::kInserted:
++      for (const auto& inserted : change.GetInsert()->contents) {
++        if (!SpaceTabHelper::HasSpace(inserted.contents)) {
++          SetTabSpace(inserted.contents, active_space_id_);
++        }
++      }
++      break;
++    case TabStripModelChange::kRemoved:
++      emptied_active_space =
++          std::ranges::any_of(change.GetRemove()->contents,
++                              [](const auto& removed) {
++                                return removed.remove_reason ==
++                                       TabRemovedReason::kDeleted;
++                              }) &&
++          !HasTabsInSpace(active_space_id_);
++      break;
++    case TabStripModelChange::kReplaced: {
++      // Discarding a tab replaces its WebContents.
++      const TabStripModelChange::Replace* replace = change.GetReplace();
++      SetTabSpace(
++          replace->new_contents,
++          ResolveSpace(SpaceTabHelper::GetSpaceId(replace->old_contents)));
++      break;
++    }
++    default:
++      break;
++  }
++
++  // While a favorite is active, inserted tabs can change which space was used
++  // last. Session restore activates the first tab before inserting the rest.
++  const tabs::TabInterface* active_tab = tab_strip_model_->GetActiveTab();
++  const bool inserted_behind_favorite =
++      change.type() == TabStripModelChange::kInserted && active_tab &&
++      IsFavorite(active_tab);
++  if ((!selection.active_tab_changed() && !inserted_behind_favorite) ||
++      !active_tab || tab_strip_model_->closing_all()) {
++    return;
++  }
++  const base::Uuid space = GetSpaceForActiveTab();
++  if (space == active_space_id_) {
++    return;
++  }
++  if (emptied_active_space) {
++    // The tab strip can't be changed while it notifies observers.
++    base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++        FROM_HERE, base::BindOnce(&SpaceController::OpenTabInEmptiedSpace,
++                                  weak_factory_.GetWeakPtr()));
++    return;
++  }
++  active_space_id_ = space;
++}
++
++void SpaceController::OnSpacesChanged() {
++  // Tabs of a removed space now belong to the default space.
++  if (!registry_->GetSpace(active_space_id_)) {
++    active_space_id_ = GetSpaceForActiveTab();
++  }
++}
++
++base::Uuid SpaceController::ResolveSpace(const base::Uuid& space_id) const {
++  return space_id.is_valid() && registry_->GetSpace(space_id)
++             ? space_id
++             : registry_->GetDefaultSpace().id;
++}
++
++base::Uuid SpaceController::GetSpaceForActiveTab() const {
++  const tabs::TabInterface* active_tab = tab_strip_model_->GetActiveTab();
++  if (active_tab && !IsFavorite(active_tab)) {
++    return GetSpaceOfTab(active_tab);
++  }
++  const tabs::TabInterface* recent_tab =
++      FindMostRecentTab([](const tabs::TabInterface*) { return true; });
++  return recent_tab ? GetSpaceOfTab(recent_tab)
++                    : ResolveSpace(active_space_id_);
++}
++
++tabs::TabInterface* SpaceController::FindMostRecentTab(
++    base::FunctionRef<bool(const tabs::TabInterface*)> predicate) const {
++  tabs::TabInterface* recent_tab = nullptr;
++  base::TimeTicks recent_time;
++  for (tabs::TabInterface* tab : *tab_strip_model_) {
++    if (IsFavorite(tab) || !predicate(tab)) {
++      continue;
++    }
++    const base::TimeTicks time = tab->GetContents()->GetLastActiveTimeTicks();
++    if (!recent_tab || time > recent_time) {
++      recent_tab = tab;
++      recent_time = time;
++    }
++  }
++  return recent_tab;
++}
++
++bool SpaceController::HasTabsInSpace(const base::Uuid& space_id) const {
++  return FindMostRecentTab([this, &space_id](const tabs::TabInterface* tab) {
++           return GetSpaceOfTab(tab) == space_id;
++         }) != nullptr;
++}
++
++void SpaceController::ActivateTabInActiveSpace() {
++  tabs::TabInterface* tab =
++      FindMostRecentTab([this](const tabs::TabInterface* tab) {
++        return GetSpaceOfTab(tab) == active_space_id_;
++      });
++  if (!tab) {
++    // An empty URL opens the New Tab page. The new tab joins the active space
++    // when it is inserted.
++    tab_strip_model_->delegate()->AddTabAt(GURL(), -1, /*foreground=*/true);
++    return;
++  }
++  if (tab != tab_strip_model_->GetActiveTab()) {
++    tab_strip_model_->ActivateTabAt(
++        tab_strip_model_->GetIndexOfTab(tab),
++        TabStripUserGestureDetails(
++            TabStripUserGestureDetails::GestureType::kOther));
++  }
++}
++
++void SpaceController::OpenTabInEmptiedSpace() {
++  if (tab_strip_model_->empty() || tab_strip_model_->closing_all()) {
++    return;
++  }
++  if (HasTabsInSpace(active_space_id_)) {
++    active_space_id_ = GetSpaceForActiveTab();
++    return;
++  }
++  ActivateTabInActiveSpace();
++}
++
++void SpaceController::SetTabSpace(content::WebContents* contents,
++                                  const base::Uuid& space_id) {
++  SpaceTabHelper::SetSpaceId(
++      contents,
++      space_id == registry_->GetDefaultSpace().id ? base::Uuid() : space_id);
++}
++
++}  // namespace spaces
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_controller.h
+@@ -0,0 +1,131 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_SPACES_SPACE_CONTROLLER_H_
++#define CHROME_BROWSER_UI_SPACES_SPACE_CONTROLLER_H_
++
++#include <memory>
++
++#include "base/functional/function_ref.h"
++#include "base/memory/raw_ptr.h"
++#include "base/memory/weak_ptr.h"
++#include "base/scoped_observation.h"
++#include "base/uuid.h"
++#include "chrome/browser/ui/spaces/space_registry.h"
++#include "chrome/browser/ui/spaces/tab_space_filter.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
++
++class BrowserWindowInterface;
++class TabStripModel;
++
++namespace content {
++class WebContents;
++}
++
++namespace tabs {
++class TabInterface;
++}
++
++namespace spaces {
++
++// Shows one space at a time in a normal browser window, and keeps the window's
++// tabs in their spaces:
++// - The active space follows the active tab, so activating a tab in another
++//   space, by any means, switches to that space.
++// - While a favorite is active, the active space is the space of the most
++//   recently active tab that isn't one. That is how it survives a restart.
++// - New tabs join the active space. Restored tabs keep the space they had.
++// - Closing the last tab of the active space opens a new tab there, as in Arc,
++//   instead of leaving the space.
++// Owned by EmbedderBrowserWindowFeatures.
++class SpaceController : public TabSpaceFilter,
++                        public TabStripModelObserver,
++                        public SpaceRegistry::Observer {
++ public:
++  DECLARE_USER_DATA(SpaceController);
++
++  // Returns a controller for `browser` if it is a normal window of a profile
++  // with Spaces and HeliumSpaces is enabled, or null otherwise.
++  static std::unique_ptr<SpaceController> MaybeCreate(
++      BrowserWindowInterface* browser);
++
++  // Returns the controller of `browser`, or null if it has none.
++  static SpaceController* From(BrowserWindowInterface* browser);
++
++  SpaceController(BrowserWindowInterface* browser, SpaceRegistry* registry);
++  SpaceController(const SpaceController&) = delete;
++  SpaceController& operator=(const SpaceController&) = delete;
++  ~SpaceController() override;
++
++  // The id of the space shown. Always a space in the registry.
++  const base::Uuid& active_space_id() const { return active_space_id_; }
++
++  // Shows `space_id` and activates its most recently active tab, or opens a
++  // new tab in it if it has none. An unknown id means the default space.
++  void SwitchToSpace(const base::Uuid& space_id);
++
++  // Moves `tab` to `space_id`; an unknown id means the default space. If `tab`
++  // was the active tab, the window stays in the active space and activates
++  // another tab there.
++  void MoveTabToSpace(tabs::TabInterface* tab, const base::Uuid& space_id);
++
++  // The space `tab` belongs to: the default space if it has none, or if its
++  // space no longer exists.
++  base::Uuid GetSpaceOfTab(const tabs::TabInterface* tab) const;
++
++  // Whether `tab` is a favorite: pinned, in the default space, and shown in
++  // every space.
++  bool IsFavorite(const tabs::TabInterface* tab) const;
++
++  // TabSpaceFilter:
++  bool IsTabInActiveSpace(const tabs::TabInterface* tab) const override;
++
++  // TabStripModelObserver:
++  void OnTabStripModelChanged(
++      TabStripModel* tab_strip_model,
++      const TabStripModelChange& change,
++      const TabStripSelectionChange& selection) override;
++
++  // SpaceRegistry::Observer:
++  void OnSpacesChanged() override;
++
++ private:
++  // Returns `space_id` if it is in the registry, else the default space.
++  base::Uuid ResolveSpace(const base::Uuid& space_id) const;
++
++  // The space the active tab says should be shown. See the class comment.
++  base::Uuid GetSpaceForActiveTab() const;
++
++  // The most recently active tab, not a favorite, that `predicate` accepts.
++  tabs::TabInterface* FindMostRecentTab(
++      base::FunctionRef<bool(const tabs::TabInterface*)> predicate) const;
++
++  bool HasTabsInSpace(const base::Uuid& space_id) const;
++
++  // Activates the active space's most recently active tab, or opens a new tab
++  // there if it has none.
++  void ActivateTabInActiveSpace();
++
++  // Opens a new tab in the active space if the last one was just closed and
++  // nothing else has been shown there since.
++  void OpenTabInEmptiedSpace();
++
++  // Stores `space_id` on `contents`, where the default space is stored as no
++  // id, so it stays out of the session file.
++  void SetTabSpace(content::WebContents* contents, const base::Uuid& space_id);
++
++  const raw_ptr<TabStripModel> tab_strip_model_;
++  const raw_ptr<SpaceRegistry> registry_;
++  base::Uuid active_space_id_;
++
++  base::ScopedObservation<SpaceRegistry, SpaceRegistry::Observer>
++      registry_observation_{this};
++  ui::ScopedUnownedUserData<SpaceController> scoped_data_;
++  base::WeakPtrFactory<SpaceController> weak_factory_{this};
++};
++
++}  // namespace spaces
++
++#endif  // CHROME_BROWSER_UI_SPACES_SPACE_CONTROLLER_H_
+--- /dev/null
++++ b/chrome/browser/ui/spaces/tab_space_filter.h
+@@ -0,0 +1,30 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_SPACES_TAB_SPACE_FILTER_H_
++#define CHROME_BROWSER_UI_SPACES_TAB_SPACE_FILTER_H_
++
++namespace tabs {
++class TabInterface;
++}
++
++namespace spaces {
++
++// Lets TabStripModel and tab commands skip tabs outside the window's active
++// space, the way they skip tabs outside a focused tab group. SpaceController
++// implements it and sets itself on its window's TabStripModel. Header only, so
++// the tab strip can depend on it without depending on Spaces.
++class TabSpaceFilter {
++ public:
++  // Whether `tab` is shown in the active space: it belongs to that space, or
++  // it is a favorite, which shows in every space.
++  virtual bool IsTabInActiveSpace(const tabs::TabInterface* tab) const = 0;
++
++ protected:
++  virtual ~TabSpaceFilter() = default;
++};
++
++}  // namespace spaces
++
++#endif  // CHROME_BROWSER_UI_SPACES_TAB_SPACE_FILTER_H_
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -404,6 +404,7 @@ if (!is_android) {
+       "//chrome/browser/ui/commerce",
+       "//chrome/browser/ui/helium:helium_layout_state_controller",
+       "//chrome/browser/ui/send_tab_to_self",
++      "//chrome/browser/ui/spaces:tab_space_filter",
+       "//chrome/browser/ui/thumbnails",
+       "//chrome/browser/ui/user_education",
+       "//chrome/browser/ui/views/tabs/common",
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -126,6 +126,9 @@
+ #include "ui/base/page_transition_types.h"
+ #include "ui/gfx/range/range.h"
+ 
++// helium-spaces
++#include "chrome/browser/ui/spaces/tab_space_filter.h"
++
+ using base::UserMetricsAction;
+ using content::WebContents;
+ 
+@@ -2277,6 +2280,18 @@ std::optional<tab_groups::TabGroupId> Ta
+   return selection_model_.focused_group();
+ }
+ 
++void TabStripModel::SetSpaceFilter(spaces::TabSpaceFilter* filter) {
++  space_filter_ = filter;
++}
++
++bool TabStripModel::IsTabInActiveSpace(const tabs::TabInterface* tab) const {
++  return !space_filter_ || space_filter_->IsTabInActiveSpace(tab);
++}
++
++bool TabStripModel::IsTabInActiveSpace(int index) const {
++  return IsTabInActiveSpace(GetTabAtIndex(index));
++}
++
+ void TabStripModel::EnterFocusMode(const tab_groups::TabGroupId& group) {
+   CHECK(base::FeatureList::IsEnabled(features::kTabGroupsFocusing));
+ 
+@@ -3979,6 +3994,10 @@ std::vector<int> TabStripModel::GetIndic
+     if (focused_group.has_value() && GetTabGroupForTab(i) != focused_group) {
+       continue;
+     }
++    // helium-spaces: Or not in the active space.
++    if (!IsTabInActiveSpace(i)) {
++      continue;
++    }
+     if (!indices_to_exclude.Contains(gfx::Range(i, i + 1)) && !IsTabPinned(i) &&
+         (!is_selected || !IsTabSelected(i))) {
+       indices.push_back(i);
+@@ -4016,6 +4035,10 @@ std::vector<tabs::TabInterface*> TabStri
+     if (focused_group.has_value() && tab->GetGroup() != focused_group) {
+       continue;
+     }
++    // helium-spaces: And in the active space.
++    if (!IsTabInActiveSpace(tab)) {
++      continue;
++    }
+ 
+     if (tab == invoked_tab || tab->IsPinned()) {
+       if (id == CommandCloseTabsToLeft && tab == invoked_tab) {
+@@ -4529,7 +4552,13 @@ void TabStripModel::SelectMRUTab(TabRela
+     }
+ 
+     for (int i = 0; i < count(); ++i) {
+-      mru_cycle_list_.push_back(i);
++      // helium-spaces: Cycle within the active space.
++      if (IsTabInActiveSpace(i)) {
++        mru_cycle_list_.push_back(i);
++      }
++    }
++    if (mru_cycle_list_.empty()) {
++      return;
+     }
+ 
+     std::sort(mru_cycle_list_.begin(), mru_cycle_list_.end(),
+@@ -4585,6 +4614,11 @@ void TabStripModel::SelectRelativeTab(Ta
+       return true;
+     }
+ 
++    // helium-spaces: Or outside the active space.
++    if (!IsTabInActiveSpace(i)) {
++      return true;
++    }
++
+     // Do not select the tab if it is not part of the focused state.
+     return focused_group.has_value() &&
+            !tabs::TabStripModelSelectionState::IsTabValidInFocusedGroup(
+@@ -6110,7 +6144,9 @@ std::optional<int> TabStripModel::Determ
+     // otherwise a legitimate selection, so it is kept separate from the
+     // visibility check below.
+     auto is_valid_for_focus = [this, &focused_group](int index) {
+-      if (!ContainsIndex(index)) {
++      // helium-spaces: Stay in the active space. If it has no tab left,
++      // SpaceController opens a new one there.
++      if (!ContainsIndex(index) || !IsTabInActiveSpace(index)) {
+         return false;
+       }
+       return !focused_group.has_value() ||
+--- a/chrome/browser/ui/tabs/tab_strip_model.h
++++ b/chrome/browser/ui/tabs/tab_strip_model.h
+@@ -56,6 +56,10 @@ class TabGroupModel;
+ class TabStripModelDelegate;
+ class TabStripModelObserver;
+ 
++namespace spaces {
++class TabSpaceFilter;
++}  // namespace spaces
++
+ namespace content {
+ class WebContents;
+ }
+@@ -747,6 +751,15 @@ class TabStripModel {
+   // order.
+   void RotateFocusedGroup(bool forward);
+ 
++  // helium-spaces: Sets the filter that hides tabs outside the window's active
++  // space, or null to show every tab. SpaceController sets it.
++  void SetSpaceFilter(spaces::TabSpaceFilter* filter);
++
++  // helium-spaces: Whether a tab is shown in the window's active space. True
++  // for every tab while no space filter is set.
++  bool IsTabInActiveSpace(const tabs::TabInterface* tab) const;
++  bool IsTabInActiveSpace(int index) const;
++
+   // Returns true if one or more of the tabs pointed to by `indices` are
+   // supported by read later.
+   bool IsReadLaterSupportedForAny(const std::vector<int>& indices);
+@@ -1548,6 +1561,9 @@ class TabStripModel {
+   // List of tabs for MRU cycling
+   std::vector<int> mru_cycle_list_;
+ 
++  // helium-spaces: Hides tabs outside the active space, if set.
++  raw_ptr<spaces::TabSpaceFilter> space_filter_ = nullptr;
++
+   base::WeakPtrFactory<TabStripModel> weak_factory_{this};
+ };
+ 

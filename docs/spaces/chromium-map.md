@@ -20,6 +20,13 @@ New files we add (under `chrome/browser/ui/spaces/` and
 | `chrome/browser/sessions/session_service_base.cc` | `spaces/core/add-space-tab-helper.patch` | Include; `CreateSpaceIdSessionCommand()` in `BuildCommandsForTab()`, after the pinned state. Runs on session-file rewrites and for every restored tab | 156.0.8078.47 |
 | `chrome/browser/ui/BUILD.gn` | `spaces/core/add-space-tab-helper.patch` | Dep on `:tab_space` in `browser_tabrestore_impl` and `browser_live_tab_context_impl` | 156.0.8078.47 |
 | `chrome/browser/ui/browser_tabrestore.cc` | `spaces/core/add-space-tab-helper.patch` | Include; `RestoreSpaceIdFromExtraData()` next to glic and send-tab-to-self in `CreateRestoredTab()` | 156.0.8078.47 |
+| `chrome/browser/ui/browser_commands.cc` | `spaces/core/add-space-controller.patch` | `IsTabSelectable()` also requires `IsTabInActiveSpace()`, so Cmd+1..9 stay in the active space | 156.0.8078.47 |
+| `chrome/browser/ui/browser_window/internal/BUILD.gn` | `spaces/core/add-space-controller.patch` | Dep on `//chrome/browser/ui/spaces:controller` in `internal`, non-Android block | 156.0.8078.47 |
+| `chrome/browser/ui/browser_window/internal/embedder_browser_window_features.cc` | `spaces/core/add-space-controller.patch` | Include; create `SpaceController` in `Init()`, reset it in `TearDownPreBrowserWindowDestruction()`. Chromium's slot for embedder window features | 156.0.8078.47 |
+| `chrome/browser/ui/browser_window/public/embedder_browser_window_features.h` | `spaces/core/add-space-controller.patch` | Forward declaration and `space_controller_` member | 156.0.8078.47 |
+| `chrome/browser/ui/tabs/BUILD.gn` | `spaces/core/add-space-controller.patch` | Dep on `//chrome/browser/ui/spaces:tab_space_filter` in `tab_strip_impl` | 156.0.8078.47 |
+| `chrome/browser/ui/tabs/tab_strip_model.h` | `spaces/core/add-space-controller.patch` | Forward declaration; `SetSpaceFilter()`, `IsTabInActiveSpace()` after `RotateFocusedGroup()`; `space_filter_` member | 156.0.8078.47 |
+| `chrome/browser/ui/tabs/tab_strip_model.cc` | `spaces/core/add-space-controller.patch` | Include; `IsTabInActiveSpace()` next to the focused-group checks in `GetIndicesClosedByCommand()`, `GetTabsClosedByCommand()`, `SelectRelativeTab()`, `DetermineNewSelectedIndex()`, and in Helium's `SelectMRUTab()` | 156.0.8078.47 |
 | `chrome/browser/ui/browser_live_tab_context.cc` | `spaces/core/add-space-tab-helper.patch` | Include; `AddSpaceIdToExtraData()` in `GetExtraDataForTab()`. Helium's `core.patch` also edits this file | 156.0.8078.47 |
 | `chrome/browser/ui/webui/BUILD.gn` | `spaces/tooling/add-spaces-internals.patch` | Dep on `//chrome/browser/ui/spaces:internals` in `configs`, `enable_session_service` block | 156.0.8078.47 |
 | `chrome/browser/ui/webui/chrome_web_ui_configs.cc` | `spaces/tooling/add-spaces-internals.patch` | Include and `AddWebUIConfig()` for `SpacesInternalsUIConfig`, `ENABLE_SESSION_SERVICE` block | 156.0.8078.47 |
@@ -32,11 +39,10 @@ New files we add (under `chrome/browser/ui/spaces/` and
 | `chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc` | Spaces | Filter tabs by active space, host switcher strip and favorites grid, route scroll to swipe handler |
 | `chrome/browser/ui/views/tabs/common/unpinned_tab_container_view_layout.cc`, `pinned_tab_container_view.cc` | Spaces | Hide tabs outside the active space, next to the focused-group check (Vertical, and horizontal with `kTabStripUnification`) |
 | `chrome/browser/ui/views/tabs/tab_container_impl.cc`, `tab_strip.cc` | Spaces | Same, for the legacy horizontal strip (Classic, Compact, Dynamic) |
-| `chrome/browser/ui/tabs/tab_strip_model.cc` | Spaces | Next tab to activate on close, Ctrl+Tab, next to the focused-group checks |
-| `chrome/browser/sessions/session_service_base.cc`, `session_restore.cc` | Spaces | Active space per window: write in `BuildCommandsForBrowser`, read when restoring the window (step 3) |
+| `chrome/browser/ui/tabs/tab_strip_model.cc` | Spaces | Keyboard tab moves (`MoveTabNext`/`Previous`) and range selection, with the contiguity rule |
 | `chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h` | Spaces | Read collapse/width state next to space state |
-| `chrome/browser/ui/browser_tabstrip.cc` and tab creation path | Spaces, Isolation | New tabs join the active space; isolated spaces pass a SiteInstance |
-| `chrome/browser/ui/browser_commands.cc` | Spaces | Ctrl+Tab within space, space switching commands |
+| `chrome/browser/ui/browser_tabstrip.cc` and tab creation path | Isolation | Isolated spaces pass a SiteInstance. (New tabs join the active space from `SpaceController`, with no hook) |
+| `chrome/browser/ui/browser_commands.cc` | Spaces | Space switching commands |
 | `chrome/app/chrome_command_ids.h`, macOS accelerator tables | Spaces | Command ids and shortcuts |
 | `chrome/browser/ui/tabs/tab_menu_model.cc` | Spaces, Folders | Move to space, pin to favorites, add to folder |
 | `chrome/browser/prefs/browser_prefs.cc` | Archive | Register prefs, only if a pref can't be registered by its service factory. Spaces prefs are registered by `SpaceRegistryFactory` |

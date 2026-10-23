@@ -50,8 +50,14 @@ model, so session restore, drag and drop, and tab commands keep working.
 - Switching: two-finger horizontal swipe over the sidebar only (page swipes
   keep back/forward), Cmd+Opt+Left/Right, Ctrl+Opt+1..9, click an icon. Ctrl+Tab
   stays inside the active space.
-- Persistence: space list in a profile dictionary pref; active space per window
-  in session window data. Spaces are never auto-deleted.
+- Persistence: space list in a profile dictionary pref. The active space
+  follows the active tab: activating a tab in another space switches to it,
+  and while a favorite is active the window shows the space of its most
+  recently active other tab. Tabs' last-active times are already saved, so
+  the active space needs no session data of its own. Spaces are never
+  auto-deleted.
+- New tabs join the active space; restored tabs keep their own. Closing a
+  space's last tab opens a new tab in it, as in Arc.
 
 ## Feature 2: Per-space isolation
 

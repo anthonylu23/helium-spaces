@@ -1,7 +1,8 @@
 # Status
 
 **Current phase: 3 (Spaces v1). Steps 1 and 2 committed on branch
-`spaces/registry`; next is step 3. Step 0 spike: code review and
+`spaces/registry`. Step 3a (`SpaceController`, model and command hooks)
+committed on branch `spaces/controller`; next is 3b, the tab strip views. Step 0 spike: code review and
 computer-use checks support option C; actual dragging and human animation
 review remain open.**
 
@@ -14,7 +15,7 @@ Last updated 2026-10-23.
 | Helium | 0.20.1.1 (core `f29a2596`, macOS `9aa975a`) |
 | Chromium | 156.0.8078.47 |
 | Machine | M3 Pro, 11 cores, 18 GB RAM, Xcode 26.2 (upstream CI uses 26.5) |
-| Our patches | 5, in `patches/spaces/` |
+| Our patches | 6, in `patches/spaces/` |
 
 ## Measured build costs
 
@@ -71,11 +72,21 @@ Last updated 2026-10-23.
        A `TabInserted()` hook turned out to be unnecessary and was dropped:
        step 3 must assign a tab's space after it is in a window.
        Active space per window moved to step 3, with `SpaceController`.
-    3. `SpaceController`, active space per window (window extra data,
-       written in `BuildCommandsForBrowser`), and filtering, at the
-       focus-mode hook points, in both
-       the collection views (Vertical) and the legacy `TabContainerImpl`
-       (Classic, Compact, Dynamic).
+    3. a. Done: `spaces/core/add-space-controller.patch`.
+          `SpaceController` per normal window, owned by Chromium's
+          `EmbedderBrowserWindowFeatures`, and a `TabSpaceFilter` set on the
+          `TabStripModel`. The active space follows the active tab; with a
+          favorite active it is the space of the most recently active other
+          tab, so it needs no session data of its own. New tabs join the
+          active space. Closing a space's last tab opens a new tab there.
+          Ctrl+Tab (and Helium's MRU cycling), Cmd+1..9, the tab activated
+          after a close, and close-other/close-to-the-side tabs stay in the
+          active space. Mutation-tested like step 2.
+       b. Filtering in the views, at the focus-mode hook points: the
+          collection views (Vertical) and the legacy `TabContainerImpl`
+          (Classic, Compact, Dynamic). Then range selection, keyboard tab
+          moves and the contiguity rule, which matter once hidden tabs are
+          hidden.
     4. Switcher strip, keyboard switching, tab context menu.
 3. Consider Xcode 26.5 to match upstream CI before the first rebase.
 
@@ -88,6 +99,10 @@ Automated (`devutils/spaces_smoke.mjs`):
 - Flag off: no spaces are saved. Flag on: one default space, same id after a restart.
 - Tabs assigned to spaces keep them after a restart, a second restart, a
   forced session-file rewrite, and close plus reopen (Cmd+Shift+T).
+- Switching (to an empty space, back to a space's most recent tab), new tabs
+  joining the active space, Ctrl+Tab, Cmd+1/Cmd+9, favorites, "Close other
+  tabs", closing a space's last tab, activating a tab elsewhere, removing the
+  active space, and the active space after a restart with a favorite active.
 
 Unit (`spaces_unittests`): 12 `SpaceList` tests.
 

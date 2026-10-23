@@ -134,14 +134,12 @@ BrowserLiveTabContext::GetExtraDataForTab().
  test("spaces_unittests") {
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/space_tab_helper.cc
-@@ -0,0 +1,98 @@
+@@ -0,0 +1,101 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#include "chrome/browser/ui/spaces/space_tab_helper.h"
-+
-+#include <utility>
 +
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/sessions/session_service.h"
@@ -166,12 +164,21 @@ BrowserLiveTabContext::GetExtraDataForTab().
 +}
 +
 +// static
++bool SpaceTabHelper::HasSpace(const content::WebContents* contents) {
++  return FromWebContents(contents);
++}
++
++// static
 +void SpaceTabHelper::SetSpaceId(content::WebContents* contents,
 +                                base::Uuid space_id) {
-+  if (!features::IsSpacesEnabled() || GetSpaceId(contents) == space_id) {
++  if (!features::IsSpacesEnabled()) {
 +    return;
 +  }
-+  GetOrCreateForWebContents(contents)->space_id_ = space_id;
++  SpaceTabHelper* helper = GetOrCreateForWebContents(contents);
++  if (helper->space_id_ == space_id) {
++    return;
++  }
++  helper->space_id_ = space_id;
 +
 +  // A tab that isn't in a window yet is written at the next session rewrite.
 +  SessionService* session_service = SessionServiceFactory::GetForProfile(
@@ -219,14 +226,10 @@ BrowserLiveTabContext::GetExtraDataForTab().
 +  if (!features::IsSpacesEnabled()) {
 +    return;
 +  }
++  SpaceTabHelper* helper = SpaceTabHelper::GetOrCreateForWebContents(contents);
 +  auto it = extra_data.find(kSpaceIdExtraDataKey);
-+  if (it == extra_data.end()) {
-+    return;
-+  }
-+  base::Uuid space_id = base::Uuid::ParseLowercase(it->second);
-+  if (space_id.is_valid()) {
-+    SpaceTabHelper::GetOrCreateForWebContents(contents)->space_id_ =
-+        std::move(space_id);
++  if (it != extra_data.end()) {
++    helper->space_id_ = base::Uuid::ParseLowercase(it->second);
 +  }
 +}
 +
@@ -235,7 +238,7 @@ BrowserLiveTabContext::GetExtraDataForTab().
 +}  // namespace spaces
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/space_tab_helper.h
-@@ -0,0 +1,83 @@
+@@ -0,0 +1,88 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -275,6 +278,10 @@ BrowserLiveTabContext::GetExtraDataForTab().
 +  // Returns the space id of `contents`, or an invalid id if it has none.
 +  static base::Uuid GetSpaceId(const content::WebContents* contents);
 +
++  // Whether `contents` has been given a space, even the default one. Restored
++  // tabs always have one; SpaceController gives one to every other new tab.
++  static bool HasSpace(const content::WebContents* contents);
++
 +  // Moves `contents` to `space_id`, where an invalid id means the default
 +  // space, and records it in the session so restore puts it back. Call it
 +  // once the tab is in a window: before that the id is only kept in memory,
@@ -310,8 +317,9 @@ BrowserLiveTabContext::GetExtraDataForTab().
 +void AddSpaceIdToExtraData(const content::WebContents* contents,
 +                           std::map<std::string, std::string>* extra_data);
 +
-+// Sets the space of a restored tab from its session or tab restore extra data.
-+// Doesn't write to the session; restore then calls BuildCommandsForTab().
++// Sets the space of a restored tab from its session or tab restore extra data,
++// the default space if it has none, so the tab keeps it when inserted. Doesn't
++// write to the session; restore then calls BuildCommandsForTab().
 +void RestoreSpaceIdFromExtraData(
 +    content::WebContents* contents,
 +    const std::map<std::string, std::string>& extra_data);
