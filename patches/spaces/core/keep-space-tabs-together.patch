@@ -1,0 +1,1398 @@
+--- a/chrome/browser/ui/spaces/BUILD.gn
++++ b/chrome/browser/ui/spaces/BUILD.gn
+@@ -20,6 +20,8 @@ source_set("model") {
+     "space.h",
+     "space_list.cc",
+     "space_list.h",
++    "space_order.cc",
++    "space_order.h",
+   ]
+   public_deps = [
+     "//base",
+@@ -72,7 +74,10 @@ source_set("tab_space") {
+ # Header only, so //chrome/browser/ui/tabs:tab_strip_impl can depend on it.
+ source_set("tab_space_filter") {
+   sources = [ "tab_space_filter.h" ]
+-  public_deps = [ "//base" ]
++  public_deps = [
++    "//base",
++    "//components/tab_groups",
++  ]
+ }
+ 
+ # SpaceController, which shows one space at a time in a browser window.
+@@ -82,10 +87,13 @@ source_set("controller") {
+     "space_controller.h",
+   ]
+   public_deps = [
++    ":model",
+     ":spaces",
+     ":tab_space_filter",
+     "//base",
+     "//chrome/browser/ui/tabs:tab_strip_model_observer",
++    "//components/sessions",
++    "//components/tab_groups",
+     "//components/tabs:public",
+     "//ui/base/unowned_user_data",
+   ]
+@@ -104,7 +112,10 @@ source_set("controller") {
+ # The tarball we build from ships without Chromium's test data, so unit_tests
+ # and browser_tests can't build. This target only needs gtest.
+ test("spaces_unittests") {
+-  sources = [ "space_list_unittest.cc" ]
++  sources = [
++    "space_list_unittest.cc",
++    "space_order_unittest.cc",
++  ]
+   deps = [
+     ":model",
+     "//base/test:run_all_unittests",
+--- a/chrome/browser/ui/spaces/space_controller.cc
++++ b/chrome/browser/ui/spaces/space_controller.cc
+@@ -7,8 +7,10 @@
+ #include <algorithm>
+ #include <utility>
+ 
++#include "base/auto_reset.h"
+ #include "base/functional/bind.h"
+ #include "base/location.h"
++#include "base/logging.h"
+ #include "base/task/sequenced_task_runner.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/tab_list/tab_removed_reason.h"
+@@ -19,6 +21,7 @@
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
++#include "components/tabs/public/split_tab_data.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "content/public/browser/web_contents.h"
+ #include "url/gurl.h"
+@@ -53,6 +56,7 @@ SpaceController::SpaceController(Browser
+                                  SpaceRegistry* registry)
+     : tab_strip_model_(browser->GetTabStripModel()),
+       registry_(registry),
++      window_id_(browser->GetSessionID()),
+       active_space_id_(registry->GetDefaultSpace().id),
+       scoped_data_(browser->GetUnownedUserDataHost(), *this) {
+   tab_strip_model_->AddObserver(this);
+@@ -80,11 +84,37 @@ void SpaceController::MoveTabToSpace(tab
+   if (space == GetSpaceOfTab(tab)) {
+     return;
+   }
++  const std::optional<split_tabs::SplitTabId> split = tab->GetSplit();
++  const std::vector<tabs::TabInterface*> moving =
++      split ? tab_strip_model_->GetSplitData(*split)->ListTabs()
++            : std::vector<tabs::TabInterface*>{tab};
+   if (tab->GetGroup()) {
+-    tab_strip_model_->RemoveFromGroup({tab_strip_model_->GetIndexOfTab(tab)});
++    std::vector<int> indices;
++    for (const tabs::TabInterface* moving_tab : moving) {
++      indices.push_back(tab_strip_model_->GetIndexOfTab(moving_tab));
++    }
++    tab_strip_model_->RemoveFromGroup(indices);
++  }
++  const bool was_active =
++      std::ranges::contains(moving, tab_strip_model_->GetActiveTab());
++  for (tabs::TabInterface* moving_tab : moving) {
++    SetTabSpace(moving_tab->GetContents(), space);
++  }
++
++  // Asking for the end of the tab strip puts them at the end of the space's
++  // tabs; see ConstrainMoveIndex().
++  const int last_index = tab_strip_model_->count() - 1;
++  if (split) {
++    tab_strip_model_->MoveSplitTo(
++        *split, last_index + 1 - static_cast<int>(moving.size()),
++        tab->IsPinned(), std::nullopt);
++  } else {
++    tab_strip_model_->MoveWebContentsAt(tab_strip_model_->GetIndexOfTab(tab),
++                                        last_index, /*select_after_move=*/false,
++                                        std::nullopt);
+   }
+-  SetTabSpace(tab->GetContents(), space);
+-  if (tab == tab_strip_model_->GetActiveTab() && !IsTabInActiveSpace(tab)) {
++
++  if (was_active && !IsTabInActiveSpace(tab)) {
+     ActivateTabInActiveSpace();
+   }
+   tab_visibility_changed_callbacks_.Notify();
+@@ -108,6 +138,118 @@ bool SpaceController::IsTabInActiveSpace
+   return IsFavorite(tab) || GetSpaceOfTab(tab) == active_space_id_;
+ }
+ 
++bool SpaceController::IsOrderValid() const {
++  return IsTabOrderValid(GetOrderKeys({}), registry_->GetDefaultSpace().id);
++}
++
++int SpaceController::WillInsertTabs(
++    const std::vector<tabs::TabInterface*>& tabs,
++    int index,
++    bool pinned,
++    std::optional<tab_groups::TabGroupId> group) {
++  if (tabs.empty()) {
++    return index;
++  }
++  const base::Uuid& default_space = registry_->GetDefaultSpace().id;
++  const std::optional<base::Uuid> group_space =
++      group ? GetSpaceOfGroup(*group, {}) : std::nullopt;
++  // A window that only has favorites, such as one a selection was just moved
++  // to, takes the space of the first other tab moved in.
++  const bool window_shows_a_space = std::ranges::any_of(
++      *tab_strip_model_,
++      [this](const tabs::TabInterface* t) { return !IsFavorite(t); });
++  for (tabs::TabInterface* tab : tabs) {
++    content::WebContents* contents = tab->GetContents();
++    const SessionID last_window_id = SpaceTabHelper::GetLastWindowId(contents);
++    std::optional<base::Uuid> space_before_drag =
++        SpaceTabHelper::GetSpaceBeforeDrag(contents, window_id_);
++    if (group_space) {
++      SetTabSpace(contents, *group_space, /*before_insert=*/true);
++    } else if (!SpaceTabHelper::HasSpace(contents)) {
++      SetTabSpace(contents, active_space_id_, /*before_insert=*/true);
++    } else if (space_before_drag) {
++      // Dragged back to the window the drag started in, or put back there.
++      SetTabSpace(contents, ResolveSpace(*space_before_drag),
++                  /*before_insert=*/true);
++    } else if (last_window_id.is_valid() && last_window_id != window_id_ &&
++               window_shows_a_space &&
++               !(pinned && GetSpaceOfTab(tab) == default_space)) {
++      // Moved from another window: it joins the space shown here, where it
++      // was dropped, as in Arc. Favorites stay favorites.
++      SetTabSpace(contents, active_space_id_, /*before_insert=*/true);
++    }
++    SpaceTabHelper::SetLastWindowId(contents, window_id_);
++  }
++  if (group_space || fixing_order_) {
++    return index;
++  }
++  return static_cast<int>(
++      ConstrainTabIndex(GetOrderKeys({}), {GetSpaceOfTab(tabs[0]), pinned},
++                        static_cast<size_t>(index), default_space));
++}
++
++int SpaceController::ConstrainMoveIndex(
++    const std::vector<tabs::TabInterface*>& tabs,
++    int index,
++    bool pinned,
++    std::optional<tab_groups::TabGroupId> group) const {
++  if (tabs.empty() || fixing_order_) {
++    return index;
++  }
++  // Chromium keeps tabs moved into a group with the group, which is in one
++  // space.
++  if (group && GetSpaceOfGroup(*group, tabs)) {
++    return index;
++  }
++  const base::Uuid space = GetSpaceOfTab(tabs[0]);
++  if (!std::ranges::all_of(tabs, [this, &space](const tabs::TabInterface* tab) {
++        return GetSpaceOfTab(tab) == space;
++      })) {
++    // Tabs of several spaces, which only an extension can select: let them
++    // go, and fix the order afterwards.
++    return index;
++  }
++  return static_cast<int>(ConstrainTabIndex(GetOrderKeys(tabs), {space, pinned},
++                                            static_cast<size_t>(index),
++                                            registry_->GetDefaultSpace().id));
++}
++
++void SpaceController::WillSetTabPinned(tabs::TabInterface* tab, bool pinned) {
++  if (!pinned && IsFavorite(tab)) {
++    SetTabSpace(tab->GetContents(), active_space_id_);
++  }
++}
++
++void SpaceController::WillGroupTabs(
++    const std::vector<tabs::TabInterface*>& tabs) {
++  for (tabs::TabInterface* tab : tabs) {
++    WillSetTabPinned(tab, /*pinned=*/false);
++  }
++}
++
++void SpaceController::WillSplitTabs(
++    const std::vector<tabs::TabInterface*>& tabs,
++    const tabs::TabInterface* pivot) {
++  // The pivot is the active tab, so its space is the active one, or it is a
++  // favorite and the split joins the favorites.
++  const base::Uuid space = GetSpaceOfTab(pivot);
++  for (tabs::TabInterface* tab : tabs) {
++    SetTabSpace(tab->GetContents(), space);
++  }
++}
++
++void SpaceController::WillSwapTabs(tabs::TabInterface* a,
++                                   tabs::TabInterface* b) {
++  const base::Uuid space_of_a = GetSpaceOfTab(a);
++  SetTabSpace(a->GetContents(), GetSpaceOfTab(b));
++  SetTabSpace(b->GetContents(), space_of_a);
++}
++
++bool SpaceController::AreTabsInSameRun(const tabs::TabInterface* a,
++                                       const tabs::TabInterface* b) const {
++  return a->IsPinned() == b->IsPinned() && GetSpaceOfTab(a) == GetSpaceOfTab(b);
++}
++
+ void SpaceController::OnTabStripModelChanged(
+     TabStripModel* tab_strip_model,
+     const TabStripModelChange& change,
+@@ -115,10 +257,10 @@ void SpaceController::OnTabStripModelCha
+   bool emptied_active_space = false;
+   switch (change.type()) {
+     case TabStripModelChange::kInserted:
++      // WillInsertTabs() gave each tab its space, before it was in the
++      // window's session.
+       for (const auto& inserted : change.GetInsert()->contents) {
+-        if (!SpaceTabHelper::HasSpace(inserted.contents)) {
+-          SetTabSpace(inserted.contents, active_space_id_);
+-        }
++        SpaceTabHelper::SaveSpaceIdIfUnsaved(inserted.contents);
+       }
+       break;
+     case TabStripModelChange::kRemoved:
+@@ -145,6 +287,7 @@ void SpaceController::OnTabStripModelCha
+   if (tab_strip_model_->closing_all()) {
+     return;
+   }
++  MaybeFixOrderLater();
+   if (emptied_active_space) {
+     // WillCloseTabs() opens a tab first when tabs are closed through the tab
+     // strip; this covers tabs deleted any other way. The tab strip can't be
+@@ -181,6 +324,30 @@ void SpaceController::OnTabPinnedStateCh
+   }
+ }
+ 
++void SpaceController::TabGroupedStateChanged(
++    TabStripModel* tab_strip_model,
++    std::optional<tab_groups::TabGroupId> old_group,
++    std::optional<tab_groups::TabGroupId> new_group,
++    tabs::TabInterface* tab,
++    int index) {
++  if (!new_group) {
++    return;
++  }
++  // A group's space is its first tab's, the one made the group or the one it
++  // was moved in with.
++  const std::optional<base::Uuid> group_space =
++      GetSpaceOfGroup(*new_group, {tab});
++  if (!group_space || *group_space == GetSpaceOfTab(tab)) {
++    return;
++  }
++  SetTabSpace(tab->GetContents(), *group_space);
++  // The tab strip is still notifying observers.
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&SpaceController::OnTabSpacesChanged,
++                                weak_factory_.GetWeakPtr()));
++  MaybeFixOrderLater();
++}
++
+ void SpaceController::WillCloseTabs(
+     const std::vector<tabs::TabInterface*>& tabs) {
+   const tabs::TabInterface* active_tab = tab_strip_model_->GetActiveTab();
+@@ -201,7 +368,11 @@ void SpaceController::WillCloseTabs(
+ }
+ 
+ void SpaceController::OnSpacesChanged() {
+-  // Tabs of a removed space now belong to the default space.
++  // Tabs of a removed space now belong to the default space, and its pinned
++  // tabs are favorites. Put them with the default space's tabs.
++  if (!IsOrderValid()) {
++    FixOrder();
++  }
+   if (!registry_->GetSpace(active_space_id_)) {
+     SetActiveSpace(GetSpaceForActiveTab());
+   }
+@@ -300,10 +471,118 @@ void SpaceController::OpenTabInEmptiedSp
+ }
+ 
+ void SpaceController::SetTabSpace(content::WebContents* contents,
+-                                  const base::Uuid& space_id) {
+-  SpaceTabHelper::SetSpaceId(
+-      contents,
+-      space_id == registry_->GetDefaultSpace().id ? base::Uuid() : space_id);
++                                  const base::Uuid& space_id,
++                                  bool before_insert) {
++  const base::Uuid stored =
++      space_id == registry_->GetDefaultSpace().id ? base::Uuid() : space_id;
++  if (before_insert) {
++    SpaceTabHelper::SetSpaceIdBeforeInsert(contents, stored);
++  } else {
++    SpaceTabHelper::SetSpaceId(contents, stored);
++  }
++}
++
++void SpaceController::OnTabSpacesChanged() {
++  const tabs::TabInterface* active_tab = tab_strip_model_->GetActiveTab();
++  if (active_tab && !IsTabInActiveSpace(active_tab)) {
++    SetActiveSpace(GetSpaceOfTab(active_tab));
++  }
++  tab_visibility_changed_callbacks_.Notify();
++}
++
++std::optional<base::Uuid> SpaceController::GetSpaceOfGroup(
++    const tab_groups::TabGroupId& group,
++    const std::vector<tabs::TabInterface*>& excluding) const {
++  for (const tabs::TabInterface* tab : *tab_strip_model_) {
++    if (tab->GetGroup() == group && !std::ranges::contains(excluding, tab)) {
++      return GetSpaceOfTab(tab);
++    }
++  }
++  return std::nullopt;
++}
++
++std::vector<TabOrderKey> SpaceController::GetOrderKeys(
++    const std::vector<tabs::TabInterface*>& excluding) const {
++  std::vector<TabOrderKey> keys;
++  for (const tabs::TabInterface* tab : *tab_strip_model_) {
++    if (!std::ranges::contains(excluding, tab)) {
++      keys.push_back({GetSpaceOfTab(tab), tab->IsPinned()});
++    }
++  }
++  return keys;
++}
++
++void SpaceController::MaybeFixOrderLater() {
++  if (fix_order_posted_ || fixing_order_ || IsOrderValid()) {
++    return;
++  }
++  // The tab strip can't be changed while it notifies observers, and the
++  // order may only be broken halfway through a change.
++  fix_order_posted_ = true;
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&SpaceController::FixOrderIfInvalid,
++                                weak_factory_.GetWeakPtr()));
++}
++
++void SpaceController::FixOrderIfInvalid() {
++  fix_order_posted_ = false;
++  if (tab_strip_model_->closing_all() || IsOrderValid()) {
++    return;
++  }
++  // A change the hooks in TabStripModel don't cover.
++  LOG(WARNING) << "helium-spaces: fixing the tab order";
++  ++order_fix_count_;
++  FixOrder();
++}
++
++void SpaceController::FixOrder() {
++  // Units are tabs that move together: a group, a split view, or a tab.
++  struct Unit {
++    tabs::TabHandle first_tab;
++    int length = 0;
++    std::optional<tab_groups::TabGroupId> group;
++    std::optional<split_tabs::SplitTabId> split;
++  };
++  std::vector<Unit> units;
++  std::vector<TabOrderKey> keys;
++  for (int index = 0; index < tab_strip_model_->count();) {
++    tabs::TabInterface* tab = tab_strip_model_->GetTabAtIndex(index);
++    Unit unit{tab->GetHandle(), 0, tab->GetGroup(),
++              tab->GetGroup() ? std::nullopt : tab->GetSplit()};
++    do {
++      ++unit.length;
++      ++index;
++    } while (
++        index < tab_strip_model_->count() &&
++        ((unit.group &&
++          tab_strip_model_->GetTabAtIndex(index)->GetGroup() == unit.group) ||
++         (unit.split &&
++          tab_strip_model_->GetTabAtIndex(index)->GetSplit() == unit.split)));
++    keys.push_back({GetSpaceOfTab(tab), tab->IsPinned()});
++    units.push_back(unit);
++  }
++
++  base::AutoReset<bool> fixing(&fixing_order_, true);
++  int target = 0;
++  for (size_t unit_index :
++       GetValidTabOrder(keys, registry_->GetDefaultSpace().id)) {
++    const Unit& unit = units[unit_index];
++    tabs::TabInterface* first_tab = unit.first_tab.Get();
++    const int index = tab_strip_model_->GetIndexOfTab(first_tab);
++    // Units before `target` are in place, so this one only moves left.
++    if (index != target) {
++      if (unit.group) {
++        tab_strip_model_->MoveGroupTo(*unit.group, target);
++      } else if (unit.split) {
++        tab_strip_model_->MoveSplitTo(*unit.split, target,
++                                      first_tab->IsPinned(), std::nullopt);
++      } else {
++        tab_strip_model_->MoveWebContentsAt(
++            index, target, /*select_after_move=*/false, std::nullopt);
++      }
++    }
++    target += unit.length;
++  }
+ }
+ 
+ bool IsTabHiddenBySpace(const tabs::TabInterface* tab) {
+--- a/chrome/browser/ui/spaces/space_controller.h
++++ b/chrome/browser/ui/spaces/space_controller.h
+@@ -7,6 +7,7 @@
+ 
+ #include <map>
+ #include <memory>
++#include <optional>
+ #include <vector>
+ 
+ #include "base/callback_list.h"
+@@ -15,9 +16,12 @@
+ #include "base/memory/weak_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "base/uuid.h"
++#include "chrome/browser/ui/spaces/space_order.h"
+ #include "chrome/browser/ui/spaces/space_registry.h"
+ #include "chrome/browser/ui/spaces/tab_space_filter.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
++#include "components/sessions/core/session_id.h"
++#include "components/tab_groups/tab_group_id.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
+ 
+@@ -38,8 +42,15 @@ namespace spaces {
+ //   space of the most recently active tab that isn't a favorite.
+ // - Switching to a space activates the tab last active there.
+ // - New tabs join the active space. Restored tabs keep the space they had.
++//   Tabs moved in from another window join the active space, as in Arc,
++//   unless they are favorites or the window had only favorites. A tab drag
++//   that comes back to the window it started in keeps the tab's space there.
++// - A tab added to a tab group, or a split view, joins its space.
+ // - Closing the last tab of the active space opens a new tab there first, as
+ //   in Arc, instead of leaving the space.
++// - Each space's tabs stay together in the tab strip (see space_order.h).
++//   TabStripModel asks where tabs may go; if the order still breaks the rule,
++//   it is fixed in a posted task and counted, so tests can catch the gap.
+ // Owned by EmbedderBrowserWindowFeatures.
+ class SpaceController : public TabSpaceFilter,
+                         public TabStripModelObserver,
+@@ -67,9 +78,10 @@ class SpaceController : public TabSpaceF
+   // new tab in it if it has none. An unknown id means the default space.
+   void SwitchToSpace(const base::Uuid& space_id);
+ 
+-  // Moves `tab` to `space_id`; an unknown id means the default space. It
+-  // leaves its tab group, since a group stays within one space. If `tab` was
+-  // the active tab, the window stays in the active space and activates
++  // Moves `tab` to the end of `space_id`'s tabs; an unknown id means the
++  // default space. It leaves its tab group, since a group stays within one
++  // space, and a tab in a split view moves with the other tab in it. If `tab`
++  // was the active tab, the window stays in the active space and activates
+   // another tab there.
+   void MoveTabToSpace(tabs::TabInterface* tab, const base::Uuid& space_id);
+ 
+@@ -81,9 +93,31 @@ class SpaceController : public TabSpaceF
+   // every space.
+   bool IsFavorite(const tabs::TabInterface* tab) const;
+ 
++  // Whether the window's tabs follow the order rule.
++  bool IsOrderValid() const;
++
++  // How many times the order broke the rule and was fixed afterwards.
++  int order_fix_count() const { return order_fix_count_; }
++
+   // TabSpaceFilter:
+   bool IsTabInActiveSpace(const tabs::TabInterface* tab) const override;
+   void WillCloseTabs(const std::vector<tabs::TabInterface*>& tabs) override;
++  int WillInsertTabs(const std::vector<tabs::TabInterface*>& tabs,
++                     int index,
++                     bool pinned,
++                     std::optional<tab_groups::TabGroupId> group) override;
++  int ConstrainMoveIndex(
++      const std::vector<tabs::TabInterface*>& tabs,
++      int index,
++      bool pinned,
++      std::optional<tab_groups::TabGroupId> group) const override;
++  void WillSetTabPinned(tabs::TabInterface* tab, bool pinned) override;
++  void WillGroupTabs(const std::vector<tabs::TabInterface*>& tabs) override;
++  void WillSplitTabs(const std::vector<tabs::TabInterface*>& tabs,
++                     const tabs::TabInterface* pivot) override;
++  void WillSwapTabs(tabs::TabInterface* a, tabs::TabInterface* b) override;
++  bool AreTabsInSameRun(const tabs::TabInterface* a,
++                        const tabs::TabInterface* b) const override;
+   base::CallbackListSubscription RegisterTabVisibilityChanged(
+       base::RepeatingClosure callback) override;
+ 
+@@ -93,6 +127,11 @@ class SpaceController : public TabSpaceF
+       const TabStripModelChange& change,
+       const TabStripSelectionChange& selection) override;
+   void OnTabPinnedStateChanged(tabs::TabInterface* tab, int index) override;
++  void TabGroupedStateChanged(TabStripModel* tab_strip_model,
++                              std::optional<tab_groups::TabGroupId> old_group,
++                              std::optional<tab_groups::TabGroupId> new_group,
++                              tabs::TabInterface* tab,
++                              int index) override;
+ 
+   // SpaceRegistry::Observer:
+   void OnSpacesChanged() override;
+@@ -124,15 +163,45 @@ class SpaceController : public TabSpaceF
+   void OpenTabInEmptiedSpace();
+ 
+   // Stores `space_id` on `contents`, where the default space is stored as no
+-  // id, so it stays out of the session file.
+-  void SetTabSpace(content::WebContents* contents, const base::Uuid& space_id);
++  // id, so it stays out of the session file. Set `before_insert` for a tab
++  // about to be inserted into this window.
++  void SetTabSpace(content::WebContents* contents,
++                   const base::Uuid& space_id,
++                   bool before_insert = false);
++
++  // Switches to the active tab's space if the active tab was moved out of the
++  // active space, and tells the tab strips that tabs may have moved between
++  // spaces.
++  void OnTabSpacesChanged();
++
++  // The space of `group`'s first tab that isn't in `excluding`, or nullopt if
++  // it has no other tabs.
++  std::optional<base::Uuid> GetSpaceOfGroup(
++      const tab_groups::TabGroupId& group,
++      const std::vector<tabs::TabInterface*>& excluding) const;
++
++  // The order key of every tab in the window except `excluding`.
++  std::vector<TabOrderKey> GetOrderKeys(
++      const std::vector<tabs::TabInterface*>& excluding) const;
++
++  // Posts FixOrderIfInvalid() if the order breaks the rule.
++  void MaybeFixOrderLater();
++  void FixOrderIfInvalid();
++
++  // Moves tabs, groups and split views so the order follows the rule.
++  void FixOrder();
+ 
+   const raw_ptr<TabStripModel> tab_strip_model_;
+   const raw_ptr<SpaceRegistry> registry_;
++  const SessionID window_id_;
+   base::Uuid active_space_id_;
+   // The last tab activated in each space, to return to when switching back.
+   std::map<base::Uuid, tabs::TabHandle> last_active_tabs_;
+   base::RepeatingClosureList tab_visibility_changed_callbacks_;
++  // Set while FixOrder() moves tabs, which then go exactly where it says.
++  bool fixing_order_ = false;
++  bool fix_order_posted_ = false;
++  int order_fix_count_ = 0;
+ 
+   base::ScopedObservation<SpaceRegistry, SpaceRegistry::Observer>
+       registry_observation_{this};
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_order.cc
+@@ -0,0 +1,126 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/spaces/space_order.h"
++
++#include <algorithm>
++#include <optional>
++#include <utility>
++
++namespace spaces {
++
++namespace {
++
++bool IsFavorite(const TabOrderKey& key, const base::Uuid& default_space) {
++  return key.pinned && key.space == default_space;
++}
++
++// The number of tabs at the start of `keys` that `predicate` accepts.
++template <typename Predicate>
++size_t CountLeading(base::span<const TabOrderKey> keys, Predicate predicate) {
++  size_t count = 0;
++  while (count < keys.size() && predicate(keys[count])) {
++    ++count;
++  }
++  return count;
++}
++
++}  // namespace
++
++bool IsTabOrderValid(base::span<const TabOrderKey> keys,
++                     const base::Uuid& default_space) {
++  const size_t pinned_count =
++      CountLeading(keys, [](const TabOrderKey& key) { return key.pinned; });
++  const size_t favorite_count =
++      CountLeading(keys, [&default_space](const TabOrderKey& key) {
++        return IsFavorite(key, default_space);
++      });
++  std::vector<TabOrderKey> finished_runs;
++  for (size_t i = 0; i < keys.size(); ++i) {
++    if (keys[i].pinned != (i < pinned_count) ||
++        IsFavorite(keys[i], default_space) != (i < favorite_count)) {
++      return false;
++    }
++    if (i > 0 && keys[i - 1] != keys[i]) {
++      if (std::ranges::contains(finished_runs, keys[i])) {
++        return false;
++      }
++      finished_runs.push_back(keys[i - 1]);
++    }
++  }
++  return true;
++}
++
++size_t ConstrainTabIndex(base::span<const TabOrderKey> keys,
++                         const TabOrderKey& key,
++                         size_t index,
++                         const base::Uuid& default_space) {
++  const size_t pinned_count =
++      CountLeading(keys, [](const TabOrderKey& key) { return key.pinned; });
++  const size_t favorite_count =
++      CountLeading(keys, [&default_space](const TabOrderKey& key) {
++        return IsFavorite(key, default_space);
++      });
++
++  size_t begin = key.pinned ? 0 : pinned_count;
++  size_t end = key.pinned ? pinned_count : keys.size();
++  if (IsFavorite(key, default_space)) {
++    end = favorite_count;
++  } else if (key.pinned) {
++    begin = std::min(favorite_count, end);
++  }
++  index = std::clamp(index, begin, end);
++
++  std::optional<size_t> run_begin;
++  size_t run_end = 0;
++  for (size_t i = begin; i < end; ++i) {
++    if (keys[i] == key) {
++      run_begin = run_begin.value_or(i);
++      run_end = i + 1;
++    }
++  }
++  if (run_begin) {
++    return std::clamp(index, *run_begin, run_end);
++  }
++
++  const auto distance = [index](size_t position) {
++    return position > index ? position - index : index - position;
++  };
++  size_t nearest = begin;
++  for (size_t edge = begin; edge <= end; ++edge) {
++    const bool is_edge =
++        edge == begin || edge == end || keys[edge - 1] != keys[edge];
++    if (is_edge && distance(edge) <= distance(nearest)) {
++      nearest = edge;
++    }
++  }
++  return nearest;
++}
++
++std::vector<size_t> GetValidTabOrder(base::span<const TabOrderKey> units,
++                                     const base::Uuid& default_space) {
++  // Each run sorts by region (favorites, other pinned, unpinned), then by its
++  // first unit.
++  std::vector<TabOrderKey> runs;
++  std::vector<std::pair<size_t, size_t>> rank;
++  for (const TabOrderKey& key : units) {
++    auto it = std::ranges::find(runs, key);
++    if (it == runs.end()) {
++      it = runs.insert(runs.end(), key);
++    }
++    const size_t region =
++        IsFavorite(key, default_space) ? 0 : (key.pinned ? 1 : 2);
++    rank.emplace_back(region, static_cast<size_t>(it - runs.begin()));
++  }
++
++  std::vector<size_t> order(units.size());
++  for (size_t i = 0; i < order.size(); ++i) {
++    order[i] = i;
++  }
++  std::ranges::stable_sort(
++      order, [&rank](size_t a, size_t b) { return rank[a] < rank[b]; });
++  return order;
++}
++
++}  // namespace spaces
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_order.h
+@@ -0,0 +1,49 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_SPACES_SPACE_ORDER_H_
++#define CHROME_BROWSER_UI_SPACES_SPACE_ORDER_H_
++
++#include <cstddef>
++#include <vector>
++
++#include "base/containers/span.h"
++#include "base/uuid.h"
++
++namespace spaces {
++
++// Which run of the tab strip a tab belongs to. The tab strip keeps pinned tabs
++// first, and within that each space's pinned tabs together, and the same for
++// unpinned tabs. Favorites, the default space's pinned tabs, come before
++// every other pinned tab.
++struct TabOrderKey {
++  base::Uuid space;
++  bool pinned = false;
++
++  friend bool operator==(const TabOrderKey&, const TabOrderKey&) = default;
++};
++
++// Whether `keys`, one per tab in tab strip order, follow the rule above.
++bool IsTabOrderValid(base::span<const TabOrderKey> keys,
++                     const base::Uuid& default_space);
++
++// Where a tab with `key` may go if inserted at `index` among `keys`, which
++// are in order and don't include it: `index`, clamped to the pinned or
++// unpinned tabs, then to `key`'s run if it has one. Otherwise the run edge
++// nearest to `index` (the later one on a tie), so no other run is split.
++size_t ConstrainTabIndex(base::span<const TabOrderKey> keys,
++                         const TabOrderKey& key,
++                         size_t index,
++                         const base::Uuid& default_space);
++
++// The order, as indices into `units`, that follows the rule above. A unit is
++// a tab, or tabs that must stay together, such as a tab group. Changes as
++// little as it can: units keep their order within a run, and runs keep the
++// order of their first units, except that favorites come first.
++std::vector<size_t> GetValidTabOrder(base::span<const TabOrderKey> units,
++                                     const base::Uuid& default_space);
++
++}  // namespace spaces
++
++#endif  // CHROME_BROWSER_UI_SPACES_SPACE_ORDER_H_
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_order_unittest.cc
+@@ -0,0 +1,156 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/spaces/space_order.h"
++
++#include <cctype>
++#include <string>
++#include <vector>
++
++#include "base/uuid.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace spaces {
++
++namespace {
++
++// Tabs are written as one letter each: D, W and P for unpinned tabs of the
++// default, Work and Play spaces, and lower case for pinned ones, so "d" is a
++// favorite.
++class SpaceOrderTest : public testing::Test {
++ protected:
++  TabOrderKey Key(char letter) const {
++    const char upper = static_cast<char>(std::toupper(letter));
++    const base::Uuid& space =
++        upper == 'W' ? work_ : (upper == 'P' ? play_ : default_);
++    return {space, letter != upper};
++  }
++
++  std::vector<TabOrderKey> Keys(const std::string& tabs) const {
++    std::vector<TabOrderKey> keys;
++    for (char letter : tabs) {
++      keys.push_back(Key(letter));
++    }
++    return keys;
++  }
++
++  bool IsValid(const std::string& tabs) const {
++    return IsTabOrderValid(Keys(tabs), default_);
++  }
++
++  size_t Constrain(const std::string& tabs, char tab, size_t index) const {
++    return ConstrainTabIndex(Keys(tabs), Key(tab), index, default_);
++  }
++
++  // `tabs` reordered by GetValidTabOrder().
++  std::string Fix(const std::string& tabs) const {
++    std::string fixed;
++    for (size_t index : GetValidTabOrder(Keys(tabs), default_)) {
++      fixed += tabs[index];
++    }
++    return fixed;
++  }
++
++  const base::Uuid default_ = base::Uuid::GenerateRandomV4();
++  const base::Uuid work_ = base::Uuid::GenerateRandomV4();
++  const base::Uuid play_ = base::Uuid::GenerateRandomV4();
++};
++
++TEST_F(SpaceOrderTest, ValidOrders) {
++  EXPECT_TRUE(IsValid(""));
++  EXPECT_TRUE(IsValid("D"));
++  EXPECT_TRUE(IsValid("DDWWPP"));
++  EXPECT_TRUE(IsValid("PPDDWW"));
++  EXPECT_TRUE(IsValid("ddwwppDWP"));
++  EXPECT_TRUE(IsValid("ddppwwWWDD"));
++  EXPECT_TRUE(IsValid("wwPP"));
++}
++
++TEST_F(SpaceOrderTest, InvalidOrders) {
++  EXPECT_FALSE(IsValid("WPW"));
++  EXPECT_FALSE(IsValid("DWWPD"));
++  EXPECT_FALSE(IsValid("wpwW"));
++  // Favorites come before other pinned tabs.
++  EXPECT_FALSE(IsValid("wdW"));
++  // Pinned tabs come first.
++  EXPECT_FALSE(IsValid("Ww"));
++}
++
++TEST_F(SpaceOrderTest, ConstrainKeepsIndexInsideTheRun) {
++  EXPECT_EQ(Constrain("DDWWWPP", 'W', 3), 3u);
++  EXPECT_EQ(Constrain("DDWWWPP", 'W', 2), 2u);
++  EXPECT_EQ(Constrain("DDWWWPP", 'W', 5), 5u);
++}
++
++TEST_F(SpaceOrderTest, ConstrainMovesIndexToTheRun) {
++  // Cmd+T in Work puts a tab at the end of the strip, after Play's tabs.
++  EXPECT_EQ(Constrain("DDWWWPP", 'W', 7), 5u);
++  EXPECT_EQ(Constrain("DDWWWPP", 'W', 0), 2u);
++  EXPECT_EQ(Constrain("DDWWWPP", 'D', 7), 2u);
++  EXPECT_EQ(Constrain("DDWWWPP", 'P', 0), 5u);
++}
++
++TEST_F(SpaceOrderTest, ConstrainWithNoRunPicksTheNearestEdge) {
++  EXPECT_EQ(Constrain("DDWW", 'P', 4), 4u);
++  EXPECT_EQ(Constrain("DDWW", 'P', 0), 0u);
++  EXPECT_EQ(Constrain("DDDWW", 'P', 2), 3u);
++  EXPECT_EQ(Constrain("", 'P', 0), 0u);
++  // A tie goes to the later edge.
++  EXPECT_EQ(Constrain("DDWW", 'P', 1), 2u);
++  EXPECT_EQ(Constrain("DDDDWW", 'P', 2), 4u);
++}
++
++TEST_F(SpaceOrderTest, ConstrainKeepsPinnedTabsApart) {
++  // Unpinned tabs go after every pinned tab.
++  EXPECT_EQ(Constrain("dwWW", 'W', 0), 2u);
++  // Pinned tabs go before every unpinned tab.
++  EXPECT_EQ(Constrain("dwWW", 'w', 4), 2u);
++}
++
++TEST_F(SpaceOrderTest, ConstrainKeepsFavoritesFirst) {
++  EXPECT_EQ(Constrain("ddwwpp", 'd', 6), 2u);
++  EXPECT_EQ(Constrain("ddwwpp", 'd', 4), 2u);
++  EXPECT_EQ(Constrain("wwpp", 'd', 3), 0u);
++  EXPECT_EQ(Constrain("ddwwpp", 'w', 0), 2u);
++  // A space's first pinned tab goes after the favorites.
++  EXPECT_EQ(Constrain("ddpp", 'w', 0), 2u);
++  EXPECT_EQ(Constrain("ddpp", 'w', 4), 4u);
++  EXPECT_EQ(Constrain("ddpp", 'w', 3), 4u);
++}
++
++TEST_F(SpaceOrderTest, ConstrainGivesAValidOrder) {
++  const std::string orders[] = {"", "D", "ddwwpp", "DDWWPP", "dpPPWWDD"};
++  for (const std::string& order : orders) {
++    for (char tab : std::string("DWPdwp")) {
++      for (size_t index = 0; index <= order.size(); ++index) {
++        std::string result = order;
++        result.insert(Constrain(order, tab, index), 1, tab);
++        EXPECT_TRUE(IsValid(result))
++            << order << " + " << tab << " at " << index << " = " << result;
++      }
++    }
++  }
++}
++
++TEST_F(SpaceOrderTest, FixLeavesValidOrdersAlone) {
++  EXPECT_EQ(Fix(""), "");
++  EXPECT_EQ(Fix("ddwwppDDWWPP"), "ddwwppDDWWPP");
++  EXPECT_EQ(Fix("PPWWDD"), "PPWWDD");
++}
++
++TEST_F(SpaceOrderTest, FixJoinsRunsInOrderOfTheirFirstTab) {
++  EXPECT_EQ(Fix("WPW"), "WWP");
++  EXPECT_EQ(Fix("DWPDPW"), "DDWWPP");
++  // A removed space's tabs become default tabs.
++  EXPECT_EQ(Fix("DDPPDD"), "DDDDPP");
++}
++
++TEST_F(SpaceOrderTest, FixPutsFavoritesFirst) {
++  EXPECT_EQ(Fix("wwdpd"), "ddwwp");
++  EXPECT_EQ(Fix("wdWDw"), "dwwWD");
++}
++
++}  // namespace
++
++}  // namespace spaces
+--- a/chrome/browser/ui/spaces/space_tab_helper.cc
++++ b/chrome/browser/ui/spaces/space_tab_helper.cc
+@@ -15,6 +15,14 @@
+ 
+ namespace spaces {
+ 
++namespace {
++
++// The tab drag going on, if any. Only one can be at a time.
++int g_tab_drag = 0;
++int g_last_tab_drag = 0;
++
++}  // namespace
++
+ SpaceTabHelper::SpaceTabHelper(content::WebContents* contents)
+     : content::WebContentsUserData<SpaceTabHelper>(*contents) {}
+ 
+@@ -42,20 +50,89 @@ void SpaceTabHelper::SetSpaceId(content:
+     return;
+   }
+   helper->space_id_ = space_id;
++  helper->unsaved_ = !helper->Save();
++}
++
++// static
++void SpaceTabHelper::SetSpaceIdBeforeInsert(content::WebContents* contents,
++                                            base::Uuid space_id) {
++  if (!features::IsSpacesEnabled()) {
++    return;
++  }
++  SpaceTabHelper* helper = GetOrCreateForWebContents(contents);
++  if (helper->space_id_ != space_id) {
++    helper->space_id_ = space_id;
++    helper->unsaved_ = true;
++  }
++}
++
++// static
++std::optional<base::Uuid> SpaceTabHelper::GetSpaceBeforeDrag(
++    const content::WebContents* contents,
++    SessionID window_id) {
++  const SpaceTabHelper* helper = FromWebContents(contents);
++  if (!helper || !g_tab_drag || helper->drag_ != g_tab_drag ||
++      helper->drag_window_id_ != window_id) {
++    return std::nullopt;
++  }
++  return helper->space_before_drag_;
++}
++
++// static
++void SpaceTabHelper::SaveSpaceIdIfUnsaved(content::WebContents* contents) {
++  SpaceTabHelper* helper = FromWebContents(contents);
++  if (helper && helper->unsaved_) {
++    helper->unsaved_ = !helper->Save();
++  }
++}
++
++// static
++SessionID SpaceTabHelper::GetLastWindowId(
++    const content::WebContents* contents) {
++  const SpaceTabHelper* helper = FromWebContents(contents);
++  return helper ? helper->last_window_id_ : SessionID::InvalidValue();
++}
++
++// static
++void SpaceTabHelper::SetLastWindowId(content::WebContents* contents,
++                                     SessionID window_id) {
++  if (SpaceTabHelper* helper = FromWebContents(contents)) {
++    helper->last_window_id_ = window_id;
++  }
++}
+ 
+-  // A tab that isn't in a window yet is written at the next session rewrite.
++bool SpaceTabHelper::Save() {
++  content::WebContents* contents = &GetWebContents();
+   SessionService* session_service = SessionServiceFactory::GetForProfile(
+       Profile::FromBrowserContext(contents->GetBrowserContext()));
+   const SessionID window_id =
+       sessions::SessionTabHelper::IdForWindowContainingTab(contents);
+   const SessionID tab_id = sessions::SessionTabHelper::IdForTab(contents);
+-  if (!session_service || !window_id.is_valid() || !tab_id.is_valid()) {
+-    return;
++  if (!window_id.is_valid() || !tab_id.is_valid()) {
++    return false;
+   }
+-  // Written even when empty, to override an earlier id in the same file.
+-  session_service->AddTabExtraData(
+-      window_id, tab_id, kSpaceIdExtraDataKey,
+-      space_id.is_valid() ? space_id.AsLowercaseString() : std::string());
++  if (session_service) {
++    // Written even when empty, to override an earlier id in the same file.
++    session_service->AddTabExtraData(
++        window_id, tab_id, kSpaceIdExtraDataKey,
++        space_id_.is_valid() ? space_id_.AsLowercaseString() : std::string());
++  }
++  return true;
++}
++
++void WillDragTabs(const std::vector<content::WebContents*>& contents) {
++  g_tab_drag = ++g_last_tab_drag;
++  for (content::WebContents* tab : contents) {
++    if (SpaceTabHelper* helper = SpaceTabHelper::FromWebContents(tab)) {
++      helper->drag_ = g_tab_drag;
++      helper->drag_window_id_ = helper->last_window_id_;
++      helper->space_before_drag_ = helper->space_id_;
++    }
++  }
++}
++
++void DidEndTabDrag() {
++  g_tab_drag = 0;
+ }
+ 
+ std::unique_ptr<sessions::SessionCommand> CreateSpaceIdSessionCommand(
+--- a/chrome/browser/ui/spaces/space_tab_helper.h
++++ b/chrome/browser/ui/spaces/space_tab_helper.h
+@@ -7,9 +7,12 @@
+ 
+ #include <map>
+ #include <memory>
++#include <optional>
+ #include <string>
++#include <vector>
+ 
+ #include "base/uuid.h"
++#include "components/sessions/core/session_id.h"
+ #include "content/public/browser/web_contents_user_data.h"
+ 
+ namespace content {
+@@ -42,14 +45,37 @@ class SpaceTabHelper : public content::W
+   static bool HasSpace(const content::WebContents* contents);
+ 
+   // Moves `contents` to `space_id`, where an invalid id means the default
+-  // space, and records it in the session so restore puts it back. Call it
+-  // once the tab is in a window: before that the id is only kept in memory,
+-  // and reaches the session file at its next rewrite. Does nothing while
+-  // HeliumSpaces is disabled.
++  // space, and records it in the session so restore puts it back. A tab that
++  // isn't in a window yet is recorded by SaveSpaceIdIfUnsaved() once it is.
++  // Does nothing while HeliumSpaces is disabled.
+   static void SetSpaceId(content::WebContents* contents, base::Uuid space_id);
+ 
++  // Like SetSpaceId(), for a tab about to be inserted into a window: records
++  // it in the session once the tab is there, through SaveSpaceIdIfUnsaved(),
++  // since until then the tab's window id is still its previous window's.
++  static void SetSpaceIdBeforeInsert(content::WebContents* contents,
++                                     base::Uuid space_id);
++
++  // Writes the space of `contents` to the session if SetSpaceId() was called
++  // before it was in a window.
++  static void SaveSpaceIdIfUnsaved(content::WebContents* contents);
++
++  // The window `contents` was last inserted into, as SpaceController records
++  // it, so it can tell a tab moved from another window from a new or restored
++  // one. Invalid until then.
++  static SessionID GetLastWindowId(const content::WebContents* contents);
++  static void SetLastWindowId(content::WebContents* contents,
++                              SessionID window_id);
++
++  // The space `contents` had in `window_id` when a tab drag that is still
++  // going on started there, or nullopt. See WillDragTabs().
++  static std::optional<base::Uuid> GetSpaceBeforeDrag(
++      const content::WebContents* contents,
++      SessionID window_id);
++
+  private:
+   friend WebContentsUserData;
++  friend void WillDragTabs(const std::vector<content::WebContents*>& contents);
+   // Restoring sets the id without writing it back to the session.
+   friend void RestoreSpaceIdFromExtraData(
+       content::WebContents* contents,
+@@ -57,11 +83,29 @@ class SpaceTabHelper : public content::W
+ 
+   explicit SpaceTabHelper(content::WebContents* contents);
+ 
++  // Records `space_id_` in the session. Returns false if the tab isn't in a
++  // window yet.
++  bool Save();
++
+   base::Uuid space_id_;
++  bool unsaved_ = false;
++  SessionID last_window_id_ = SessionID::InvalidValue();
++  // Set by WillDragTabs(): the drag, its window and the tab's space there.
++  int drag_ = 0;
++  SessionID drag_window_id_ = SessionID::InvalidValue();
++  base::Uuid space_before_drag_;
+ 
+   WEB_CONTENTS_USER_DATA_KEY_DECL();
+ };
+ 
++// Called when a tab drag starts with `contents`, and when it ends. While the
++// tabs are dragged they are attached to every window they pass over, and join
++// the space it shows; until the drag ends, one that comes back to the window
++// it started in, or is put back there when the drag is cancelled, gets back
++// the space it had there.
++void WillDragTabs(const std::vector<content::WebContents*>& contents);
++void DidEndTabDrag();
++
+ // Session glue, called from hooks in Chromium's session code. Each does
+ // nothing while HeliumSpaces is disabled.
+ 
+--- a/chrome/browser/ui/spaces/tab_space_filter.h
++++ b/chrome/browser/ui/spaces/tab_space_filter.h
+@@ -5,10 +5,12 @@
+ #ifndef CHROME_BROWSER_UI_SPACES_TAB_SPACE_FILTER_H_
+ #define CHROME_BROWSER_UI_SPACES_TAB_SPACE_FILTER_H_
+ 
++#include <optional>
+ #include <vector>
+ 
+ #include "base/callback_list.h"
+ #include "base/functional/callback_forward.h"
++#include "components/tab_groups/tab_group_id.h"
+ 
+ namespace tabs {
+ class TabInterface;
+@@ -33,6 +35,52 @@ class TabSpaceFilter {
+   // first, so the window stays in the space.
+   virtual void WillCloseTabs(const std::vector<tabs::TabInterface*>& tabs) = 0;
+ 
++  // Each space's tabs stay together in the tab strip: its pinned tabs in one
++  // run and its other tabs in another, with favorites before every other
++  // pinned tab. These keep it so, as the pinned checks around them keep pinned
++  // tabs first. See space_order.h.
++
++  // Called before `tabs`, which stay together, are inserted at `index`, which
++  // is already among the pinned or unpinned tabs as `pinned` says. Gives each
++  // tab its space and returns where they may go. Tabs inserted into `group`
++  // join its space and go where Chromium puts them in the group.
++  virtual int WillInsertTabs(const std::vector<tabs::TabInterface*>& tabs,
++                             int index,
++                             bool pinned,
++                             std::optional<tab_groups::TabGroupId> group) = 0;
++
++  // Returns where `tabs`, which are in the tab strip, may move so that the
++  // first of them is at `index` afterwards, pinned as `pinned` says and in
++  // `group`.
++  virtual int ConstrainMoveIndex(
++      const std::vector<tabs::TabInterface*>& tabs,
++      int index,
++      bool pinned,
++      std::optional<tab_groups::TabGroupId> group) const = 0;
++
++  // Called before `tab` is pinned or unpinned. An unpinned favorite joins the
++  // active space, as in Arc, rather than the default space.
++  virtual void WillSetTabPinned(tabs::TabInterface* tab, bool pinned) = 0;
++
++  // Called before `tabs` form a new group, which unpins them. Favorites among
++  // them join the active space, where the group is made.
++  virtual void WillGroupTabs(const std::vector<tabs::TabInterface*>& tabs) = 0;
++
++  // Called before `tabs` form a split view with `pivot`, which moves them
++  // next to it and gives them its pinned state. They all join its space.
++  virtual void WillSplitTabs(const std::vector<tabs::TabInterface*>& tabs,
++                             const tabs::TabInterface* pivot) = 0;
++
++  // Called before `a` and `b` swap places, each taking the other's pinned
++  // state and group, as when a tab replaces one in a split view. They swap
++  // spaces too.
++  virtual void WillSwapTabs(tabs::TabInterface* a, tabs::TabInterface* b) = 0;
++
++  // Whether `a` and `b` are in the same run: the same space, and both pinned
++  // or both not. Moving a tab past the end of its run would split another.
++  virtual bool AreTabsInSameRun(const tabs::TabInterface* a,
++                                const tabs::TabInterface* b) const = 0;
++
+   // Runs `callback` whenever a tab may have been shown or hidden by a change
+   // of the active space or of a tab's space.
+   virtual base::CallbackListSubscription RegisterTabVisibilityChanged(
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -702,6 +702,12 @@ gfx::Range TabStripModel::InsertDetached
+     static_cast<tabs::TabModel*>(tab)->OnAddedToModel(this);
+   }
+ 
++  // helium-spaces: Keep each space's tabs together.
++  if (space_filter_) {
++    index = space_filter_->WillInsertTabs(split_collection->GetTabsRecursive(),
++                                          index, pinned, group_id);
++  }
++
+   return InsertDetachedCollectionImpl(
+       split_collection, split->active_index_,
+       base::BindOnce(&tabs::TabStripCollection::InsertTabCollectionAt,
+@@ -737,6 +743,11 @@ gfx::Range TabStripModel::InsertDetached
+   }
+ 
+   index = ConstrainInsertionIndex(index, false);
++  // helium-spaces: Keep each space's tabs together.
++  if (space_filter_) {
++    index = space_filter_->WillInsertTabs(group_collection->GetTabsRecursive(),
++                                          index, false, std::nullopt);
++  }
+ 
+   return InsertDetachedCollectionImpl(
+       group_collection, group->active_index_,
+@@ -1110,6 +1121,11 @@ int TabStripModel::MoveWebContentsAt(int
+   const bool pinned = IsTabPinned(index);
+ 
+   to_position = ConstrainMoveIndex(to_position, pinned);
++  // helium-spaces: Keep each space's tabs together.
++  if (space_filter_) {
++    to_position = space_filter_->ConstrainMoveIndex(
++        {GetTabAtIndex(index)}, to_position, pinned, std::nullopt);
++  }
+ 
+   if (index == to_position) {
+     return to_position;
+@@ -1133,6 +1149,11 @@ int TabStripModel::MoveWebContentsAt(
+ 
+   bool pinned = IsTabPinned(index);
+   to_position = ConstrainMoveIndex(to_position, pinned);
++  // helium-spaces: Keep each space's tabs together.
++  if (space_filter_) {
++    to_position = space_filter_->ConstrainMoveIndex({GetTabAtIndex(index)},
++                                                    to_position, pinned, group);
++  }
+   MoveTabToIndexImpl(index, to_position, group, pinned, select_after_move);
+   return to_position;
+ }
+@@ -1151,15 +1172,27 @@ void TabStripModel::MoveSelectedTabsTo(
+                  static_cast<int>(pinned_selected_indices.size()) - 1,
+                  pinned_tab_count - 1);
+ 
+-  MoveTabsToIndexImpl(
+-      pinned_selected_indices,
+-      last_pinned_index - static_cast<int>(pinned_selected_indices.size()) + 1,
+-      std::nullopt);
++  int first_pinned_index =
++      last_pinned_index - static_cast<int>(pinned_selected_indices.size()) + 1;
++  // helium-spaces: Keep each space's tabs together.
++  if (space_filter_ && !pinned_selected_indices.empty()) {
++    first_pinned_index = space_filter_->ConstrainMoveIndex(
++        GetTabsAtIndices(pinned_selected_indices), first_pinned_index, true,
++        std::nullopt);
++  }
++
++  MoveTabsToIndexImpl(pinned_selected_indices, first_pinned_index,
++                      std::nullopt);
+ 
+-  const int first_unpinned_index =
++  int first_unpinned_index =
+       std::clamp(index + static_cast<int>(pinned_selected_indices.size()),
+                  pinned_tab_count,
+                  count() - static_cast<int>(unpinned_selected_indices.size()));
++  if (space_filter_ && !unpinned_selected_indices.empty()) {
++    first_unpinned_index = space_filter_->ConstrainMoveIndex(
++        GetTabsAtIndices(unpinned_selected_indices), first_unpinned_index,
++        false, into_group);
++  }
+ 
+   MoveTabsToIndexImpl(unpinned_selected_indices, first_unpinned_index,
+                       into_group);
+@@ -1177,6 +1210,15 @@ void TabStripModel::MoveGroupTo(const ta
+   }
+ 
+   const gfx::Range tabs_in_group = group_model_->GetTabGroup(group)->ListTabs();
++  // helium-spaces: Keep each space's tabs together.
++  if (space_filter_) {
++    std::vector<int> group_indices;
++    for (size_t i = tabs_in_group.start(); i < tabs_in_group.end(); ++i) {
++      group_indices.push_back(static_cast<int>(i));
++    }
++    to_index = space_filter_->ConstrainMoveIndex(
++        GetTabsAtIndices(group_indices), to_index, false, std::nullopt);
++  }
+   if (static_cast<int>(tabs_in_group.start()) == to_index) {
+     return;
+   }
+@@ -1208,6 +1250,11 @@ void TabStripModel::MoveSplitTo(
+   }
+ 
+   to_index = ConstrainMoveIndex(to_index, pinned);
++  // helium-spaces: Keep each space's tabs together.
++  if (space_filter_) {
++    to_index = space_filter_->ConstrainMoveIndex(
++        GetSplitData(split_id)->ListTabs(), to_index, pinned, group_id);
++  }
+ 
+   std::vector<std::pair<tabs::TabInterface*, int>> tabs_with_indices =
+       GetTabsAndIndicesInSplit(split_id);
+@@ -4137,6 +4184,10 @@ int TabStripModel::InsertTabAtImpl(
+     had_pinned_tabs_in_focus_session_ = true;
+   }
+   index = ConstrainInsertionIndex(index, pin);
++  // helium-spaces: Keep each space's tabs together.
++  if (space_filter_) {
++    index = space_filter_->WillInsertTabs({tab.get()}, index, pin, group);
++  }
+ 
+   tabs::TabModel* const active_tab_model = GetActiveTabModel();
+ 
+@@ -4846,6 +4897,11 @@ split_tabs::SplitTabId TabStripModel::Ad
+     tabs.push_back(tab);
+   }
+ 
++  // helium-spaces: A split view's tabs are all in one space.
++  if (space_filter_) {
++    space_filter_->WillSplitTabs(tabs, GetTabAtIndex(pivot_index));
++  }
++
+   // Add the tabs to a split with the active index.
+   MoveTabsAndSetPropertiesImpl(indices, pivot_index,
+                                GetTabGroupForTab(pivot_index),
+@@ -4962,6 +5018,11 @@ void TabStripModel::UpdateTabInSplitImpl
+   RemoveSplitImpl(split_id,
+                   SplitTabChange::SplitTabRemoveReason::kSplitTabUpdated);
+ 
++  // helium-spaces: Each tab takes the other's place, so it takes its space.
++  if (space_filter_) {
++    space_filter_->WillSwapTabs(split_tab, GetTabAtIndex(update_index));
++  }
++
+   if (update_type == SplitUpdateType::kReplace) {
+     const int split_index = GetIndexOfTab(split_tab);
+     MoveTabToIndexImpl(update_index, split_index, split_tab->GetGroup(),
+@@ -5056,6 +5117,11 @@ void TabStripModel::AddToNewGroupImpl(co
+   contents_data_->CreateTabGroup(std::move(group_collection));
+   selection_model_.InvalidateListSelectionModel(base::PassKey<TabStripModel>());
+ 
++  // helium-spaces: Grouping unpins favorites; they join the active space.
++  if (space_filter_) {
++    space_filter_->WillGroupTabs(GetTabsAtIndices(indices));
++  }
++
+   // Find a destination for the first tab that's not pinned or inside another
+   // group. We will stack the rest of the tabs up to its right.
+   int destination_index = -1;
+@@ -5082,6 +5148,21 @@ void TabStripModel::AddToNewGroupImpl(co
+     }
+   }
+ 
++  // helium-spaces: Keep each space's tabs together. `destination_index` is
++  // an index before the move, and ConstrainMoveIndex() works with one after
++  // it.
++  if (space_filter_) {
++    destination_index -= std::ranges::count_if(
++        indices, [destination_index](int i) { return i < destination_index; });
++    destination_index = space_filter_->ConstrainMoveIndex(
++        GetTabsAtIndices(indices), destination_index, false, std::nullopt);
++    for (int index : indices) {
++      if (index < destination_index) {
++        ++destination_index;
++      }
++    }
++  }
++
+   MoveTabsAndSetPropertiesImpl(indices, destination_index, new_group, false);
+ 
+   // Excluding the active tab, deselect all tabs being added to the group.
+@@ -5779,8 +5860,14 @@ int TabStripModel::SetTabPinnedImpl(int
+     had_pinned_tabs_in_focus_session_ = true;
+   }
+ 
+-  const int final_index =
++  int final_index =
+       pinned ? IndexOfFirstNonPinnedTab() : IndexOfFirstNonPinnedTab() - 1;
++  // helium-spaces: Keep each space's tabs together.
++  if (space_filter_) {
++    space_filter_->WillSetTabPinned(GetTabAtIndex(index), pinned);
++    final_index = space_filter_->ConstrainMoveIndex(
++        {GetTabAtIndex(index)}, final_index, pinned, std::nullopt);
++  }
+ 
+   MoveTabToIndexImpl(index, final_index, std::nullopt, pinned, false);
+   return final_index;
+@@ -5798,9 +5885,16 @@ void TabStripModel::SetSplitPinnedImpl(t
+   for (size_t index = GetIndexOfTab(tabs[0]); tabs::TabInterface* _ : tabs) {
+     tab_indices.push_back(index++);
+   }
+-  const int destination_index = pinned
+-                                    ? IndexOfFirstNonPinnedTab()
+-                                    : IndexOfFirstNonPinnedTab() - tabs.size();
++  int destination_index = pinned ? IndexOfFirstNonPinnedTab()
++                                 : IndexOfFirstNonPinnedTab() - tabs.size();
++  // helium-spaces: Keep each space's tabs together.
++  if (space_filter_) {
++    for (tabs::TabInterface* tab : tabs) {
++      space_filter_->WillSetTabPinned(tab, pinned);
++    }
++    destination_index = space_filter_->ConstrainMoveIndex(
++        tabs, destination_index, pinned, std::nullopt);
++  }
+ 
+   MoveTabsWithNotifications(
+       tab_indices, destination_index,
