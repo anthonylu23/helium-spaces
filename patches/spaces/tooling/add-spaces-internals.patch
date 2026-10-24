@@ -8,7 +8,7 @@ enabled.
 
 --- a/chrome/browser/ui/spaces/BUILD.gn
 +++ b/chrome/browser/ui/spaces/BUILD.gn
-@@ -109,6 +109,31 @@ source_set("controller") {
+@@ -131,6 +131,34 @@ source_set("menu") {
    ]
  }
  
@@ -32,8 +32,11 @@ enabled.
 +    "//chrome/browser/ui/browser_window",
 +    "//chrome/browser/ui/helium:helium_layout_state_controller",
 +    "//chrome/browser/ui/tabs:tab_enums",
++    "//chrome/browser/ui/tabs:tab_menu",
 +    "//chrome/browser/ui/tabs:tab_strip",
 +    "//components/sessions",
++    "//components/tab_groups",
++    "//ui/menus",
 +  ]
 +}
 +
@@ -42,7 +45,7 @@ enabled.
  test("spaces_unittests") {
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/spaces_internals_ui.cc
-@@ -0,0 +1,756 @@
+@@ -0,0 +1,999 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -59,6 +62,7 @@ enabled.
 +#include "base/json/json_writer.h"
 +#include "base/memory/raw_ptr.h"
 +#include "base/memory/ref_counted_memory.h"
++#include "base/supports_user_data.h"
 +#include "base/strings/escape.h"
 +#include "base/strings/utf_string_conversions.h"
 +#include "base/uuid.h"
@@ -78,10 +82,16 @@ enabled.
 +#include "chrome/browser/ui/spaces/spaces_features.h"
 +#include "chrome/browser/ui/tabs/split_tab_metrics.h"
 +#include "chrome/browser/ui/tabs/tab_enums.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
++#include "chrome/browser/ui/tabs/tab_menu_model.h"
++#include "chrome/browser/ui/tabs/tab_menu_model_delegate.h"
 +#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
 +#include "components/sessions/content/session_tab_helper.h"
 +#include "components/sessions/core/session_id.h"
 +#include "components/split_tabs/split_tab_visual_data.h"
++#include "components/tab_groups/tab_group_visual_data.h"
++#include "components/tabs/public/tab_group.h"
 +#include "components/tabs/public/tab_interface.h"
 +#include "content/public/browser/navigation_controller.h"
 +#include "content/public/browser/page_navigator.h"
@@ -90,13 +100,116 @@ enabled.
 +#include "content/public/browser/web_ui_data_source.h"
 +#include "content/public/browser/web_ui_message_handler.h"
 +#include "content/public/common/url_constants.h"
++#include "ui/base/models/menu_model.h"
 +#include "ui/base/page_transition_types.h"
 +#include "ui/base/window_open_disposition.h"
++#include "ui/menus/simple_menu_model.h"
 +#include "url/gurl.h"
 +
 +namespace spaces {
 +
 +namespace {
++
++// The tab context menu built by tabMenu(), and whether tabMenuItem() last
++// found its item, kept per profile and shown in its state until the next
++// call, since each state load is a new page.
++struct TabMenuResults : public base::SupportsUserData::Data {
++  base::ListValue menu;
++  bool item_activated = false;
++};
++
++TabMenuResults& GetTabMenuResults(Profile* profile) {
++  static constexpr char kKey[] = "helium_spaces.internals_tab_menu";
++  auto* results = static_cast<TabMenuResults*>(profile->GetUserData(kKey));
++  if (!results) {
++    auto owned = std::make_unique<TabMenuResults>();
++    results = owned.get();
++    profile->SetUserData(kKey, std::move(owned));
++  }
++  return *results;
++}
++
++// Builds the tab context menu as the tab strip does, and runs its commands
++// the same way.
++class TabMenu : public ui::SimpleMenuModel::Delegate {
++ public:
++  TabMenu(TabStripModel* tab_strip, int index)
++      : tab_strip_(tab_strip),
++        index_(index),
++        model_(this,
++               TabMenuModelDelegate::From(
++                   tab_strip->delegate()->GetBrowserWindowInterface()),
++               tab_strip,
++               index) {}
++
++  // Each item's label, and a submenu's items.
++  base::ListValue Dump() { return Dump(&model_); }
++
++  // Activates the item at the end of `labels`, a path of labels through
++  // submenus. Returns false if there is none, or it or a parent is disabled
++  // or hidden, as the user couldn't choose it.
++  bool Activate(const std::vector<std::string>& labels) {
++    ui::MenuModel* menu = &model_;
++    for (size_t i = 0; i < labels.size(); ++i) {
++      std::optional<size_t> found;
++      for (size_t item = 0; item < menu->GetItemCount(); ++item) {
++        if (base::UTF16ToUTF8(menu->GetLabelAt(item)) == labels[i]) {
++          found = item;
++          break;
++        }
++      }
++      if (!found || !menu->IsEnabledAt(*found) || !menu->IsVisibleAt(*found)) {
++        return false;
++      }
++      if (i + 1 < labels.size()) {
++        menu = menu->GetSubmenuModelAt(*found);
++        if (!menu) {
++          return false;
++        }
++      } else {
++        menu->ActivatedAt(*found);
++      }
++    }
++    return true;
++  }
++
++  // ui::SimpleMenuModel::Delegate, as TabContextMenuController. Extension
++  // items, past the tab menu's own commands, count as disabled.
++  bool IsCommandIdEnabled(int command_id) const override {
++    return command_id >= 0 &&
++           command_id <= TabStripModel::CommandAddToFavorites &&
++           tab_strip_->IsContextMenuCommandEnabled(
++               index_,
++               static_cast<TabStripModel::ContextMenuCommand>(command_id));
++  }
++  void ExecuteCommand(int command_id, int event_flags) override {
++    tab_strip_->ExecuteContextMenuCommand(
++        index_, static_cast<TabStripModel::ContextMenuCommand>(command_id));
++  }
++
++ private:
++  static base::ListValue Dump(ui::MenuModel* menu) {
++    base::ListValue items;
++    for (size_t i = 0; i < menu->GetItemCount(); ++i) {
++      if (menu->GetTypeAt(i) == ui::MenuModel::TYPE_SEPARATOR ||
++          !menu->IsVisibleAt(i)) {
++        continue;
++      }
++      base::DictValue item;
++      item.Set("label", base::UTF16ToUTF8(menu->GetLabelAt(i)));
++      item.Set("enabled", menu->IsEnabledAt(i));
++      if (ui::MenuModel* submenu = menu->GetSubmenuModelAt(i)) {
++        item.Set("items", Dump(submenu));
++      }
++      items.Append(std::move(item));
++    }
++    return items;
++  }
++
++  const raw_ptr<TabStripModel> tab_strip_;
++  const int index_;
++  TabMenuModel model_;
++};
 +
 +base::DictValue BuildState(Profile* profile) {
 +  base::DictValue state;
@@ -157,6 +270,9 @@ enabled.
 +        return true;
 +      });
 +  state.Set("windows", std::move(windows));
++  const TabMenuResults& tab_menu = GetTabMenuResults(profile);
++  state.Set("tab_menu", tab_menu.menu.Clone());
++  state.Set("tab_menu_item_activated", tab_menu.item_activated);
 +  return state;
 +}
 +
@@ -280,6 +396,20 @@ enabled.
 +        "tabMenuCommand",
 +        base::BindRepeating(&SpacesInternalsHandler::TabMenuCommand,
 +                            base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "dropOnSpace", base::BindRepeating(&SpacesInternalsHandler::DropOnSpace,
++                                           base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "collapseGroup",
++        base::BindRepeating(&SpacesInternalsHandler::CollapseGroup,
++                            base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "tabMenu", base::BindRepeating(&SpacesInternalsHandler::ShowTabMenu,
++                                       base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "tabMenuItem",
++        base::BindRepeating(&SpacesInternalsHandler::ActivateTabMenuItem,
++                            base::Unretained(this)));
 +  }
 +
 + private:
@@ -401,6 +531,12 @@ enabled.
 +        {"moveTabNext", IDC_MOVE_TAB_NEXT},
 +        {"moveTabPrevious", IDC_MOVE_TAB_PREVIOUS},
 +        {"newWindow", IDC_NEW_WINDOW},
++        {"selectNextSpace", IDC_SELECT_NEXT_SPACE},
++        {"selectPreviousSpace", IDC_SELECT_PREVIOUS_SPACE},
++        {"selectSpace1", IDC_SELECT_SPACE_0},
++        {"selectSpace2", IDC_SELECT_SPACE_1},
++        {"selectSpace3", IDC_SELECT_SPACE_2},
++        {"selectSpace9", IDC_SELECT_SPACE_8},
 +    };
 +    std::optional<int> window_id =
 +        args.size() == 2 ? args[0].GetIfInt() : std::nullopt;
@@ -435,6 +571,72 @@ enabled.
 +      indices.push_back(*index);
 +    }
 +    browser->GetTabStripModel()->AddToNewGroup(indices);
++  }
++
++  // dropOnSpace(window_session_id, [tab_index, ...], space_id, as_group):
++  // what dropping dragged tabs on a space's icon does. With `as_group`, the
++  // group of the first tab was dragged by its header.
++  void DropOnSpace(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 4 ? args[0].GetIfInt() : std::nullopt;
++    const base::ListValue* list =
++        args.size() == 4 ? args[1].GetIfList() : nullptr;
++    const std::string* space_id =
++        args.size() == 4 ? args[2].GetIfString() : nullptr;
++    std::optional<bool> as_group =
++        args.size() == 4 ? args[3].GetIfBool() : std::nullopt;
++    BrowserWindowInterface* browser =
++        window_id ? FindBrowser(profile_, *window_id) : nullptr;
++    SpaceController* controller =
++        browser ? SpaceController::From(browser) : nullptr;
++    if (!controller || !list || list->empty() || !space_id || !as_group) {
++      return;
++    }
++    TabStripModel* tab_strip = browser->GetTabStripModel();
++    std::vector<tabs::TabHandle> tabs;
++    for (const base::Value& value : *list) {
++      std::optional<int> index = value.GetIfInt();
++      if (!index || !tab_strip->ContainsIndex(*index)) {
++        return;
++      }
++      tabs.push_back(tab_strip->GetTabAtIndex(*index)->GetHandle());
++    }
++    std::optional<tab_groups::TabGroupId> group =
++        *as_group ? tabs.front().Get()->GetGroup() : std::nullopt;
++    controller->MoveDroppedTabsToSpace(std::move(tabs), group,
++                                       base::Uuid::ParseLowercase(*space_id));
++  }
++
++  // collapseGroup(window_session_id, tab_index): collapses the group of the
++  // tab at `tab_index` with the model calls BrowserTabStripController makes,
++  // which first activate another tab if the active one is in the group.
++  void CollapseGroup(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 2 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> index =
++        args.size() == 2 ? args[1].GetIfInt() : std::nullopt;
++    TabStripModel* tab_strip =
++        window_id && index ? FindTabStrip(*window_id, *index) : nullptr;
++    std::optional<tab_groups::TabGroupId> group =
++        tab_strip ? tab_strip->GetTabGroupForTab(*index) : std::nullopt;
++    if (!group) {
++      return;
++    }
++    if (tab_strip->GetTabGroupForTab(tab_strip->active_index()) == group) {
++      if (std::optional<int> next =
++              tab_strip->GetNextExpandedActiveTab(*group)) {
++        tab_strip->ActivateTabAt(*next);
++      } else {
++        tab_strip->delegate()->AddTabAt(GURL(), -1, /*foreground=*/true);
++        return;
++      }
++    }
++    const tab_groups::TabGroupVisualData* visuals =
++        tab_strip->group_model()->GetTabGroup(*group)->visual_data();
++    tab_strip->ChangeTabGroupVisuals(
++        *group,
++        tab_groups::TabGroupVisualData(visuals->title(), visuals->color(),
++                                       /*is_collapsed=*/true));
 +  }
 +
 +  // setLayout(window_session_id, layout): Helium's tab layout, 0 Classic,
@@ -714,6 +916,7 @@ enabled.
 +        kCommands = {
 +            {"closeTabsToLeft", TabStripModel::CommandCloseTabsToLeft},
 +            {"togglePinned", TabStripModel::CommandTogglePinned},
++            {"addToFavorites", TabStripModel::CommandAddToFavorites},
 +        };
 +    std::optional<int> window_id =
 +        args.size() == 3 ? args[0].GetIfInt() : std::nullopt;
@@ -726,6 +929,49 @@ enabled.
 +    }
 +    if (TabStripModel* tab_strip = FindTabStrip(*window_id, *index)) {
 +      tab_strip->ExecuteContextMenuCommand(*index, kCommands.at(*name));
++    }
++  }
++
++  // tabMenu(window_session_id, tab_index): builds the tab context menu of the
++  // tab at `tab_index` and shows its items in the state as `tab_menu`.
++  void ShowTabMenu(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 2 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> index =
++        args.size() == 2 ? args[1].GetIfInt() : std::nullopt;
++    base::ListValue& menu = GetTabMenuResults(profile_).menu;
++    menu.clear();
++    if (!window_id || !index) {
++      return;
++    }
++    if (TabStripModel* tab_strip = FindTabStrip(*window_id, *index)) {
++      menu = TabMenu(tab_strip, *index).Dump();
++    }
++  }
++
++  // tabMenuItem(window_session_id, tab_index, [label, ...]): activates an
++  // item of the tab context menu, through submenus by their labels.
++  void ActivateTabMenuItem(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 3 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> index =
++        args.size() == 3 ? args[1].GetIfInt() : std::nullopt;
++    const base::ListValue* path =
++        args.size() == 3 ? args[2].GetIfList() : nullptr;
++    bool& activated = GetTabMenuResults(profile_).item_activated;
++    activated = false;
++    if (!window_id || !index || !path) {
++      return;
++    }
++    std::vector<std::string> labels;
++    for (const base::Value& label : *path) {
++      if (!label.is_string()) {
++        return;
++      }
++      labels.push_back(label.GetString());
++    }
++    if (TabStripModel* tab_strip = FindTabStrip(*window_id, *index)) {
++      activated = TabMenu(tab_strip, *index).Activate(labels);
 +    }
 +  }
 +

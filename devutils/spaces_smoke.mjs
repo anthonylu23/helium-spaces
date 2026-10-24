@@ -850,9 +850,175 @@ async function checkMovesInSpace() {
   await close();
 }
 
+// Space switching commands, and the tab context menu's Spaces items.
+async function checkSpaceCommands() {
+  const profile = newProfile();
+  const { cdp, close } = await launch(profile, ['--enable-features=HeliumSpaces']);
+  let state = await internalsState(cdp);
+  const win = state.windows[0].session_id;
+  const send = (message, ...rest) => internalsSend(cdp, message, rest);
+  const find = (state, name) => tabList(state).find((t) => t.name === name);
+  const order = (state) => tabList(state).map((t) =>
+    `${t.name ?? (t.url.startsWith(INTERNALS) ? 'I' : 'N')}${t.pinned ? '*' : ''}${t.active ? '!' : ''}:${t.space}`).join(' ');
+  const ordered = (state) => state.windows.every((w) => w.order_ok && w.order_fixes === 0);
+  const activeTab = (state) => tabList(state).find((t) => t.active);
+  const menu = async (name) => {
+    await send('tabMenu', win, find(await internalsState(cdp), name).index);
+    return (await internalsState(cdp)).tab_menu;
+  };
+  const labels = (items) => items.map((item) => item.label);
+  const submenu = (items, label) => items.find((item) => item.label === label)?.items;
+  // Fails the run if the item is missing, disabled or hidden.
+  const menuItem = async (name, ...path) => {
+    await send('tabMenuItem', win, find(await internalsState(cdp), name).index, path);
+    const state = await internalsState(cdp);
+    if (!state.tab_menu_item_activated) throw new Error(`no enabled menu item ${path.join(' > ')} on ${name}`);
+    return state;
+  };
+
+  await send('addSpace', 'Work');
+  await send('addSpace', 'Play');
+  for (const name of ['F1', 'D1']) await openTestTab(cdp, name);
+  state = await waitForNamedTabs(cdp, ['F1', 'D1']);
+  const ids = Object.fromEntries(state.spaces.map((s) => [s.name, s.id]));
+  await send('pinTab', win, find(state, 'F1').index, true);
+  await send('switchSpace', win, ids.Work);
+  for (const name of ['W1', 'W2', 'W3', 'W4', 'W5']) await openTestTab(cdp, name);
+  await send('switchSpace', win, ids.Play);
+  for (const name of ['P1', 'P2']) await openTestTab(cdp, name);
+  state = await waitForNamedTabs(cdp, ['W1', 'W2', 'W3', 'W4', 'W5', 'P1', 'P2']);
+  await send('groupTabs', win, [find(state, 'P1').index, find(state, 'P2').index]);
+  state = await internalsState(cdp);
+  await send('groupTabs', win, [find(state, 'W2').index, find(state, 'W3').index]);
+
+  // Default, Work, Play, in switcher order, wrapping around.
+  const switched = [];
+  for (const command of ['selectNextSpace', 'selectNextSpace', 'selectPreviousSpace', 'selectSpace2',
+                         'selectSpace9', 'selectSpace1', 'selectPreviousSpace']) {
+    await send('runCommand', win, command);
+    switched.push(activeSpace(await internalsState(cdp)));
+  }
+  check('next and previous space wrap around, and Ctrl+N selects the Nth space',
+        switched.join() === 'default,Work,default,Work,Work,default,Play', switched.join());
+
+  await send('switchSpace', win, ids.Work);
+  let items = await menu('W1');
+  check('"Move to Space" lists the other spaces',
+        JSON.stringify(labels(submenu(items, 'Move to Space') ?? [])) === '["Default","Play"]',
+        JSON.stringify(submenu(items, 'Move to Space')));
+  check('a tab of a space offers Pin and Add to Favorites',
+        labels(items).includes('Pin') && labels(items).includes('Add to Favorites'), labels(items).join());
+  // "New Group", then Work's group only; Play's is hidden. Adding W1 to the
+  // group listed puts it in W2's group.
+  const groups = labels(submenu(items, 'Add Tab to Group') ?? []);
+  state = groups.length === 2 ? await menuItem('W1', 'Add Tab to Group', groups[1]) : await internalsState(cdp);
+  check('"Add Tab to Group" lists only the active space\'s groups',
+        groups.length === 2 && find(state, 'W1')?.group === find(state, 'W2')?.group && find(state, 'W1')?.grouped &&
+        find(state, 'W1')?.space === 'Work' && ordered(state), `${groups.join()} | ${order(state)}`);
+  items = await menu('F1');
+  check('a favorite offers Remove from Favorites',
+        labels(items).includes('Remove from Favorites') && !labels(items).includes('Unpin'), labels(items).join());
+
+  // F1 and a Work tab selected: Pin would pin the Work tab in Work.
+  state = await internalsState(cdp);
+  await send('activateTab', win, find(state, 'F1').index);
+  await send('selectRange', win, find(state, 'W1').index, true);
+  items = await menu('F1');
+  check('a selection that isn\'t all favorites keeps Pin',
+        labels(items).includes('Pin') && !labels(items).some((l) => l.includes('Favorites')),
+        labels(items).join());
+  state = await internalsState(cdp);
+  await send('activateTab', win, find(state, 'W1').index);
+
+  await send('switchSpace', win, ids[undefined] ?? state.spaces.find((s) => s.default).id);
+  items = await menu('D1');
+  check("Pin reads Add to Favorites for the default space's tabs",
+        labels(items).filter((l) => l === 'Add to Favorites').length === 1 && !labels(items).includes('Pin'),
+        labels(items).join());
+
+  await send('switchSpace', win, ids.Work);
+  state = await internalsState(cdp);
+  await send('activateTab', win, find(state, 'W1').index);
+  state = await menuItem('W1', 'Move to Space', 'Play');
+  check('"Move to Space" moves the tab and keeps the window in its space',
+        find(state, 'W1')?.space === 'Play' && activeSpace(state) === 'Work' &&
+        activeTab(state)?.space === 'Work' && ordered(state), order(state));
+
+  await send('activateTab', win, find(state, 'W4').index);
+  await send('selectRange', win, find(state, 'W5').index, false);
+  state = await menuItem('W4', 'Move to Space', 'Play');
+  check('"Move to Space" moves every selected tab',
+        find(state, 'W4')?.space === 'Play' && find(state, 'W5')?.space === 'Play' && ordered(state),
+        order(state));
+
+  await send('activateTab', win, find(state, 'W2').index);
+  state = await menuItem('W2', 'Add to Favorites');
+  check('"Add to Favorites" makes the active tab a favorite and keeps the space',
+        find(state, 'W2')?.pinned && find(state, 'W2')?.space === 'default' && !find(state, 'W2')?.grouped &&
+        find(state, 'W2')?.active && activeSpace(state) === 'Work' && ordered(state), order(state));
+  state = await menuItem('W2', 'Remove from Favorites');
+  check('"Remove from Favorites" moves a favorite to the active space',
+        !find(state, 'W2')?.pinned && find(state, 'W2')?.space === 'Work' && ordered(state), order(state));
+
+  await send('splitTabs', win, [find(state, 'W2').index, find(state, 'W3').index]);
+  state = await internalsState(cdp);
+  await send('activateTab', win, find(state, 'W2').index);
+  // F1 takes W2's place in the split view, and W2 F1's: they swap spaces.
+  state = await menuItem('F1', 'Move Tab into Split View', 'Swap with Left View');
+  check('swapping a favorite into a split view swaps the two tabs\' spaces',
+        find(state, 'F1')?.space === 'Work' && !find(state, 'F1')?.pinned && find(state, 'F1')?.split &&
+        find(state, 'W2')?.space === 'default' && find(state, 'W2')?.pinned && ordered(state), order(state));
+
+  // Leave Work with W6, W7 and W8, then group W7 and W8, the last of Work's
+  // tabs, followed by Play's.
+  for (const name of ['W6', 'W7', 'W8']) await openTestTab(cdp, name);
+  state = await waitForNamedTabs(cdp, ['W6', 'W7', 'W8']);
+  state = await menuItem('F1', 'Move to Space', 'Play');
+  for (const tab of tabList(state).filter((t) => t.space === 'Work' && !t.name)) {
+    await send('tabMenuItem', win, tab.index, ['Move to Space', 'Play']);
+  }
+  state = await internalsState(cdp);
+  await send('groupTabs', win, [find(state, 'W7').index, find(state, 'W8').index]);
+  state = await internalsState(cdp);
+  await send('activateTab', win, find(state, 'W8').index);
+  await send('collapseGroup', win, find(state, 'W8').index);
+  state = await internalsState(cdp);
+  check("collapsing the active tab's group activates a tab of the active space",
+        activeTab(state)?.name === 'W6' && activeSpace(state) === 'Work' && ordered(state), order(state));
+
+  // Move W6 after the collapsed group, so its neighbors are the collapsed W8
+  // and Play's first tab, which Chromium's own fallback would pick. Without
+  // favorites, the group's tabs are the only others in the space.
+  await send('closeTab', win, find(state, 'W2').index);
+  state = await internalsState(cdp);
+  await send('moveTab', win, find(state, 'W6').index, find(state, 'W8').index);
+  state = await internalsState(cdp);
+  await send('closeTab', win, find(state, 'W6').index);
+  state = await internalsState(cdp);
+  check('closing a tab next to a collapsed group stays in the active space',
+        ['W7', 'W8'].includes(activeTab(state)?.name) && activeSpace(state) === 'Work' && ordered(state),
+        order(state));
+
+  // Dropping tabs on a space's icon: one by one, or a group by its header.
+  await send('dropOnSpace', win, [find(state, 'D1').index], ids.Play, false);
+  await sleep(500);
+  state = await internalsState(cdp);
+  check("tabs dropped on a space's icon move there",
+        find(state, 'D1')?.space === 'Play' && activeSpace(state) === 'Work' && ordered(state), order(state));
+  await send('activateTab', win, find(state, 'W8').index);
+  await send('dropOnSpace', win, [find(state, 'W7').index], ids.Play, true);
+  await sleep(500);
+  state = await internalsState(cdp);
+  check("a group dropped on a space's icon moves there whole",
+        find(state, 'W7')?.space === 'Play' && find(state, 'W8')?.space === 'Play' && find(state, 'W7')?.grouped &&
+        find(state, 'W7')?.group === find(state, 'W8')?.group && activeSpace(state) === 'Work' &&
+        activeTab(state)?.space === 'Work' && ordered(state), order(state));
+  await close();
+}
+
 // SPACES_SMOKE_ONLY=checkOrder runs one section; SPACES_SMOKE_STDERR=1 shows
 // the browser's stderr.
-const sections = { checkFlagOff, checkDefaultSpace, checkTabSpaces, checkSwitching, checkOrder, checkMovesInSpace };
+const sections = { checkFlagOff, checkDefaultSpace, checkTabSpaces, checkSwitching, checkOrder, checkMovesInSpace, checkSpaceCommands };
 try {
   for (const [name, section] of Object.entries(sections)) {
     if (!process.env.SPACES_SMOKE_ONLY || process.env.SPACES_SMOKE_ONLY === name) await section();
