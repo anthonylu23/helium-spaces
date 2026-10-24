@@ -1,0 +1,266 @@
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -1637,6 +1637,10 @@ void TabStripModel::ExtendSelectionTo(in
+ 
+     tabs_to_select = anchor_index < index ? GetTabRange(anchor, tab)
+                                           : GetTabRange(tab, anchor);
++    // helium-spaces: Skip tabs hidden in other spaces.
++    std::erase_if(tabs_to_select, [this](const tabs::TabInterface* t) {
++      return !IsTabInActiveSpace(t);
++    });
+ 
+     new_model.SetSelectedTabs({tabs_to_select.begin(), tabs_to_select.end()},
+                               tab, anchor);
+@@ -1740,6 +1744,10 @@ void TabStripModel::AddSelectionFromAnch
+     std::vector<tabs::TabInterface*> tabs_to_select =
+         anchor_index < index ? GetTabRange(anchor, tab)
+                              : GetTabRange(tab, anchor);
++    // helium-spaces: Skip tabs hidden in other spaces.
++    std::erase_if(tabs_to_select, [this](const tabs::TabInterface* t) {
++      return !IsTabInActiveSpace(t);
++    });
+ 
+     new_model.AppendTabsToSelection(
+         {tabs_to_select.begin(), tabs_to_select.end()});
+@@ -4719,8 +4727,12 @@ void TabStripModel::MoveTabRelative(TabR
+   int neighbor_index = direction == TabRelativeDirection::kNext
+                            ? moving_index_range.end()
+                            : moving_index_range.start() - 1;
++  // helium-spaces: A tab of another space, or of another run of pinned tabs,
++  // is an end of the strip too.
+   if (ContainsIndex(neighbor_index) &&
+-      IsTabPinned(moving_index_range.start()) == IsTabPinned(neighbor_index)) {
++      IsTabPinned(moving_index_range.start()) == IsTabPinned(neighbor_index) &&
++      (!space_filter_ || space_filter_->AreTabsInSameRun(
++                             active_tab, GetTabAtIndex(neighbor_index)))) {
+     int offset = 1;
+     if (tabs::TabInterface* neighbor = GetTabAtIndex(neighbor_index);
+         neighbor->IsSplit()) {
+@@ -5735,7 +5747,12 @@ TabStripModel::GetSelectionRangeFromAnch
+     end_tab = GetSplitData(split_id.value())->ListTabs().back();
+   }
+ 
+-  return GetTabRange(start_tab, end_tab);
++  // helium-spaces: Skip tabs hidden in other spaces.
++  std::vector<tabs::TabInterface*> range = GetTabRange(start_tab, end_tab);
++  std::erase_if(range, [this](const tabs::TabInterface* t) {
++    return !IsTabInActiveSpace(t);
++  });
++  return range;
+ }
+ 
+ std::vector<std::pair<int, int>> TabStripModel::CalculateIncrementalTabMoves(
+--- a/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
++++ b/chrome/browser/ui/views/tabs/common/tab_strip_collection_controller.cc
+@@ -24,6 +24,8 @@
+ #include "chrome/browser/ui/tabs/tab_menu_model.h"
+ #include "chrome/browser/ui/tabs/tab_menu_model_delegate.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++// helium-spaces
++#include "chrome/browser/ui/spaces/tab_space_filter.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
+ #include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
+ #include "chrome/browser/ui/ui_features.h"
+@@ -209,8 +211,9 @@ void TabStripCollectionController::MoveT
+   }
+ 
+   if (target_index != start_index.value()) {
+-    model_->MoveWebContentsAt(start_index.value(), target_index,
+-                              /*select_after_move=*/false);
++    // helium-spaces: It goes to the start of its space's tabs instead.
++    target_index = model_->MoveWebContentsAt(start_index.value(), target_index,
++                                             /*select_after_move=*/false);
+   }
+ 
+   // The tab may unintentionally land in the first group in the tab strip, so we
+@@ -259,8 +262,9 @@ void TabStripCollectionController::MoveT
+   }
+ 
+   if (target_index != start_index) {
+-    model_->MoveWebContentsAt(start_index, target_index,
+-                              /*select_after_move=*/false);
++    // helium-spaces: It goes to the end of its space's tabs instead.
++    target_index = model_->MoveWebContentsAt(start_index, target_index,
++                                             /*select_after_move=*/false);
+   }
+ 
+   // The tab may unintentionally land in the last group in the tab strip, so we
+@@ -688,8 +692,13 @@ void TabStripCollectionController::Shift
+ 
+   const auto old_group = tab_interface->GetGroup();
+   std::optional<tab_groups::TabGroupId> focused_group = GetFocusedGroup();
++  // helium-spaces: A tab of another space, or of another run of pinned tabs,
++  // is an end of the strip too.
+   if (!model_->ContainsIndex(target_index) ||
+-      model_->IsTabPinned(start_index) != model_->IsTabPinned(target_index)) {
++      model_->IsTabPinned(start_index) != model_->IsTabPinned(target_index) ||
++      (model_->space_filter() &&
++       !model_->space_filter()->AreTabsInSameRun(
++           tab_interface, model_->GetTabAtIndex(target_index)))) {
+     // Even if we've reached the boundary of where the tab could go, it may
+     // still be able to "move" out of its current group.
+     if (old_group.has_value() && old_group != focused_group) {
+--- a/chrome/browser/ui/views/tabs/dragging/dragging_tabs_session.cc
++++ b/chrome/browser/ui/views/tabs/dragging/dragging_tabs_session.cc
+@@ -251,6 +251,16 @@ DraggingTabsSession::CalculateGroupForDr
+   std::optional<tab_groups::TabGroupId> current_group =
+       attached_model->GetTabGroupForTab(selected_unpinned[0]);
+ 
++  // helium-spaces: Never join the group of a tab hidden in another space.
++  if (adjacent_indices.first.has_value() &&
++      !attached_model->IsTabInActiveSpace(adjacent_indices.first.value())) {
++    left_group = std::nullopt;
++  }
++  if (adjacent_indices.second.has_value() &&
++      !attached_model->IsTabInActiveSpace(adjacent_indices.second.value())) {
++    right_group = std::nullopt;
++  }
++
+   if (left_group == right_group) {
+     return left_group;
+   }
+--- a/chrome/browser/ui/views/tabs/tab_strip.cc
++++ b/chrome/browser/ui/views/tabs/tab_strip.cc
+@@ -15,8 +15,8 @@
+ #include <utility>
+ #include <vector>
+ 
+-#include "base/command_line.h"
+ #include "base/check.h"
++#include "base/command_line.h"
+ #include "base/functional/bind.h"
+ #include "base/functional/callback.h"
+ #include "base/i18n/rtl.h"
+@@ -40,6 +40,8 @@
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+ #include "chrome/browser/ui/tabs/tab_group_theme.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++// helium-spaces
++#include "chrome/browser/ui/spaces/tab_space_filter.h"
+ #include "chrome/browser/ui/tabs/tab_strip_prefs.h"
+ #include "chrome/browser/ui/tabs/tab_types.h"
+ #include "chrome/browser/ui/ui_features.h"
+@@ -1800,6 +1802,8 @@ void TabStrip::MoveTabFirst(Tab* tab) {
+ 
+   if (target_index != start_index.value()) {
+     controller_->MoveTab(start_index.value(), target_index);
++    // helium-spaces: It goes to the start of its space's tabs instead.
++    target_index = GetModelIndexOf(tab).value_or(target_index);
+   }
+ 
+   // The tab may unintentionally land in the first group in the tab strip, so we
+@@ -1846,6 +1850,8 @@ void TabStrip::MoveTabLast(Tab* tab) {
+ 
+   if (target_index != start_index) {
+     controller_->MoveTab(start_index, target_index);
++    // helium-spaces: It goes to the end of its space's tabs instead.
++    target_index = GetModelIndexOf(tab).value_or(target_index);
+   }
+ 
+   // The tab may unintentionally land in the last group in the tab strip, so we
+@@ -2330,9 +2336,16 @@ void TabStrip::ShiftTabRelative(Tab* tab
+ 
+   const auto old_group = tab->group();
+   std::optional<tab_groups::TabGroupId> focused_group = GetFocusedGroup();
++  // helium-spaces: A tab of another space, or of another run of pinned tabs,
++  // is an end of the strip too.
++  const spaces::TabSpaceFilter* space_filter =
++      GetBrowserWindowInterface()->GetTabStripModel()->space_filter();
+   if (!IsValidModelIndex(target_index) ||
+       controller_->IsTabPinned(start_index) !=
+-          controller_->IsTabPinned(target_index)) {
++          controller_->IsTabPinned(target_index) ||
++      (space_filter && !space_filter->AreTabsInSameRun(
++                           tab->tab_handle().Get(),
++                           tab_at(target_index)->tab_handle().Get()))) {
+     // Even if we've reached the boundary of where the tab could go, it may
+     // still be able to "move" out of its current group.
+     if (old_group.has_value() && old_group != focused_group) {
+--- a/chrome/browser/ui/views/tabs/dragging/BUILD.gn
++++ b/chrome/browser/ui/views/tabs/dragging/BUILD.gn
+@@ -69,6 +69,7 @@ source_set("impl") {
+     "//chrome/browser/ui/browser_window",
+     "//chrome/browser/ui/browser_window:create_browser_window",
+     "//chrome/browser/ui/omnibox",
++    "//chrome/browser/ui/spaces:tab_space",
+     "//chrome/browser/ui/tabs",
+     "//chrome/browser/ui/tabs:tab_enums",
+     "//chrome/browser/ui/tabs:tab_group",
+--- a/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
++++ b/chrome/browser/ui/views/tabs/dragging/tab_drag_controller.cc
+@@ -40,6 +40,8 @@
+ #include "chrome/browser/ui/tabs/tab_group_model.h"
+ #include "chrome/browser/ui/tabs/tab_model.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
++// helium-spaces
++#include "chrome/browser/ui/spaces/space_tab_helper.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model_observer.h"
+ #include "chrome/browser/ui/ui_features.h"
+ #include "chrome/browser/ui/views/frame/browser_view.h"
+@@ -418,6 +420,8 @@ TabDragController::~TabDragController()
+   if (g_tab_drag_controller == this) {
+     g_tab_drag_controller = nullptr;
+   }
++  // helium-spaces
++  spaces::DidEndTabDrag();
+ 
+   widget_observation_.Reset();
+ 
+@@ -557,6 +561,15 @@ TabDragController::Liveness TabDragContr
+   ref->drag_data_.source_view_index_ =
+       std::ranges::find(dragging_views, source_view) - dragging_views.begin();
+ 
++  // helium-spaces: Tabs put back in this window keep their space.
++  std::vector<content::WebContents*> dragged_contents;
++  for (const TabDragData& tab_data : ref->drag_data_.tab_drag_data_) {
++    if (tab_data.contents) {
++      dragged_contents.push_back(tab_data.contents);
++    }
++  }
++  spaces::WillDragTabs(dragged_contents);
++
+   // Listen for Esc key presses and mouse releases.
+   ref->event_tracker_ = std::make_unique<EventTracker>(
+       base::BindOnce(&TabDragController::EndDrag, base::Unretained(this),
+@@ -1557,7 +1570,11 @@ void TabDragController::AttachToNewConte
+       const size_t inserted_index =
+           attached_context_->GetTabStripModel()->InsertDetachedTabAt(
+               index, std::move(tab->get()->tab), add_types, group_for_tab);
+-      CHECK_EQ(inserted_index, index);
++      // helium-spaces: The tab goes with its space's tabs, which may not be
++      // at `index`. MoveAttached() moves it to the drop position later.
++      CHECK(inserted_index == index ||
++            attached_context_->GetTabStripModel()->space_filter());
++      index = inserted_index;
+       update_sad_tab.Run(index);
+       index++;
+     } else {
+@@ -1579,8 +1596,10 @@ void TabDragController::AttachToNewConte
+                 std::move(*detached_tab_collection), index, pinned);
+       }
+ 
+-      CHECK_EQ(collection_indices.start(), index);
+-      index += collection_indices.length();
++      // helium-spaces: As above.
++      CHECK(collection_indices.start() == index ||
++            attached_context_->GetTabStripModel()->space_filter());
++      index = collection_indices.end();
+ 
+       for (size_t sad_index = collection_indices.start();
+            sad_index < collection_indices.end(); sad_index++) {
+@@ -1703,6 +1722,15 @@ TabDragController::Detach(ReleaseCapture
+       next_active_index = dragged_indices.front() - 1;
+     }
+   }
++  // helium-spaces: Not a tab hidden in another space, which would switch the
++  // window to it; TabStripModel then picks one in the active space.
++  if (next_active_index != TabStripModel::kNoTab &&
++      !attached_model->IsTabInActiveSpace(
++          next_active_index < dragged_indices.front()
++              ? next_active_index
++              : next_active_index + static_cast<int>(dragged_indices.size()))) {
++    next_active_index = TabStripModel::kNoTab;
++  }
+ 
+   const std::vector<tab_groups::TabGroupId> groups_to_move =
+       attached_model->GetGroupsDestroyedFromRemovingIndices(dragged_indices);
