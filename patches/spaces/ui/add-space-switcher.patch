@@ -1,0 +1,943 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -3565,6 +3565,10 @@ static_library("ui") {
+       "views/helium/frame_corner_radius.h",
+       "views/helium/native_frame_materials.cc",
+       "views/helium/native_frame_materials.h",
++      "views/spaces/space_settings_bubble.cc",
++      "views/spaces/space_settings_bubble.h",
++      "views/spaces/space_switcher_view.cc",
++      "views/spaces/space_switcher_view.h",
+     ]
+ 
+     sources += get_target_outputs(":webui_name_variants")
+@@ -3598,6 +3602,8 @@ static_library("ui") {
+       "//chrome/browser/ui/qrcode_generator:impl",
+       "//chrome/browser/ui/send_tab_to_self",
+       "//chrome/browser/ui/send_tab_to_self:impl",
++      "//chrome/browser/ui/spaces:controller",
++      "//chrome/browser/ui/spaces:spaces",
+       "//chrome/browser/ui/sharing_hub",
+       "//chrome/browser/ui/sharing_hub:impl",
+       "//chrome/browser/ui/tabs/organizer:impl",
+--- a/chrome/browser/ui/spaces/spaces_strings.grdp
++++ b/chrome/browser/ui/spaces/spaces_strings.grdp
+@@ -38,5 +38,43 @@
+     Remove from Favorites
+   </message>
+ </if>
++<!-- Space switcher -->
++<message name="IDS_SPACES_SWITCHER_ACCESSIBLE_NAME" desc="Accessible name of the row of space icons at the bottom of the vertical tab strip.">
++  Spaces
++</message>
++<message name="IDS_SPACES_NEW_SPACE_NAME" desc="Name given to a new space until the user renames it.">
++  Space <ph name="SPACE_NUMBER">$1<ex>2</ex></ph>
++</message>
++<message name="IDS_SPACES_SETTINGS_TITLE" desc="Title of the bubble for editing a space's name, emoji and color.">
++  Edit space
++</message>
++<message name="IDS_SPACES_SETTINGS_NAME" desc="Label of the text field for a space's name.">
++  Name
++</message>
++<message name="IDS_SPACES_SETTINGS_ICON" desc="Label of the text field for a space's icon, an emoji shown in the space switcher.">
++  Emoji
++</message>
++<if expr="not use_titlecase">
++  <message name="IDS_SPACES_SWITCHER_NEW_SPACE" desc="Tooltip of the button that adds a space, and the menu item that does.">
++    New space
++  </message>
++  <message name="IDS_SPACES_SWITCHER_EDIT_SPACE" desc="Context menu item of a space's icon that opens its settings.">
++    Edit space…
++  </message>
++  <message name="IDS_SPACES_SWITCHER_DELETE_SPACE" desc="Context menu item of a space's icon that deletes it. Its tabs move to the default space.">
++    Delete space
++  </message>
++</if>
++<if expr="use_titlecase">
++  <message name="IDS_SPACES_SWITCHER_NEW_SPACE" desc="In Title Case: Tooltip of the button that adds a space, and the menu item that does.">
++    New Space
++  </message>
++  <message name="IDS_SPACES_SWITCHER_EDIT_SPACE" desc="In Title Case: Context menu item of a space's icon that opens its settings.">
++    Edit Space…
++  </message>
++  <message name="IDS_SPACES_SWITCHER_DELETE_SPACE" desc="In Title Case: Context menu item of a space's icon that deletes it. Its tabs move to the default space.">
++    Delete Space
++  </message>
++</if>
+ 
+ </grit-part>
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
+@@ -58,6 +58,9 @@
+ #include "chrome/browser/ui/web_applications/app_browser_controller.h"
+ #include "chrome/grit/generated_resources.h"
+ #include "components/tabs/public/tab_group.h"
++
++// helium-spaces
++#include "chrome/browser/ui/views/spaces/space_switcher_view.h"
+ #include "components/tabs/public/tab_interface.h"
+ #include "ui/base/dragdrop/os_exchange_data.h"
+ #include "ui/base/interaction/element_tracker.h"
+@@ -156,6 +159,10 @@ VerticalTabStripRegionView::VerticalTabS
+       gfx::Insets::TLBR(kBottomContainerGap, region_horizontal_padding,
+                         0, region_horizontal_padding));
+ 
++  // helium-spaces: The space switcher, at the bottom.
++  space_switcher_ = spaces::SpaceSwitcherView::MaybeAdd(
++      content_area_view_, this, browser_view->browser());
++
+   gemini_button_ =
+       content_area_view_->AddChildView(std::make_unique<views::View>());
+ 
+@@ -955,6 +962,8 @@ gfx::Rect VerticalTabStripRegionView::Ge
+   tab_strip_draggable_bounds.set_height(
+       GetBoundsInScreen().bottom() -
+       bottom_button_container_->GetMinimumSize().height() -
++      // helium-spaces
++      (space_switcher_ ? space_switcher_->height() : 0) -
+       GetLayoutConstant(
+           LayoutConstant::kVerticalTabStripUncollapsedVerticalPadding) -
+       tab_strip_draggable_bounds.y());
+--- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
++++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.h
+@@ -270,6 +270,8 @@ class VerticalTabStripRegionView final
+ 
+   raw_ptr<VerticalTabStripBottomContainer> bottom_button_container_ = nullptr;
+   raw_ptr<views::View> gemini_button_ = nullptr;
++  // helium-spaces
++  raw_ptr<views::View> space_switcher_ = nullptr;
+   raw_ptr<views::ResizeArea> resize_area_ = nullptr;
+   raw_ptr<ShadowFrameView> shadow_frame_ = nullptr;
+   int resize_area_width_;
+--- /dev/null
++++ b/chrome/browser/ui/views/spaces/space_settings_bubble.cc
+@@ -0,0 +1,213 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/spaces/space_settings_bubble.h"
++
++#include <memory>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/memory/raw_ptr.h"
++#include "base/strings/string_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "base/uuid.h"
++#include "chrome/browser/ui/spaces/space.h"
++#include "chrome/browser/ui/spaces/space_registry.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
++#include "chrome/browser/ui/tabs/tab_group_theme.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/strings/grit/components_strings.h"
++#include "components/tab_groups/tab_group_color.h"
++#include "ui/base/interaction/element_identifier.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/models/dialog_model.h"
++#include "ui/color/color_id.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/canvas.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/bubble/bubble_border.h"
++#include "ui/views/bubble/bubble_dialog_model_host.h"
++#include "ui/views/controls/button/button.h"
++#include "ui/views/layout/box_layout.h"
++#include "ui/views/view.h"
++#include "ui/views/widget/widget.h"
++
++namespace spaces {
++
++namespace {
++
++DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kSpaceNameFieldId);
++DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kSpaceIconFieldId);
++
++// Long enough for any emoji sequence, short enough to stay an icon.
++constexpr size_t kMaxIconBytes = 32;
++constexpr int kSwatchSize = 24;
++constexpr int kSwatchSpacing = 6;
++
++// One color of the palette, a circle, ringed while selected.
++class SpaceColorSwatch : public views::Button {
++  METADATA_HEADER(SpaceColorSwatch, views::Button)
++
++ public:
++  SpaceColorSwatch(PressedCallback callback,
++                   tab_groups::TabGroupColorId color,
++                   const std::u16string& label)
++      : views::Button(std::move(callback)), color_(color) {
++    SetTooltipText(label);
++    GetViewAccessibility().SetRole(ax::mojom::Role::kRadioButton);
++    GetViewAccessibility().SetName(label);
++    SetSelected(false);
++  }
++
++  tab_groups::TabGroupColorId color() const { return color_; }
++
++  void SetSelected(bool selected) {
++    selected_ = selected;
++    GetViewAccessibility().SetCheckedState(
++        selected ? ax::mojom::CheckedState::kTrue
++                 : ax::mojom::CheckedState::kFalse);
++    SchedulePaint();
++  }
++
++  // views::Button:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override {
++    return gfx::Size(kSwatchSize, kSwatchSize);
++  }
++
++  void PaintButtonContents(gfx::Canvas* canvas) override {
++    const gfx::RectF bounds(GetLocalBounds());
++    cc::PaintFlags flags;
++    flags.setAntiAlias(true);
++    flags.setColor(GetColorProvider()->GetColor(
++        GetTabGroupTabStripColorId(color_, /*active_frame=*/true)));
++    canvas->DrawCircle(bounds.CenterPoint(),
++                       kSwatchSize / 2 - (selected_ ? 4 : 2), flags);
++    if (selected_) {
++      flags.setStyle(cc::PaintFlags::kStroke_Style);
++      flags.setStrokeWidth(2);
++      canvas->DrawCircle(bounds.CenterPoint(), kSwatchSize / 2 - 1, flags);
++    }
++  }
++
++ private:
++  const tab_groups::TabGroupColorId color_;
++  bool selected_ = false;
++};
++
++BEGIN_METADATA(SpaceColorSwatch)
++END_METADATA
++
++// The tab group palette as a row of swatches, one selected.
++class SpaceColorPicker : public views::View {
++  METADATA_HEADER(SpaceColorPicker, views::View)
++
++ public:
++  explicit SpaceColorPicker(tab_groups::TabGroupColorId selected) {
++    SetLayoutManager(std::make_unique<views::BoxLayout>(
++        views::BoxLayout::Orientation::kHorizontal, gfx::Insets(),
++        kSwatchSpacing));
++    const tab_groups::ColorLabelMap labels =
++        tab_groups::GetTabGroupColorLabelMap();
++    for (const tab_groups::TabGroupColorId color :
++         TabGroupModel::GetColorOrdering()) {
++      AddChildView(std::make_unique<SpaceColorSwatch>(
++          base::BindRepeating(&SpaceColorPicker::Select, base::Unretained(this),
++                              color),
++          color, labels.at(color)));
++    }
++    Select(selected);
++  }
++
++  tab_groups::TabGroupColorId selected() const { return selected_; }
++
++ private:
++  void Select(tab_groups::TabGroupColorId color) {
++    selected_ = color;
++    for (views::View* child : children()) {
++      auto* swatch = static_cast<SpaceColorSwatch*>(child);
++      swatch->SetSelected(swatch->color() == color);
++    }
++  }
++
++  tab_groups::TabGroupColorId selected_;
++};
++
++BEGIN_METADATA(SpaceColorPicker)
++END_METADATA
++
++void Save(SpaceRegistry* registry,
++          base::Uuid space_id,
++          ui::DialogModelDelegate* delegate,
++          SpaceColorPicker* color_picker) {
++  const Space* current = registry->GetSpace(space_id);
++  if (!current) {
++    return;
++  }
++  Space space = *current;
++  ui::DialogModel* model = delegate->dialog_model();
++  const std::u16string name = base::CollapseWhitespace(
++      model->GetTextfieldByUniqueId(kSpaceNameFieldId)->text(),
++      /*trim_sequences_with_line_breaks=*/true);
++  if (!name.empty()) {
++    space.name = base::UTF16ToUTF8(name);
++  }
++  std::u16string icon;
++  base::TrimWhitespace(model->GetTextfieldByUniqueId(kSpaceIconFieldId)->text(),
++                       base::TRIM_ALL, &icon);
++  // Cut at a character boundary, never inside one.
++  base::TruncateUTF8ToByteSize(base::UTF16ToUTF8(icon), kMaxIconBytes,
++                               &space.icon);
++  space.color = color_picker->selected();
++  registry->UpdateSpace(space);
++}
++
++}  // namespace
++
++void ShowSpaceSettingsBubble(views::View* anchor,
++                             SpaceRegistry* registry,
++                             const base::Uuid& space_id) {
++  const Space* space = registry->GetSpace(space_id);
++  if (!space || !anchor->GetWidget()) {
++    return;
++  }
++  auto color_picker = std::make_unique<SpaceColorPicker>(space->color);
++  SpaceColorPicker* color_picker_ptr = color_picker.get();
++  auto delegate = std::make_unique<ui::DialogModelDelegate>();
++  ui::DialogModelDelegate* delegate_ptr = delegate.get();
++
++  std::unique_ptr<ui::DialogModel> model =
++      ui::DialogModel::Builder(std::move(delegate))
++          .SetTitle(l10n_util::GetStringUTF16(IDS_SPACES_SETTINGS_TITLE))
++          .AddTextfield(kSpaceNameFieldId,
++                        l10n_util::GetStringUTF16(IDS_SPACES_SETTINGS_NAME),
++                        base::UTF8ToUTF16(space->name))
++          .AddTextfield(kSpaceIconFieldId,
++                        l10n_util::GetStringUTF16(IDS_SPACES_SETTINGS_ICON),
++                        base::UTF8ToUTF16(space->icon))
++          .AddCustomField(
++              std::make_unique<views::BubbleDialogModelHost::CustomView>(
++                  std::move(color_picker),
++                  views::BubbleDialogModelHost::FieldType::kControl))
++          .AddOkButton(base::BindOnce(&Save, registry, space_id, delegate_ptr,
++                                      color_picker_ptr),
++                       ui::DialogModel::Button::Params().SetLabel(
++                           l10n_util::GetStringUTF16(IDS_DONE)))
++          .AddCancelButton(base::DoNothing())
++          .SetInitiallyFocusedField(kSpaceNameFieldId)
++          .Build();
++
++  auto bubble = std::make_unique<views::BubbleDialogModelHost>(
++      std::move(model), anchor, views::BubbleBorder::BOTTOM_LEFT);
++  views::BubbleDialogDelegate::CreateBubbleDeprecated(
++      std::move(bubble), views::Widget::InitParams::NATIVE_WIDGET_OWNS_WIDGET)
++      ->Show();
++}
++
++}  // namespace spaces
+--- /dev/null
++++ b/chrome/browser/ui/views/spaces/space_settings_bubble.h
+@@ -0,0 +1,28 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_SPACES_SPACE_SETTINGS_BUBBLE_H_
++#define CHROME_BROWSER_UI_VIEWS_SPACES_SPACE_SETTINGS_BUBBLE_H_
++
++namespace base {
++class Uuid;
++}
++
++namespace views {
++class View;
++}
++
++namespace spaces {
++
++class SpaceRegistry;
++
++// Shows a bubble at `anchor` for editing the name, emoji and color of
++// `space_id`, saved when the user clicks Done.
++void ShowSpaceSettingsBubble(views::View* anchor,
++                             SpaceRegistry* registry,
++                             const base::Uuid& space_id);
++
++}  // namespace spaces
++
++#endif  // CHROME_BROWSER_UI_VIEWS_SPACES_SPACE_SETTINGS_BUBBLE_H_
+--- /dev/null
++++ b/chrome/browser/ui/views/spaces/space_switcher_view.cc
+@@ -0,0 +1,444 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/views/spaces/space_switcher_view.h"
++
++#include <algorithm>
++#include <string>
++#include <utility>
++
++#include "base/functional/bind.h"
++#include "base/strings/string_number_conversions.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/app/vector_icons/vector_icons.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/spaces/space.h"
++#include "chrome/browser/ui/spaces/space_controller.h"
++#include "chrome/browser/ui/spaces/space_registry_factory.h"
++#include "chrome/browser/ui/tabs/tab_group_model.h"
++#include "chrome/browser/ui/tabs/tab_group_theme.h"
++#include "chrome/browser/ui/tabs/vertical_tab_strip_state_controller.h"
++#include "chrome/browser/ui/views/frame/tab_strip_region_view.h"
++#include "chrome/browser/ui/views/spaces/space_settings_bubble.h"
++#include "chrome/grit/generated_resources.h"
++#include "ui/base/l10n/l10n_util.h"
++#include "ui/base/metadata/metadata_impl_macros.h"
++#include "ui/base/mojom/menu_source_type.mojom.h"
++#include "ui/color/color_provider.h"
++#include "ui/gfx/canvas.h"
++#include "ui/gfx/font_list.h"
++#include "ui/gfx/geometry/rect_f.h"
++#include "ui/views/accessibility/view_accessibility.h"
++#include "ui/views/animation/ink_drop.h"
++#include "ui/views/controls/button/button.h"
++#include "ui/views/controls/button/image_button.h"
++#include "ui/views/controls/button/image_button_factory.h"
++#include "ui/views/controls/highlight_path_generator.h"
++#include "ui/views/controls/menu/menu_runner.h"
++
++namespace spaces {
++
++namespace {
++
++// The size of a space's icon, and of the "+" button.
++constexpr int kButtonSize = 28;
++// Below this width, icons become dots.
++constexpr int kMinIconWidth = 22;
++// Narrower icons than this don't fit at all; the active one stays shown.
++constexpr int kMinDotWidth = 8;
++constexpr int kDotRadius = 3;
++constexpr int kLargeDotRadius = 5;
++constexpr int kCornerRadius = 6;
++constexpr int kVerticalPadding = 2;
++
++// Spaces menu commands, past the spaces' indices.
++constexpr int kNewSpaceCommand = 1000;
++constexpr int kEditSpaceCommand = 1001;
++constexpr int kDeleteSpaceCommand = 1002;
++
++}  // namespace
++
++// One space's icon: its emoji, or a dot in its color. The active space's icon
++// sits on a background of its color.
++class SpaceSwitcherButton : public views::Button {
++  METADATA_HEADER(SpaceSwitcherButton, views::Button)
++
++ public:
++  SpaceSwitcherButton(PressedCallback callback, const Space& space)
++      : views::Button(std::move(callback)), space_(space) {
++    views::InstallRoundRectHighlightPathGenerator(this, gfx::Insets(),
++                                                  kCornerRadius);
++    views::InkDrop::Get(this)->SetMode(views::InkDropHost::InkDropMode::ON);
++    SetHasInkDropActionOnClick(true);
++    SetTooltipText(base::UTF8ToUTF16(space.name));
++    GetViewAccessibility().SetName(base::UTF8ToUTF16(space.name));
++  }
++
++  const Space& space() const { return space_; }
++
++  void SetActive(bool active) {
++    if (active_ == active) {
++      return;
++    }
++    active_ = active;
++    GetViewAccessibility().SetIsSelected(active);
++    SchedulePaint();
++  }
++
++  void SetDropTarget(bool drop_target) {
++    if (drop_target_ == drop_target) {
++      return;
++    }
++    drop_target_ = drop_target;
++    SchedulePaint();
++  }
++
++  // views::Button:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override {
++    return gfx::Size(kButtonSize, kButtonSize);
++  }
++
++  void PaintButtonContents(gfx::Canvas* canvas) override {
++    const ui::ColorProvider* colors = GetColorProvider();
++    const SkColor color =
++        colors->GetColor(GetTabGroupTabStripColorId(space_.color,
++                                                    /*active_frame=*/true));
++    const gfx::RectF bounds(GetContentsBounds());
++    const bool dot = width() < kMinIconWidth;
++    cc::PaintFlags flags;
++    flags.setAntiAlias(true);
++    if ((active_ || drop_target_) && !dot) {
++      flags.setColor(SkColorSetA(color, drop_target_ ? 0x80 : 0x40));
++      canvas->DrawRoundRect(bounds, kCornerRadius, flags);
++    }
++    if (dot || space_.icon.empty()) {
++      flags.setColor(active_ || !dot ? color : SkColorSetA(color, 0x99));
++      canvas->DrawCircle(bounds.CenterPoint(),
++                         dot && (active_ || drop_target_) ? kLargeDotRadius
++                         : dot                            ? kDotRadius
++                                                          : kLargeDotRadius,
++                         flags);
++      return;
++    }
++    canvas->DrawStringRectWithFlags(
++        base::UTF8ToUTF16(space_.icon), gfx::FontList().DeriveWithSizeDelta(2),
++        color, GetContentsBounds(), gfx::Canvas::TEXT_ALIGN_CENTER);
++  }
++
++ private:
++  const Space space_;
++  bool active_ = false;
++  bool drop_target_ = false;
++};
++
++BEGIN_METADATA(SpaceSwitcherButton)
++END_METADATA
++
++// static
++SpaceSwitcherView* SpaceSwitcherView::MaybeAdd(
++    views::View* parent,
++    TabStripRegionView* region,
++    BrowserWindowInterface* browser) {
++  if (!SpaceController::From(browser)) {
++    return nullptr;
++  }
++  return parent->AddChildView(std::make_unique<SpaceSwitcherView>(
++      region, browser,
++      SpaceRegistryFactory::GetForProfile(browser->GetProfile())));
++}
++
++SpaceSwitcherView::SpaceSwitcherView(TabStripRegionView* region,
++                                     BrowserWindowInterface* browser,
++                                     SpaceRegistry* registry)
++    : region_(region), browser_(browser), registry_(registry) {
++  GetViewAccessibility().SetRole(ax::mojom::Role::kTabList);
++  GetViewAccessibility().SetName(
++      l10n_util::GetStringUTF16(IDS_SPACES_SWITCHER_ACCESSIBLE_NAME));
++
++  auto add_button = views::CreateVectorImageButtonWithNativeTheme(
++      base::BindRepeating(&SpaceSwitcherView::AddSpace, base::Unretained(this)),
++      kAddIcon, 16);
++  add_button->SetTooltipText(
++      l10n_util::GetStringUTF16(IDS_SPACES_SWITCHER_NEW_SPACE));
++  views::InstallRoundRectHighlightPathGenerator(add_button.get(), gfx::Insets(),
++                                                kCornerRadius);
++  add_button_ = AddChildView(std::move(add_button));
++
++  if (auto* state = tabs::VerticalTabStripStateController::From(browser)) {
++    collapsed_ = state->IsCollapsed();
++    collapse_subscription_ = state->RegisterOnCollapseChanged(
++        base::BindRepeating(&SpaceSwitcherView::OnCollapseStateChanged,
++                            base::Unretained(this)));
++  }
++  visibility_subscription_ =
++      SpaceController::From(browser)->RegisterTabVisibilityChanged(
++          base::BindRepeating(&SpaceSwitcherView::UpdateActive,
++                              base::Unretained(this)));
++  registry_observation_.Observe(registry_);
++  Rebuild();
++}
++
++SpaceSwitcherView::~SpaceSwitcherView() = default;
++
++std::optional<base::Uuid> SpaceSwitcherView::GetSpaceAtPoint(
++    const gfx::Point& point_in_screen) const {
++  for (SpaceSwitcherButton* button : buttons_) {
++    if (button->IsDrawn() &&
++        button->GetBoundsInScreen().Contains(point_in_screen)) {
++      return button->space().id;
++    }
++  }
++  return std::nullopt;
++}
++
++void SpaceSwitcherView::SetDropTarget(std::optional<base::Uuid> space_id) {
++  for (SpaceSwitcherButton* button : buttons_) {
++    button->SetDropTarget(button->space().id == space_id);
++  }
++}
++
++gfx::Size SpaceSwitcherView::CalculatePreferredSize(
++    const views::SizeBounds& available_size) const {
++  const int count = collapsed_ ? 1 : buttons_.size() + 1;
++  return gfx::Size(count * kButtonSize, kButtonSize + 2 * kVerticalPadding);
++}
++
++void SpaceSwitcherView::Layout(PassKey) {
++  const gfx::Rect bounds = GetContentsBounds();
++  const int y = bounds.y() + kVerticalPadding;
++  SpaceController* controller = GetController();
++  const base::Uuid active =
++      controller ? controller->active_space_id() : base::Uuid();
++
++  showing_only_active_ = collapsed_;
++  if (collapsed_) {
++    add_button_->SetVisible(false);
++    for (SpaceSwitcherButton* button : buttons_) {
++      const bool is_active = button->space().id == active;
++      button->SetVisible(is_active);
++      if (is_active) {
++        button->SetBounds(bounds.x() + (bounds.width() - kButtonSize) / 2, y,
++                          kButtonSize, kButtonSize);
++      }
++    }
++    return;
++  }
++
++  // "+" at the end, and the spaces centered in the rest, shrinking to dots,
++  // then to the active space alone if even dots don't fit.
++  add_button_->SetVisible(true);
++  add_button_->SetBounds(bounds.right() - kButtonSize, y, kButtonSize,
++                         kButtonSize);
++  const int available = bounds.width() - kButtonSize;
++  const int count = buttons_.size();
++  if (count == 0) {
++    return;
++  }
++  int width = std::min(kButtonSize, available / count);
++  const bool fits = width >= kMinDotWidth;
++  if (!fits) {
++    width = kButtonSize;
++  }
++  const int shown = fits ? count : 1;
++  showing_only_active_ = !fits;
++  int x = bounds.x() + (available - shown * width) / 2;
++  for (SpaceSwitcherButton* button : buttons_) {
++    const bool visible = fits || button->space().id == active;
++    button->SetVisible(visible);
++    if (visible) {
++      button->SetBounds(x, y, width, kButtonSize);
++      x += width;
++    }
++  }
++}
++
++void SpaceSwitcherView::ShowContextMenuForViewImpl(
++    views::View* source,
++    const gfx::Point& point,
++    ui::mojom::MenuSourceType source_type) {
++  auto* button = static_cast<SpaceSwitcherButton*>(source);
++  menu_space_id_ = button->space().id;
++  auto model = std::make_unique<ui::SimpleMenuModel>(this);
++  model->AddItemWithStringId(kEditSpaceCommand, IDS_SPACES_SWITCHER_EDIT_SPACE);
++  model->AddItemWithStringId(kDeleteSpaceCommand,
++                             IDS_SPACES_SWITCHER_DELETE_SPACE);
++  RunMenu(std::move(model), source, source_type);
++}
++
++void SpaceSwitcherView::ExecuteCommand(int command_id, int event_flags) {
++  SpaceController* controller = GetController();
++  if (!controller) {
++    return;
++  }
++  switch (command_id) {
++    case kNewSpaceCommand:
++      AddSpace();
++      return;
++    case kEditSpaceCommand:
++      if (menu_space_id_) {
++        ShowSettingsBubble(*menu_space_id_);
++      }
++      return;
++    case kDeleteSpaceCommand:
++      if (menu_space_id_) {
++        registry_->RemoveSpace(*menu_space_id_);
++      }
++      return;
++  }
++  if (command_id >= 0 &&
++      static_cast<size_t>(command_id) < registry_->spaces().size()) {
++    controller->SwitchToSpace(registry_->spaces()[command_id].id);
++  }
++}
++
++bool SpaceSwitcherView::IsCommandIdChecked(int command_id) const {
++  SpaceController* controller = GetController();
++  return controller && command_id >= 0 &&
++         static_cast<size_t>(command_id) < registry_->spaces().size() &&
++         registry_->spaces()[command_id].id == controller->active_space_id();
++}
++
++bool SpaceSwitcherView::IsCommandIdEnabled(int command_id) const {
++  if (command_id == kDeleteSpaceCommand) {
++    const Space* space =
++        menu_space_id_ ? registry_->GetSpace(*menu_space_id_) : nullptr;
++    return space && !space->is_default;
++  }
++  return true;
++}
++
++void SpaceSwitcherView::MenuClosed(ui::SimpleMenuModel* menu) {
++  expand_on_hover_lock_.reset();
++}
++
++void SpaceSwitcherView::OnSpacesChanged() {
++  Rebuild();
++}
++
++SpaceController* SpaceSwitcherView::GetController() const {
++  return SpaceController::From(browser_);
++}
++
++void SpaceSwitcherView::Rebuild() {
++  // Cleared before they are destroyed, so no pointer dangles.
++  std::vector<SpaceSwitcherButton*> old_buttons(buttons_.begin(),
++                                                buttons_.end());
++  buttons_.clear();
++  for (SpaceSwitcherButton* button : old_buttons) {
++    RemoveChildViewT(button);
++  }
++  for (const Space& space : registry_->spaces()) {
++    auto button = std::make_unique<SpaceSwitcherButton>(
++        base::BindRepeating(&SpaceSwitcherView::OnSpaceButtonPressed,
++                            base::Unretained(this), space.id),
++        space);
++    button->set_context_menu_controller(this);
++    buttons_.push_back(AddChildViewAt(std::move(button), buttons_.size()));
++  }
++  UpdateActive();
++  PreferredSizeChanged();
++}
++
++void SpaceSwitcherView::UpdateActive() {
++  SpaceController* controller = GetController();
++  if (!controller) {
++    return;
++  }
++  for (SpaceSwitcherButton* button : buttons_) {
++    button->SetActive(button->space().id == controller->active_space_id());
++  }
++  InvalidateLayout();
++}
++
++void SpaceSwitcherView::OnCollapseStateChanged(
++    tabs::VerticalTabStripCollapseState state) {
++  // Updated at the start of the animation, as the bottom container is.
++  collapsed_ = state != tabs::VerticalTabStripCollapseState::kExpanded;
++  PreferredSizeChanged();
++}
++
++void SpaceSwitcherView::OnSpaceButtonPressed(const base::Uuid& space_id) {
++  SpaceController* controller = GetController();
++  if (!controller) {
++    return;
++  }
++  if (!showing_only_active_) {
++    controller->SwitchToSpace(space_id);
++    return;
++  }
++  // When it is the only icon shown, it lists the spaces.
++  menu_space_id_.reset();
++  auto model = std::make_unique<ui::SimpleMenuModel>(this);
++  for (size_t i = 0; i < registry_->spaces().size(); ++i) {
++    const Space& space = registry_->spaces()[i];
++    model->AddCheckItem(
++        i,
++        base::UTF8ToUTF16(space.icon.empty() ? space.name
++                                             : space.icon + " " + space.name));
++    model->SetMayHaveMnemonicsAt(i, false);
++  }
++  model->AddSeparator(ui::NORMAL_SEPARATOR);
++  model->AddItemWithStringId(kNewSpaceCommand, IDS_SPACES_SWITCHER_NEW_SPACE);
++  RunMenu(std::move(model), GetButton(space_id),
++          ui::mojom::MenuSourceType::kMouse);
++}
++
++void SpaceSwitcherView::AddSpace() {
++  SpaceController* controller = GetController();
++  if (!controller) {
++    return;
++  }
++  // The next color of the tab group palette, so neighbors differ.
++  const std::vector<tab_groups::TabGroupColorId>& colors =
++      TabGroupModel::GetColorOrdering();
++  const size_t count = registry_->spaces().size();
++  const base::Uuid id = registry_->AddSpace(
++      l10n_util::GetStringFUTF8(IDS_SPACES_NEW_SPACE_NAME,
++                                base::NumberToString16(count + 1)),
++      colors[count % colors.size()], std::string());
++  controller->SwitchToSpace(id);
++  ShowSettingsBubble(id);
++}
++
++void SpaceSwitcherView::ShowSettingsBubble(const base::Uuid& space_id) {
++  views::View* anchor = GetButton(space_id);
++  if (!anchor || !anchor->GetVisible()) {
++    anchor = this;
++  }
++  ShowSpaceSettingsBubble(anchor, registry_, space_id);
++}
++
++void SpaceSwitcherView::RunMenu(std::unique_ptr<ui::SimpleMenuModel> model,
++                                views::View* anchor,
++                                ui::mojom::MenuSourceType source_type) {
++  if (!anchor) {
++    return;
++  }
++  // The old runner goes before the model it shows.
++  menu_runner_.reset();
++  menu_model_ = std::move(model);
++  expand_on_hover_lock_ =
++      region_->GetExpandOnHoverLock(ExpandOnHoverLockType::kKeepCurrentState);
++  menu_runner_ = std::make_unique<views::MenuRunner>(
++      menu_model_.get(), views::MenuRunner::CONTEXT_MENU);
++  menu_runner_->RunMenuAt(GetWidget(), nullptr, anchor->GetBoundsInScreen(),
++                          views::MenuAnchorPosition::kTopLeft, source_type);
++}
++
++SpaceSwitcherButton* SpaceSwitcherView::GetButton(
++    const base::Uuid& space_id) const {
++  for (SpaceSwitcherButton* button : buttons_) {
++    if (button->space().id == space_id) {
++      return button;
++    }
++  }
++  return nullptr;
++}
++
++BEGIN_METADATA(SpaceSwitcherView)
++END_METADATA
++
++}  // namespace spaces
+--- /dev/null
++++ b/chrome/browser/ui/views/spaces/space_switcher_view.h
+@@ -0,0 +1,135 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_VIEWS_SPACES_SPACE_SWITCHER_VIEW_H_
++#define CHROME_BROWSER_UI_VIEWS_SPACES_SPACE_SWITCHER_VIEW_H_
++
++#include <memory>
++#include <optional>
++#include <vector>
++
++#include "base/callback_list.h"
++#include "base/memory/raw_ptr.h"
++#include "base/scoped_observation.h"
++#include "base/uuid.h"
++#include "chrome/browser/ui/spaces/space_registry.h"
++#include "ui/base/metadata/metadata_header_macros.h"
++#include "ui/menus/simple_menu_model.h"
++#include "ui/views/context_menu_controller.h"
++#include "ui/views/view.h"
++
++class BrowserWindowInterface;
++class ExpandOnHoverLock;
++class TabStripRegionView;
++
++namespace tabs {
++enum class VerticalTabStripCollapseState;
++}
++
++namespace views {
++class Button;
++class MenuRunner;
++}  // namespace views
++
++namespace spaces {
++
++class SpaceController;
++class SpaceSwitcherButton;
++
++// The row of space icons at the bottom of the vertical tab strip, as in Arc:
++// click one to switch to its space, right-click to edit or delete it, and "+"
++// to add a space. Icons shrink to dots when they don't fit. In the collapsed
++// tab strip, or when even dots don't fit, only the active space's icon shows,
++// and clicking it lists the spaces in a menu.
++class SpaceSwitcherView : public views::View,
++                          public views::ContextMenuController,
++                          public ui::SimpleMenuModel::Delegate,
++                          public SpaceRegistry::Observer {
++  METADATA_HEADER(SpaceSwitcherView, views::View)
++
++ public:
++  // Adds a switcher to `parent` if `browser` shows spaces, and returns it.
++  // `region` is the vertical tab strip, kept expanded while a menu is open.
++  static SpaceSwitcherView* MaybeAdd(views::View* parent,
++                                     TabStripRegionView* region,
++                                     BrowserWindowInterface* browser);
++
++  SpaceSwitcherView(TabStripRegionView* region,
++                    BrowserWindowInterface* browser,
++                    SpaceRegistry* registry);
++  SpaceSwitcherView(const SpaceSwitcherView&) = delete;
++  SpaceSwitcherView& operator=(const SpaceSwitcherView&) = delete;
++  ~SpaceSwitcherView() override;
++
++  // The space whose icon contains `point_in_screen`, or nullopt.
++  std::optional<base::Uuid> GetSpaceAtPoint(
++      const gfx::Point& point_in_screen) const;
++
++  // Highlights the icon of `space_id`, or none, while tabs are dragged over
++  // it.
++  void SetDropTarget(std::optional<base::Uuid> space_id);
++
++  // views::View:
++  gfx::Size CalculatePreferredSize(
++      const views::SizeBounds& available_size) const override;
++  void Layout(PassKey) override;
++
++  // views::ContextMenuController:
++  void ShowContextMenuForViewImpl(
++      views::View* source,
++      const gfx::Point& point,
++      ui::mojom::MenuSourceType source_type) override;
++
++  // ui::SimpleMenuModel::Delegate:
++  void ExecuteCommand(int command_id, int event_flags) override;
++  bool IsCommandIdChecked(int command_id) const override;
++  bool IsCommandIdEnabled(int command_id) const override;
++  void MenuClosed(ui::SimpleMenuModel* menu) override;
++
++  // SpaceRegistry::Observer:
++  void OnSpacesChanged() override;
++
++ private:
++  SpaceController* GetController() const;
++
++  // Recreates the icons from the registry.
++  void Rebuild();
++  // Marks the active space's icon, and shows only it while collapsed.
++  void UpdateActive();
++  void OnCollapseStateChanged(tabs::VerticalTabStripCollapseState state);
++
++  void OnSpaceButtonPressed(const base::Uuid& space_id);
++  void AddSpace();
++  void ShowSettingsBubble(const base::Uuid& space_id);
++  void RunMenu(std::unique_ptr<ui::SimpleMenuModel> model,
++               views::View* anchor,
++               ui::mojom::MenuSourceType source_type);
++  SpaceSwitcherButton* GetButton(const base::Uuid& space_id) const;
++
++  const raw_ptr<TabStripRegionView> region_;
++  const raw_ptr<BrowserWindowInterface> browser_;
++  const raw_ptr<SpaceRegistry> registry_;
++
++  std::vector<raw_ptr<SpaceSwitcherButton>> buttons_;
++  raw_ptr<views::Button> add_button_ = nullptr;
++  bool collapsed_ = false;
++  // Whether only the active space's icon shows: collapsed, or too many
++  // spaces for even dots. Clicking it then opens a menu of the spaces.
++  bool showing_only_active_ = false;
++
++  // The space a context menu is open for, or the spaces menu if none.
++  std::optional<base::Uuid> menu_space_id_;
++  std::unique_ptr<ui::SimpleMenuModel> menu_model_;
++  std::unique_ptr<views::MenuRunner> menu_runner_;
++  std::unique_ptr<ExpandOnHoverLock> expand_on_hover_lock_;
++
++  base::ScopedObservation<SpaceRegistry, SpaceRegistry::Observer>
++      registry_observation_{this};
++  base::CallbackListSubscription visibility_subscription_;
++  base::CallbackListSubscription collapse_subscription_;
++};
++
++}  // namespace spaces
++
++#endif  // CHROME_BROWSER_UI_VIEWS_SPACES_SPACE_SWITCHER_VIEW_H_

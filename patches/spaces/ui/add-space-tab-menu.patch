@@ -1,0 +1,551 @@
+--- a/chrome/browser/ui/spaces/BUILD.gn
++++ b/chrome/browser/ui/spaces/BUILD.gn
+@@ -109,6 +109,28 @@ source_set("controller") {
+   ]
+ }
+ 
++# Spaces items of the tab context menu.
++source_set("menu") {
++  sources = [
++    "space_menu_model.cc",
++    "space_menu_model.h",
++  ]
++  public_deps = [
++    "//base",
++    "//ui/menus",
++  ]
++  deps = [
++    ":controller",
++    ":model",
++    "//chrome/app:generated_resources",
++    "//chrome/app/vector_icons",
++    "//chrome/browser/ui/tabs:tab_group",
++    "//chrome/browser/ui/tabs:tab_strip",
++    "//components/tabs:public",
++    "//ui/base",
++  ]
++}
++
+ # The tarball we build from ships without Chromium's test data, so unit_tests
+ # and browser_tests can't build. This target only needs gtest.
+ test("spaces_unittests") {
+--- a/chrome/browser/ui/spaces/space_controller.cc
++++ b/chrome/browser/ui/spaces/space_controller.cc
+@@ -78,6 +78,19 @@ void SpaceController::SwitchToSpace(cons
+   ActivateTabInActiveSpace();
+ }
+ 
++const base::Uuid& SpaceController::default_space_id() const {
++  return registry_->GetDefaultSpace().id;
++}
++
++void SpaceController::AddTabsToFavorites(
++    const std::vector<tabs::TabInterface*>& tabs) {
++  for (tabs::TabInterface* tab : tabs) {
++    if (tab->IsPinned()) {
++      MoveTabToSpace(tab, default_space_id());
++    }
++  }
++}
++
+ void SpaceController::SwitchToAdjacentSpace(bool forward) {
+   SwitchToSpace(
+       GetAdjacentSpaceId(registry_->spaces(), active_space_id_, forward));
+--- a/chrome/browser/ui/spaces/space_controller.h
++++ b/chrome/browser/ui/spaces/space_controller.h
+@@ -74,6 +74,11 @@ class SpaceController : public TabSpaceF
+   // The id of the space shown. Always a space in the registry.
+   const base::Uuid& active_space_id() const { return active_space_id_; }
+ 
++  // The id of the profile's default space.
++  const base::Uuid& default_space_id() const;
++
++  SpaceRegistry* registry() const { return registry_; }
++
+   // Shows `space_id` and activates its most recently active tab, or opens a
+   // new tab in it if it has none. An unknown id means the default space.
+   void SwitchToSpace(const base::Uuid& space_id);
+@@ -124,6 +129,8 @@ class SpaceController : public TabSpaceF
+   void WillSplitTabs(const std::vector<tabs::TabInterface*>& tabs,
+                      const tabs::TabInterface* pivot) override;
+   void WillSwapTabs(tabs::TabInterface* a, tabs::TabInterface* b) override;
++  void AddTabsToFavorites(
++      const std::vector<tabs::TabInterface*>& tabs) override;
+   bool AreTabsInSameRun(const tabs::TabInterface* a,
+                         const tabs::TabInterface* b) const override;
+   base::CallbackListSubscription RegisterTabVisibilityChanged(
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_menu_model.cc
+@@ -0,0 +1,152 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/spaces/space_menu_model.h"
++
++#include <algorithm>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include "base/memory/ptr_util.h"
++#include "base/strings/utf_string_conversions.h"
++#include "chrome/app/vector_icons/vector_icons.h"
++#include "chrome/browser/ui/spaces/space.h"
++#include "chrome/browser/ui/spaces/space_controller.h"
++#include "chrome/browser/ui/tabs/tab_group_theme.h"
++#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
++#include "chrome/grit/generated_resources.h"
++#include "components/tabs/public/tab_interface.h"
++#include "ui/base/models/image_model.h"
++#include "ui/base/models/list_selection_model.h"
++
++namespace spaces {
++
++namespace {
++
++constexpr int kSpaceIconSize = 14;
++
++SpaceController* GetController(TabStripModel* tab_strip) {
++  BrowserWindowInterface* browser =
++      tab_strip->delegate() ? tab_strip->delegate()->GetBrowserWindowInterface()
++                            : nullptr;
++  return browser ? SpaceController::From(browser) : nullptr;
++}
++
++std::u16string GetLabel(const Space& space) {
++  return base::UTF8ToUTF16(space.icon.empty() ? space.name
++                                              : space.icon + " " + space.name);
++}
++
++}  // namespace
++
++std::vector<tabs::TabInterface*> GetTabsForMenuCommand(TabStripModel* tab_strip,
++                                                       int context_index) {
++  if (!tab_strip->ContainsIndex(context_index)) {
++    return {};
++  }
++  if (!tab_strip->IsTabSelected(context_index)) {
++    return {tab_strip->GetTabAtIndex(context_index)};
++  }
++  std::vector<tabs::TabInterface*> tabs;
++  for (size_t index : tab_strip->selection_model()
++                          .GetListSelectionModel()
++                          .selected_indices()) {
++    tabs.push_back(tab_strip->GetTabAtIndex(index));
++  }
++  return tabs;
++}
++
++std::optional<int> GetPinMenuItemStringId(TabStripModel* tab_strip,
++                                          int context_index,
++                                          bool will_pin) {
++  SpaceController* controller = GetController(tab_strip);
++  const std::vector<tabs::TabInterface*> menu_tabs =
++      GetTabsForMenuCommand(tab_strip, context_index);
++  if (!controller || menu_tabs.empty()) {
++    return std::nullopt;
++  }
++  // Only when every tab the item acts on would join or leave the favorites.
++  if (std::ranges::all_of(menu_tabs, [&](const tabs::TabInterface* tab) {
++        return controller->GetSpaceOfTab(tab) ==
++               controller->default_space_id();
++      })) {
++    return will_pin ? IDS_SPACES_TAB_CXMENU_ADD_TO_FAVORITES
++                    : IDS_SPACES_TAB_CXMENU_REMOVE_FROM_FAVORITES;
++  }
++  return std::nullopt;
++}
++
++bool ShouldShowAddToFavorites(TabStripModel* tab_strip, int context_index) {
++  SpaceController* controller = GetController(tab_strip);
++  return controller && tab_strip->ContainsIndex(context_index) &&
++         controller->GetSpaceOfTab(tab_strip->GetTabAtIndex(context_index)) !=
++             controller->default_space_id();
++}
++
++// static
++std::unique_ptr<MoveToSpaceSubMenuModel> MoveToSpaceSubMenuModel::MaybeCreate(
++    TabStripModel* tab_strip,
++    int context_index) {
++  auto model =
++      base::WrapUnique(new MoveToSpaceSubMenuModel(tab_strip, context_index));
++  return model->space_ids_.empty() ? nullptr : std::move(model);
++}
++
++MoveToSpaceSubMenuModel::MoveToSpaceSubMenuModel(TabStripModel* tab_strip,
++                                                 int context_index)
++    : ui::SimpleMenuModel(this),
++      tab_strip_(tab_strip),
++      context_index_(context_index) {
++  SpaceController* controller = GetController(tab_strip);
++  if (!controller || !tab_strip->ContainsIndex(context_index)) {
++    return;
++  }
++  const base::Uuid context_space =
++      controller->GetSpaceOfTab(tab_strip->GetTabAtIndex(context_index));
++  for (const Space& space : controller->registry()->spaces()) {
++    if (space.id == context_space) {
++      continue;
++    }
++    const int command_id = kMinCommandId + space_ids_.size();
++    space_ids_.push_back(space.id);
++    if (space.icon.empty()) {
++      AddItemWithIcon(
++          command_id, GetLabel(space),
++          ui::ImageModel::FromVectorIcon(
++              kCircleFilledIcon, GetTabGroupContextMenuColorId(space.color),
++              kSpaceIconSize));
++    } else {
++      AddItem(command_id, GetLabel(space));
++    }
++    SetMayHaveMnemonicsAt(GetItemCount() - 1, false);
++  }
++}
++
++MoveToSpaceSubMenuModel::~MoveToSpaceSubMenuModel() = default;
++
++void MoveToSpaceSubMenuModel::ExecuteCommand(int command_id, int event_flags) {
++  // The window may have changed while the menu was open.
++  SpaceController* controller = GetController(tab_strip_);
++  const size_t index = command_id - kMinCommandId;
++  if (!controller || command_id < kMinCommandId ||
++      index >= space_ids_.size()) {
++    return;
++  }
++  // Handles, since moving a tab can close none but reorders them all.
++  std::vector<tabs::TabHandle> handles;
++  for (tabs::TabInterface* tab :
++       GetTabsForMenuCommand(tab_strip_, context_index_)) {
++    handles.push_back(tab->GetHandle());
++  }
++  for (const tabs::TabHandle& handle : handles) {
++    tabs::TabInterface* tab = handle.Get();
++    if (tab && tab_strip_->GetIndexOfTab(tab) != TabStripModel::kNoTab) {
++      controller->MoveTabToSpace(tab, space_ids_[index]);
++    }
++  }
++}
++
++}  // namespace spaces
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_menu_model.h
+@@ -0,0 +1,76 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_SPACES_SPACE_MENU_MODEL_H_
++#define CHROME_BROWSER_UI_SPACES_SPACE_MENU_MODEL_H_
++
++#include <memory>
++#include <optional>
++#include <vector>
++
++#include "base/memory/raw_ptr.h"
++#include "base/uuid.h"
++#include "ui/menus/simple_menu_model.h"
++
++class TabStripModel;
++
++namespace tabs {
++class TabInterface;
++}
++
++namespace spaces {
++
++// Spaces items of the tab context menu. Each does nothing, or returns
++// nullopt, in a window without spaces.
++
++// The tabs a tab menu command at `context_index` acts on: the selected tabs
++// if it is selected, otherwise only it, as in TabStripModel.
++std::vector<tabs::TabInterface*> GetTabsForMenuCommand(TabStripModel* tab_strip,
++                                                       int context_index);
++
++// The string of the Pin item for the tab at `context_index`, which pins if
++// `will_pin` and unpins otherwise, or nullopt to keep Chromium's
++// "Pin"/"Unpin". Pinning tabs of the default space makes them favorites, so
++// it reads "Add to Favorites", and unpinning favorites reads "Remove from
++// Favorites", when the item acts only on tabs of the default space.
++std::optional<int> GetPinMenuItemStringId(TabStripModel* tab_strip,
++                                          int context_index,
++                                          bool will_pin);
++
++// Whether the tab menu offers "Add to Favorites" next to Pin: for tabs of
++// spaces other than the default one, where Pin keeps a tab in its space.
++bool ShouldShowAddToFavorites(TabStripModel* tab_strip, int context_index);
++
++// The "Move to space" submenu: the spaces other than the context tab's, in
++// switcher order. Moves the tabs the menu acts on, as SpaceController does.
++class MoveToSpaceSubMenuModel : public ui::SimpleMenuModel,
++                                public ui::SimpleMenuModel::Delegate {
++ public:
++  // Returns null in a window without spaces, or with no other space.
++  static std::unique_ptr<MoveToSpaceSubMenuModel> MaybeCreate(
++      TabStripModel* tab_strip,
++      int context_index);
++
++  MoveToSpaceSubMenuModel(const MoveToSpaceSubMenuModel&) = delete;
++  MoveToSpaceSubMenuModel& operator=(const MoveToSpaceSubMenuModel&) = delete;
++  ~MoveToSpaceSubMenuModel() override;
++
++  // ui::SimpleMenuModel::Delegate:
++  void ExecuteCommand(int command_id, int event_flags) override;
++
++ private:
++  MoveToSpaceSubMenuModel(TabStripModel* tab_strip, int context_index);
++
++  // Past the tab menu's own command ids, as Chromium's submenus are.
++  static constexpr int kMinCommandId = 2001;
++
++  const raw_ptr<TabStripModel> tab_strip_;
++  const int context_index_;
++  // The space of each item, by command id less kMinCommandId.
++  std::vector<base::Uuid> space_ids_;
++};
++
++}  // namespace spaces
++
++#endif  // CHROME_BROWSER_UI_SPACES_SPACE_MENU_MODEL_H_
+--- a/chrome/browser/ui/spaces/spaces_strings.grdp
++++ b/chrome/browser/ui/spaces/spaces_strings.grdp
+@@ -15,4 +15,28 @@
+   Space <ph name="SPACE_NUMBER">$1<ex>1</ex></ph>
+ </message>
+ 
++<!-- Tab context menu -->
++<if expr="not use_titlecase">
++  <message name="IDS_SPACES_TAB_CXMENU_MOVE_TO_SPACE" desc="Tab context menu item opening a submenu of spaces to move the tab to. A space is a named set of tabs in a window.">
++    Move to space
++  </message>
++  <message name="IDS_SPACES_TAB_CXMENU_ADD_TO_FAVORITES" desc="Tab context menu item that makes the tab a favorite, a pinned tab shown in every space.">
++    Add to favorites
++  </message>
++  <message name="IDS_SPACES_TAB_CXMENU_REMOVE_FROM_FAVORITES" desc="Tab context menu item that unpins a favorite, moving it to the space shown.">
++    Remove from favorites
++  </message>
++</if>
++<if expr="use_titlecase">
++  <message name="IDS_SPACES_TAB_CXMENU_MOVE_TO_SPACE" desc="In Title Case: Tab context menu item opening a submenu of spaces to move the tab to. A space is a named set of tabs in a window.">
++    Move to Space
++  </message>
++  <message name="IDS_SPACES_TAB_CXMENU_ADD_TO_FAVORITES" desc="In Title Case: Tab context menu item that makes the tab a favorite, a pinned tab shown in every space.">
++    Add to Favorites
++  </message>
++  <message name="IDS_SPACES_TAB_CXMENU_REMOVE_FROM_FAVORITES" desc="In Title Case: Tab context menu item that unpins a favorite, moving it to the space shown.">
++    Remove from Favorites
++  </message>
++</if>
++
+ </grit-part>
+--- a/chrome/browser/ui/spaces/tab_space_filter.h
++++ b/chrome/browser/ui/spaces/tab_space_filter.h
+@@ -76,6 +76,11 @@ class TabSpaceFilter {
+   // spaces too.
+   virtual void WillSwapTabs(tabs::TabInterface* a, tabs::TabInterface* b) = 0;
+ 
++  // Moves `tabs`, which are pinned, to the default space, which makes them
++  // favorites.
++  virtual void AddTabsToFavorites(
++      const std::vector<tabs::TabInterface*>& tabs) = 0;
++
+   // Whether `a` and `b` are in the same run: the same space, and both pinned
+   // or both not. Moving a tab past the end of its run would split another.
+   virtual bool AreTabsInSameRun(const tabs::TabInterface* a,
+--- a/chrome/browser/ui/tabs/BUILD.gn
++++ b/chrome/browser/ui/tabs/BUILD.gn
+@@ -181,6 +181,7 @@ if (!is_android) {
+       "//chrome/browser/ui:ui_features",
+       "//chrome/browser/ui/immersive:immersive_mode_controller",
+       "//chrome/browser/ui/send_tab_to_self",
++      "//chrome/browser/ui/spaces:menu",
+       "//chrome/browser/ui/web_applications",
+       "//chrome/browser/user_education",
+       "//components/commerce/core:commerce_constants",
+--- a/chrome/browser/ui/tabs/existing_tab_group_sub_menu_model.cc
++++ b/chrome/browser/ui/tabs/existing_tab_group_sub_menu_model.cc
+@@ -48,6 +48,13 @@
+ namespace {
+ constexpr int kIconSize = 14;
+ 
++// helium-spaces: Whether `group` is shown in its window, which lists only the
++// active space's groups. A group stays within one space.
++bool IsGroupInActiveSpace(TabStripModel* model, tab_groups::TabGroupId group) {
++  return model->IsTabInActiveSpace(
++      model->group_model()->GetTabGroup(group)->ListTabs().start());
++}
++
+ 
+ }  // anonymous namespace
+ 
+@@ -113,7 +120,8 @@ ExistingTabGroupSubMenuModel::GetGroupsF
+   // Add tab groups to `groups` if they differ from our indexes current group.
+   std::vector<tab_groups::TabGroupId> groups;
+   for (auto& group : current_model->group_model()->ListTabGroups()) {
+-    if (current_model->IsEphemeralTabGroup(group)) {
++    if (current_model->IsEphemeralTabGroup(group) ||
++        !IsGroupInActiveSpace(current_model, group)) {
+       continue;
+     }
+ 
+@@ -182,7 +190,8 @@ bool ExistingTabGroupSubMenuModel::Shoul
+ 
+   // Look at tab groups in current window
+   for (tab_groups::TabGroupId group : group_model->ListTabGroups()) {
+-    if (ShouldShowGroup(model, context_index, group)) {
++    if (IsGroupInActiveSpace(model, group) &&
++        ShouldShowGroup(model, context_index, group)) {
+       return true;
+     }
+   }
+@@ -198,7 +207,8 @@ bool ExistingTabGroupSubMenuModel::Shoul
+       }
+       for (tab_groups::TabGroupId group :
+            browser_group_model->ListTabGroups()) {
+-        if (ShouldShowGroup(model, context_index, group)) {
++        if (IsGroupInActiveSpace(browser->GetTabStripModel(), group) &&
++            ShouldShowGroup(model, context_index, group)) {
+           return true;
+         }
+       }
+--- a/chrome/browser/ui/tabs/tab_menu_model.cc
++++ b/chrome/browser/ui/tabs/tab_menu_model.cc
+@@ -30,6 +30,7 @@
+ #include "chrome/browser/ui/color/chrome_color_id.h"
+ #include "chrome/browser/ui/immersive/immersive_mode_controller.h"
+ #include "chrome/browser/ui/send_tab_to_self/send_tab_to_self_context_menu_delegate.h"
++#include "chrome/browser/ui/spaces/space_menu_model.h"
+ #include "chrome/browser/ui/tabs/existing_tab_group_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/existing_window_sub_menu_model.h"
+ #include "chrome/browser/ui/tabs/features.h"
+@@ -502,6 +503,14 @@ void TabMenuModel::Build(int index) {
+     }
+   }
+ 
++  // helium-spaces
++  if ((move_to_space_submenu_ =
++           spaces::MoveToSpaceSubMenuModel::MaybeCreate(tab_strip_, index))) {
++    AddSubMenu(TabStripModel::CommandMoveToSpace,
++               l10n_util::GetStringUTF16(IDS_SPACES_TAB_CXMENU_MOVE_TO_SPACE),
++               move_to_space_submenu_.get());
++  }
++
+   AddSeparator(ui::NORMAL_SEPARATOR);
+   AddItemWithStringId(TabStripModel::CommandCopyURL,
+                       num_tabs == 1 ? IDS_TAB_CXMENU_COPY_URL
+@@ -515,9 +524,12 @@ void TabMenuModel::Build(int index) {
+   SetElementIdentifierAt(GetItemCount() - 1, kDuplicateMenuItem);
+ 
+   bool will_pin = tab_strip_->WillContextMenuPin(index);
+-  AddItemWithStringId(
+-      TabStripModel::CommandTogglePinned,
+-      will_pin ? IDS_TAB_CXMENU_PIN_TAB : IDS_TAB_CXMENU_UNPIN_TAB);
++  // helium-spaces: Pinning a tab of the default space makes it a favorite.
++  AddItemWithStringId(TabStripModel::CommandTogglePinned,
++                      spaces::GetPinMenuItemStringId(tab_strip_, index,
++                                                     will_pin)
++                          .value_or(will_pin ? IDS_TAB_CXMENU_PIN_TAB
++                                             : IDS_TAB_CXMENU_UNPIN_TAB));
+ 
+   if (features::IsMenuSimplificationEnabled()) {
+     SetIconForCommandId(
+@@ -530,6 +542,12 @@ void TabMenuModel::Build(int index) {
+             ui::kColorMenuIcon, ui::SimpleMenuModel::kDefaultIconSize));
+   }
+ 
++  // helium-spaces: In other spaces, Pin keeps a tab in its space.
++  if (spaces::ShouldShowAddToFavorites(tab_strip_, index)) {
++    AddItemWithStringId(TabStripModel::CommandAddToFavorites,
++                        IDS_SPACES_TAB_CXMENU_ADD_TO_FAVORITES);
++  }
++
+   const bool will_mute_tab = tab_strip_->WillContextMenuMuteTabs(index);
+   AddItem(TabStripModel::CommandToggleTabMuted,
+           l10n_util::GetPluralStringFUTF16(
+--- a/chrome/browser/ui/tabs/tab_menu_model.h
++++ b/chrome/browser/ui/tabs/tab_menu_model.h
+@@ -98,6 +98,8 @@ class TabMenuModel : public ui::SimpleMe
+ 
+   std::unique_ptr<ui::SimpleMenuModel> add_to_existing_group_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> add_to_existing_window_submenu_;
++  // helium-spaces
++  std::unique_ptr<ui::SimpleMenuModel> move_to_space_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel>
+       add_to_existing_comparison_table_submenu_;
+   std::unique_ptr<ui::SimpleMenuModel> swap_with_split_submenu_;
+--- a/chrome/browser/ui/tabs/tab_strip_model.cc
++++ b/chrome/browser/ui/tabs/tab_strip_model.cc
+@@ -2912,6 +2912,11 @@ bool TabStripModel::IsContextMenuCommand
+     case CommandMoveToExistingWindow:
+       return true;
+ 
++    // helium-spaces
++    case CommandMoveToSpace:
++    case CommandAddToFavorites:
++      return space_filter_ != nullptr;
++
+     case CommandMoveTabsToNewWindow: {
+       std::vector<int> indices = GetIndicesForCommand(context_index);
+       const bool would_leave_strip_empty =
+@@ -3312,6 +3317,48 @@ void TabStripModel::ExecuteContextMenuCo
+       break;
+     }
+ 
++    // helium-spaces
++    case CommandMoveToSpace:
++      // The submenu moves the tabs.
++      break;
++    case CommandAddToFavorites: {
++      if (!space_filter_) {
++        break;
++      }
++      // Pins the tabs, as CommandTogglePinned does, then makes them
++      // favorites. In this order an active tab stays active.
++      std::vector<int> indices = GetIndicesForCommand(context_index);
++      std::vector<tab_groups::TabGroupId> groups_to_delete =
++          GetGroupsDestroyedFromRemovingIndices(indices);
++      MarkTabGroupsForClosing(groups_to_delete);
++      std::vector<tabs::TabHandle> handles;
++      for (int index : indices) {
++        handles.push_back(GetTabAtIndex(index)->GetHandle());
++      }
++      base::OnceCallback<void()> callback = base::BindOnce(
++          [](TabStripModel* model, std::vector<int> indices,
++             std::vector<tabs::TabHandle> handles) {
++            model->SetTabsPinned(indices, true);
++            std::vector<tabs::TabInterface*> tabs;
++            for (const tabs::TabHandle& handle : handles) {
++              if (tabs::TabInterface* tab = handle.Get();
++                  tab && model->GetIndexOfTab(tab) != kNoTab) {
++                tabs.push_back(tab);
++              }
++            }
++            if (model->space_filter()) {
++              model->space_filter()->AddTabsToFavorites(tabs);
++            }
++          },
++          base::Unretained(this), indices, std::move(handles));
++      if (!groups_to_delete.empty()) {
++        return delegate_->OnRemovingAllTabsFromGroups(groups_to_delete,
++                                                      std::move(callback));
++      }
++      std::move(callback).Run();
++      break;
++    }
++
+     case CommandMoveTabsToNewWindow: {
+       base::UmaHistogramCounts1000(
+           "Tab.ContextMenu.MoveTabsToNewWindow.SelectedTabsCount",
+--- a/components/tabs/public/tab_context_menu_command.h
++++ b/components/tabs/public/tab_context_menu_command.h
+@@ -42,6 +42,9 @@ enum TabContextMenuCommand {
+   CommandToggleFocusGroup,
+   CommandDiscard,
+   CommandToggleTabMuted,
++  // helium-spaces
++  CommandMoveToSpace,
++  CommandAddToFavorites,
+ };
+ // LINT.ThenChange(//tools/metrics/histograms/metadata/tab/histograms.xml:TabContextMenuCommand)
+ 
