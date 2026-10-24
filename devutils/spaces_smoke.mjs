@@ -18,6 +18,10 @@
 //      groups, split views, reopened tabs, removed spaces, other windows.
 //   7. Flag on: keyboard tab moves and Shift-click ranges stay in the active
 //      space, and tab menu commands only count its tabs.
+//   8. Flag on: the space commands, the tab menu's Spaces items, and drops on
+//      a space's icon.
+//   9. Flag on: three spaces of ten tabs each, with favorites, space-pinned
+//      tabs and groups, come back the same after two restarts (Gate 1).
 // Needs a global WebSocket: Node 22+, or Node 20.10+ with --experimental-websocket.
 // Exits non-zero on any failed check.
 
@@ -1016,9 +1020,76 @@ async function checkSpaceCommands() {
   await close();
 }
 
+// Gate 1 in spec.md: three spaces of ten tabs each survive restarts in the
+// right spaces, with their pinned state, groups and order, and the window
+// comes back in the space it was in.
+async function checkRestartAtScale() {
+  const profile = newProfile();
+  const args = ['--enable-features=HeliumSpaces'];
+  let { cdp, close } = await launch(profile, args);
+  let state = await internalsState(cdp);
+  const win = state.windows[0].session_id;
+  const send = (message, ...rest) => internalsSend(cdp, message, rest);
+  const find = (state, name) => tabList(state).find((t) => t.name === name);
+  const spaceNames = { default: 'D', Work: 'W', Play: 'P' };
+  const names = Object.values(spaceNames).flatMap((p) => [...Array(10).keys()].map((i) => p + i));
+
+  await send('addSpace', 'Work');
+  await send('addSpace', 'Play');
+  state = await internalsState(cdp);
+  const ids = Object.fromEntries(state.spaces.map((s) => [s.default ? 'default' : s.name, s.id]));
+  // New tabs join the active space, so open each space's tabs while it shows.
+  for (const [space, prefix] of Object.entries(spaceNames)) {
+    await send('switchSpace', win, ids[space]);
+    for (let i = 0; i < 10; i++) await openTestTab(cdp, prefix + i, { background: true });
+    state = await waitForNamedTabs(cdp, names.filter((n) => n.startsWith(prefix)));
+    // Pins 0 and 1 (favorites in the default space) and groups 2 to 4.
+    for (const n of [0, 1]) {
+      state = await internalsState(cdp);
+      await send('pinTab', win, find(state, prefix + n).index, true);
+    }
+    state = await internalsState(cdp);
+    await send('groupTabs', win, [2, 3, 4].map((n) => find(state, prefix + n).index));
+  }
+  await send('switchSpace', win, ids.Work);
+  state = await internalsState(cdp);
+  await send('activateTab', win, find(state, 'W5').index);
+
+  // Each test tab's space, pinned state and group (named by its first tab),
+  // in tab strip order.
+  const snapshot = (state) => {
+    const tabs = tabList(state).filter((t) => t.name);
+    const groupName = new Map();
+    for (const t of tabs) if (t.grouped && !groupName.has(t.group)) groupName.set(t.group, t.name);
+    return tabs.map((t) => `${t.name}:${t.space}${t.pinned ? ':pinned' : ''}${t.grouped ? ':' + groupName.get(t.group) : ''}`).join(' ');
+  };
+  const ordered = (state) => state.windows.every((w) => w.order_ok && w.order_fixes === 0);
+  const active = (state) => tabList(state).find((t) => t.active)?.name;
+  state = await internalsState(cdp);
+  const before = snapshot(state);
+  check('30 tabs in three spaces, with favorites, space-pinned tabs and groups',
+        tabList(state).filter((t) => t.name).length === 30 && ordered(state) &&
+        ['D0', 'D1', 'W0', 'W1', 'P0', 'P1'].every((n) => find(state, n)?.pinned) &&
+        ['D', 'W', 'P'].every((p) => find(state, p + 2)?.grouped && find(state, p + 2)?.group === find(state, p + 4)?.group) &&
+        activeSpace(state) === 'Work' && active(state) === 'W5', before);
+  await close({ waitForSessionSave: true });
+
+  // Restored tabs are rewritten without our hook on a later restart, so do two.
+  for (const which of ['a restart', 'a second restart']) {
+    ({ cdp, close } = await launch(profile, [...args, '--restore-last-session'], undefined, INTERNALS));
+    state = await waitForNamedTabs(cdp, names);
+    check(`30 tabs keep their space, pin, group and order after ${which}`,
+          snapshot(state) === before && ordered(state), snapshot(state));
+    check(`the window comes back in Work, on W5, after ${which}`,
+          activeSpace(state) === 'Work' && active(state) === 'W5',
+          `active space ${activeSpace(state)}, active tab ${active(state)}`);
+    await close({ waitForSessionSave: true });
+  }
+}
+
 // SPACES_SMOKE_ONLY=checkOrder runs one section; SPACES_SMOKE_STDERR=1 shows
 // the browser's stderr.
-const sections = { checkFlagOff, checkDefaultSpace, checkTabSpaces, checkSwitching, checkOrder, checkMovesInSpace, checkSpaceCommands };
+const sections = { checkFlagOff, checkDefaultSpace, checkTabSpaces, checkSwitching, checkOrder, checkMovesInSpace, checkSpaceCommands, checkRestartAtScale };
 try {
   for (const [name, section] of Object.entries(sections)) {
     if (!process.env.SPACES_SMOKE_ONLY || process.env.SPACES_SMOKE_ONLY === name) await section();
