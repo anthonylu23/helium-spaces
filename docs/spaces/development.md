@@ -190,6 +190,13 @@ spaces and tabs as JSON and takes `chrome.send()` messages; see
   drive a restored `chrome://spaces-internals` tab instead.
 - Keyboard shortcuts go through `runCommand`, not CDP key events, which only
   reach the page.
+- The tab context menu is built for real by `tabMenu` (its items, with
+  submenus, appear in the state as `tab_menu`) and run by `tabMenuItem`,
+  which follows a path of labels. Labels are the Mac's Title Case ones.
+  Untitled groups are labeled from their tabs' titles, which a background
+  test tab may not have yet.
+- `collapseGroup` and `dropOnSpace` make the model calls the views make when
+  a group is collapsed and when tabs are dropped on a switcher icon.
 - Every DevTools call times out after 30 s. A bug that closes the tab the test
   drives otherwise hangs the run.
 

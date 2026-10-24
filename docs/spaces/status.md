@@ -4,12 +4,13 @@
 `spaces/registry`. Step 3a (`SpaceController`, model and command hooks)
 pushed on branch `spaces/controller`. Step 3b (hiding tabs in the tab
 strip views) visually checked in all four layouts and pushed there too.
-Step 3c (tab order, keyboard moves, ranges, drag) built and checked
-headless on branch `spaces/order`; its drag check by hand is open. Step 0 spike: code review and
-computer-use checks support option C; actual dragging and human animation
-review remain open.**
+Step 3c (tab order, keyboard moves, ranges, drag) pushed on branch
+`spaces/order`. Step 4 (switcher, shortcuts, tab menu) built, checked headless and checked
+by hand on branch `spaces/switcher`.
+Step 0 spike: code review and computer-use checks support option C; human
+animation review remains open.**
 
-Last updated 2026-10-23. Deferred work and deliberate decisions are in
+Last updated 2026-10-24. Deferred work and deliberate decisions are in
 `deferred.md`.
 
 ## Baseline
@@ -19,7 +20,7 @@ Last updated 2026-10-23. Deferred work and deliberate decisions are in
 | Helium | 0.20.1.1 (core `f29a2596`, macOS `9aa975a`) |
 | Chromium | 156.0.8078.47 |
 | Machine | M3 Pro, 11 cores, 18 GB RAM, Xcode 26.2 (upstream CI uses 26.5) |
-| Our patches | 9, in `patches/spaces/` |
+| Our patches | 13, in `patches/spaces/` |
 
 ## Measured build costs
 
@@ -151,7 +152,50 @@ Last updated 2026-10-23. Deferred work and deliberate decisions are in
             to another window switched the source window to the space of
             the tab after the group; fixed, and Codex's recheck passed. Keyboard
             focus on tabs and drag smoothness stay unverified.
-    4. Switcher strip, keyboard switching, tab context menu.
+    4. Built: four patches, plus the hover card fix in
+       `spaces/ui/hide-tabs-outside-active-space.patch`.
+       - `spaces/core/add-space-commands.patch`: next/previous space
+         (Cmd+Opt+Right/Left, wrapping) and space 1..9 (Ctrl+1..9), as in
+         Arc, labeled on Helium's shortcuts page. Our strings live in
+         `chrome/browser/ui/spaces/spaces_strings.grdp`.
+       - `spaces/ui/add-space-tab-menu.patch`: "Move to Space", "Add to
+         Favorites" / "Remove from Favorites", and "Add Tab to Group" limited
+         to the shown space's groups (deferred from step 3c).
+       - `spaces/ui/add-space-switcher.patch`: the switcher row at the bottom
+         of the vertical sidebar, the "+" and right-click Edit/Delete, the
+         settings bubble (name, emoji, color), dots when crowded, and the
+         active icon alone with a spaces menu when collapsed.
+       - `spaces/ui/drop-tabs-on-space-switcher.patch`: a tab or group dragged
+         onto a space's icon moves there; the icon highlights while hovered.
+       - A hover card showing for a tab hidden by a switch now closes at once
+         (deferred from step 3b).
+       - New smoke section `checkSpaceCommands` (16 checks), driving the real
+         tab menu through `tabMenu`/`tabMenuItem`. It also covers the two
+         step 3a/3c gaps: the group-collapse and collapsed-group close
+         fallbacks, and swapping a tab into a split view.
+       - Every new model, menu and controller hook, and the two step 3a
+         fallbacks, fail a smoke check when removed (11 mutations).
+       - A review agent found no crash; its six real findings are fixed:
+         Cmd+Opt+Left/Right did nothing in windows without spaces, Ctrl+1..9
+         were reserved from pages, the Pin label could contradict a mixed
+         selection, hidden icons could catch drops, submenu ids overlapped
+         the tab menu's, and a missing null check.
+       - Codex's independent code review (2026-10-24) found no crash or
+         lifetime bug. Fixed from it: the internals page's tab menu cache is
+         per profile, its menu driver honors disabled items and reports a
+         missed one, the group-list check now proves which group is listed,
+         backward wrap-around is checked, and the active icon alone (too many
+         spaces) opens the spaces menu.
+       - Codex's hands-on check (`checks/step-4-switcher-check.md`,
+         2026-10-24) passed every item in every layout it applies to, with
+         no failures: switcher, settings bubble, crowded and collapsed
+         layouts, real keys in all four layouts and in incognito, the tab
+         menu, drops on icons (tab, group, from another window, Escape, and
+         tear-off over "+" or a gap), the hover card, the shortcuts page,
+         flag off, and Full Keyboard Access (focus reaches tabs; tab moves
+         stop at the edges of the space). The order was valid and never
+         fixed in all 159 captured states. It noticed a brief near-empty
+         sidebar while switching in Vertical (in `deferred.md`).
 3. Consider Xcode 26.5 to match upstream CI before the first rebase.
 
 ## Smoke checklist
@@ -174,8 +218,12 @@ Automated (`devutils/spaces_smoke.mjs`):
 - Keyboard moves at the ends of a space's tabs, Shift-click ranges, "Close
   tabs to the left" on a hidden tab, and "Close other tabs" in a space with
   one tab.
+- Space switching commands; the tab menu's "Move to Space", favorites items
+  and group list; swapping a favorite into a split view; collapsing the
+  active tab's group and closing next to a collapsed group; tabs and groups
+  dropped on a space's icon.
 
-Unit (`spaces_unittests`): 12 `SpaceList` tests, 11 `SpaceOrder` tests.
+Unit (`spaces_unittests`): 14 `SpaceList` tests, 11 `SpaceOrder` tests.
 
 Manual, until automated:
 

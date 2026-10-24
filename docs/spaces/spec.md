@@ -55,9 +55,17 @@ model, so session restore, drag and drop, and tab commands keep working.
 - UI: switcher strip at the bottom of the vertical sidebar, sidebar filtered to
   the active space, sidebar tinted with the space color, "Move to space" in the
   tab menu, drag a tab onto a switcher icon.
-- Switching: two-finger horizontal swipe over the sidebar only (page swipes
-  keep back/forward), Cmd+Opt+Left/Right, Ctrl+Opt+1..9, click an icon. Ctrl+Tab
-  stays inside the active space.
+- Switching: two-finger horizontal swipe over the vertical sidebar only (page
+  swipes keep back/forward; phase 4). No swipe in Classic, Compact or Dynamic,
+  where it would be confused with scrolling the tab strip; they get a space
+  button or menu instead (phase 4). Cmd+Opt+Left/Right (taken from tab switching
+  while Spaces is on, as in Arc; wraps around), Ctrl+1..9 as in Arc, click an
+  icon. Ctrl+Tab stays inside the active space.
+- Switcher: one icon per space (its emoji, or a dot in its color) and "+",
+  at the bottom of the vertical sidebar; right-click to edit or delete a
+  space. Collapsed, only the active space's icon shows, and it opens a menu
+  of spaces. Tab menu: "Move to Space", "Add to Favorites" / "Remove from
+  Favorites"; "Add Tab to Group" lists only the shown space's groups.
 - Persistence: space list in a profile dictionary pref. The active space
   follows the active tab: activating a tab in another space switches to it,
   and while a favorite is active the window shows the space of its most
