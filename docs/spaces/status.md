@@ -196,7 +196,15 @@ Last updated 2026-10-24. Deferred work and deliberate decisions are in
          stop at the edges of the space). The order was valid and never
          fixed in all 159 captured states. It noticed a brief near-empty
          sidebar while switching in Vertical (in `deferred.md`).
-3. Consider Xcode 26.5 to match upstream CI before the first rebase.
+3. Close Phase 3. Gate 1's automated part passes (`checkRestartAtScale`,
+   2026-10-24). Still open: the human verdict on whether the sidebar filter
+   holds up in daily use, and the step 0 spike's animation review by eye.
+4. Phase 5's isolation spike comes before Phase 4's polish (decided
+   2026-10-24): it is the biggest unknown and can change the design, while
+   the polish items wait safely in `deferred.md`.
+5. Xcode 26.5 to match upstream CI before the first rebase. On 2026-10-24
+   the Command Line Tools were updated (macOS 27.0 SDK), but `Xcode.app` is
+   still 26.2, which is what the build uses.
 
 ## Smoke checklist
 
@@ -222,6 +230,9 @@ Automated (`devutils/spaces_smoke.mjs`):
   and group list; swapping a favorite into a split view; collapsing the
   active tab's group and closing next to a collapsed group; tabs and groups
   dropped on a space's icon.
+- Gate 1: three spaces of ten tabs each, with favorites, space-pinned tabs
+  and groups, keep their space, pin, group and order through two restarts,
+  and the window comes back in its space on its active tab.
 
 Unit (`spaces_unittests`): 14 `SpaceList` tests, 11 `SpaceOrder` tests.
 

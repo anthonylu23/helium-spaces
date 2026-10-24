@@ -103,6 +103,16 @@ bookmarks, history, passwords, extensions, settings.
 - Tab Search gets a space column, a filter per space, and "move to space".
 - Split view: already default in Chromium; just confirm pairs stay in a space.
 
+## Future: per-space colors and themes
+
+Each space can have its own color and theme, as Arc does: switching spaces
+changes the window's colors (sidebar, toolbar, frame), not only the switcher
+icon. Builds on tinting the sidebar with the space's color (`deferred.md`).
+Open questions: whether a space's theme is a full Chromium theme or a color
+scheme generated from one seed color, and how it combines with the profile's
+theme and with light and dark mode. Not scheduled yet; it would add a theme
+field to the space alongside `color`.
+
 ## Architecture
 
 New classes under `chrome/browser/ui/spaces/` and `chrome/browser/ui/views/spaces/`:
