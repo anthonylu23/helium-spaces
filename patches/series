@@ -35,4 +35,5 @@ spaces/core/add-space-controller.patch
 spaces/ui/hide-tabs-outside-active-space.patch
 spaces/core/keep-space-tabs-together.patch
 spaces/ui/keep-tab-moves-in-active-space.patch
+spaces/core/add-space-commands.patch
 spaces/tooling/add-spaces-internals.patch
