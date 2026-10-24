@@ -13,6 +13,11 @@
 //   5. Flag on: switching spaces, new tabs joining the active space, tab
 //      commands staying inside it, favorites, closing a space's last tab,
 //      removing the active space, and the active space after a restart.
+//   6. Flag on: each space's tabs stay together in the tab strip, whatever
+//      inserts or moves them: new tabs, links, extension moves, drops, pinning,
+//      groups, split views, reopened tabs, removed spaces, other windows.
+//   7. Flag on: keyboard tab moves and Shift-click ranges stay in the active
+//      space, and tab menu commands only count its tabs.
 // Needs a global WebSocket: Node 22+, or Node 20.10+ with --experimental-websocket.
 // Exits non-zero on any failed check.
 
@@ -96,7 +101,7 @@ async function launch(profile, extraArgs = [], url = 'about:blank', attachTo = u
     '--no-first-run',
     ...extraArgs,
     ...(attachTo ? [] : [url]),
-  ], { stdio: 'ignore' });
+  ], { stdio: ['ignore', 'ignore', process.env.SPACES_SMOKE_STDERR ? 'inherit' : 'ignore'] });
   browsers.push(browser);
   const exited = new Promise((r) => browser.once('exit', r));
   try {
@@ -223,9 +228,9 @@ async function openTestTab(cdp, name, { background = false } = {}) {
 
 // Every tab of the first window, with its space as a name: a space's name, or
 // "default" for the default space, no space, or a removed space.
-function tabList(state) {
+function tabList(state, windowId = undefined) {
   const names = new Map(state.spaces.map((s) => [s.id, s.default ? 'default' : s.name]));
-  const window = state.windows[0];
+  const window = windowId === undefined ? state.windows[0] : state.windows.find((w) => w.session_id === windowId);
   return window.tabs.map((tab) => ({
     ...tab, window: window.session_id, name: testTabName(tab.url),
     space: names.get(tab.space_id) ?? 'default',
@@ -239,6 +244,9 @@ function activeSpace(state) {
 }
 
 // Maps every test tab in a "T" name to its space name. Other tabs are ignored.
+// Whether two {tab name: space name} maps are the same, in any order.
+const sameSpaces = (a, b) => JSON.stringify(Object.entries(a).sort()) === JSON.stringify(Object.entries(b).sort());
+
 function tabSpaces(state) {
   const result = {};
   for (const window of state.windows) {
@@ -345,13 +353,17 @@ async function checkSwitching() {
         active(state)?.name === 'D1' && activeSpace(state) === 'Work',
         `active ${active(state)?.name}, space ${activeSpace(state)}`);
 
-  // Unpinned, D1 is an ordinary default-space tab, so the window follows it.
+  // Unpinned, D1 joins the active space, as in Arc.
   await send('pinTab', win, find(state, 'D1').index, false);
   state = await internalsState(cdp);
-  check('unpinning the active favorite moves to its space',
-        activeSpace(state) === 'default' && active(state)?.name === 'D1' && active(state)?.in_active_space,
-        `active space ${activeSpace(state)}`);
+  check('unpinning the active favorite moves it to the active space',
+        activeSpace(state) === 'Work' && active(state)?.name === 'D1' && find(state, 'D1')?.space === 'Work',
+        `active space ${activeSpace(state)}, D1 in ${find(state, 'D1')?.space}`);
+  // Make it a favorite again: a pinned tab of the default space.
   await send('pinTab', win, find(state, 'D1').index, true);
+  state = await internalsState(cdp);
+  await send('assignTab', win, find(state, 'D1').index, '');
+  state = await internalsState(cdp);
 
   await send('switchSpace', win, ids.Play);
   await openTestTab(cdp, 'P1');
@@ -393,9 +405,9 @@ async function checkSwitching() {
 
   // Closing W1 leaves Work empty: stay in Work, with a new tab, instead of
   // jumping to another space, and without showing a tab of another space on
-  // the way, which would bump its last-active time. D1 is unpinned so no
-  // favorite can stand in.
-  await send('pinTab', win, find(state, 'D1').index, false);
+  // the way, which would bump its last-active time. So that no favorite can
+  // stand in, D1 is a pinned tab of Play for this check.
+  await send('assignTab', win, find(state, 'D1').index, ids.Play);
   state = await internalsState(cdp);
   await send('activateTab', win, find(state, 'W1').index);
   state = await internalsState(cdp);
@@ -403,13 +415,13 @@ async function checkSwitching() {
   await send('runCommand', win, 'closeTab');
   await sleep(500);
   state = await internalsState(cdp);
-  const shownOnTheWay = othersBefore.filter((t) => tabList(state).find((u) => u.url === t.url)?.last_active !== t.last_active);
+  const shownOnTheWay = othersBefore.filter((t) => tabList(state).find((u) => u.id === t.id)?.last_active !== t.last_active);
   check('closing the last tab of a space opens a new tab there',
         activeSpace(state) === 'Work' && active(state)?.space === 'Work' && !active(state)?.pinned &&
         spaceTabs(state, 'Work').length === 1 && shownOnTheWay.length === 0,
         `active space ${activeSpace(state)}, active tab ${active(state)?.name ?? active(state)?.url} in ${active(state)?.space}, ` +
         `shown on the way: ${shownOnTheWay.map((t) => t.name ?? t.url)}`);
-  await send('pinTab', win, find(state, 'D1').index, true);
+  await send('assignTab', win, find(state, 'D1').index, '');
 
   await send('activateTab', win, find(state, 'P1').index);
   state = await internalsState(cdp);
@@ -455,20 +467,21 @@ async function checkTabSpaces() {
   let state = await waitForTestTabs(cdp, Object.keys(expected).length);
   const ids = Object.fromEntries(state.spaces.map((s) => [s.name, s.id]));
   const window = state.windows[0];
-  const index = Object.fromEntries(window.tabs.map((t) => [/(T\d)$/.exec(t.url)?.[1], t.index]));
   // T5 goes to Work and back, to check that moving to the default space
-  // overrides the earlier id in the same session file.
+  // overrides the earlier id in the same session file. Moving a tab to a space
+  // moves it to that space's tabs, so look up its index each time.
   for (const [title, space] of [...Object.entries(expected), ['T5', 'Work'], ['T5', 'default']]) {
-    await internalsSend(cdp, 'assignTab', [window.session_id, index[title], space === 'default' ? '' : ids[space]]);
+    const tab = (await internalsState(cdp)).windows[0].tabs.find((t) => t.url.endsWith(title));
+    await internalsSend(cdp, 'assignTab', [window.session_id, tab.index, space === 'default' ? '' : ids[space]]);
   }
   state = await internalsState(cdp);
-  check('tabs take the space they are assigned', JSON.stringify(tabSpaces(state)) === JSON.stringify(expected),
+  check('tabs take the space they are assigned', sameSpaces(tabSpaces(state), expected),
         JSON.stringify(tabSpaces(state)));
   await close({ waitForSessionSave: true });
 
   ({ cdp, close } = await launch(profile, restore));
   state = await waitForTestTabs(cdp, Object.keys(expected).length);
-  check('tabs keep their space after a restart', JSON.stringify(tabSpaces(state)) === JSON.stringify(expected),
+  check('tabs keep their space after a restart', sameSpaces(tabSpaces(state), expected),
         JSON.stringify(tabSpaces(state)));
   await close({ waitForSessionSave: true });
 
@@ -477,7 +490,7 @@ async function checkTabSpaces() {
   // changes checks that.
   ({ cdp, close } = await launch(profile, restore));
   state = await waitForTestTabs(cdp, Object.keys(expected).length);
-  check('tabs keep their space after a second restart', JSON.stringify(tabSpaces(state)) === JSON.stringify(expected),
+  check('tabs keep their space after a second restart', sameSpaces(tabSpaces(state), expected),
         JSON.stringify(tabSpaces(state)));
   await internalsSend(cdp, 'rewriteSession', []);
   await close({ waitForSessionSave: true });
@@ -485,7 +498,7 @@ async function checkTabSpaces() {
   ({ cdp, close } = await launch(profile, restore));
   state = await waitForTestTabs(cdp, Object.keys(expected).length);
   check('tabs keep their space after the session file is rewritten',
-        JSON.stringify(tabSpaces(state)) === JSON.stringify(expected), JSON.stringify(tabSpaces(state)));
+        sameSpaces(tabSpaces(state), expected), JSON.stringify(tabSpaces(state)));
 
   // Reopening a closed tab (Cmd+Shift+T) goes through tab restore instead.
   const t3 = state.windows.flatMap((w) => w.tabs.map((t) => ({ window: w.session_id, ...t })))
@@ -498,11 +511,352 @@ async function checkTabSpaces() {
   await close();
 }
 
+// Each space's tabs stay together in the tab strip: pinned and unpinned apart,
+// favorites first. Every check also asks that the order never broke and had to
+// be fixed afterwards, which SpaceController counts.
+async function checkOrder() {
+  const profile = newProfile();
+  const { cdp, close } = await launch(profile, ['--enable-features=HeliumSpaces']);
+  let state = await internalsState(cdp);
+  const win = state.windows[0].session_id;
+  const send = (message, ...rest) => internalsSend(cdp, message, rest);
+  const find = (state, name, w = win) => tabList(state, w).find((t) => t.name === name);
+  const active = (state, w = win) => tabList(state, w).find((t) => t.active);
+  // A window's tabs in order: test tabs by name, N for a New Tab page, I for
+  // this page, with the space of each run.
+  const order = (state, w = win) => tabList(state, w).map((t) =>
+    `${t.name ?? (t.url.startsWith(INTERNALS) ? 'I' : 'N')}${t.pinned ? '*' : ''}:${t.space}`).join(' ');
+  // Indices of a space's unpinned tabs.
+  const run = (state, space, w = win) =>
+    tabList(state, w).filter((t) => t.space === space && !t.pinned).map((t) => t.index);
+  let fixes = 0;
+  const ordered = (state) => {
+    const total = state.windows.reduce((sum, w) => sum + w.order_fixes, 0);
+    const ok = total === fixes && state.windows.every((w) => w.order_ok);
+    fixes = total;
+    return ok;
+  };
+
+  await send('addSpace', 'Work');
+  await send('addSpace', 'Play');
+  for (const name of ['F1', 'F2', 'D1']) await openTestTab(cdp, name);
+  state = await waitForNamedTabs(cdp, ['F1', 'F2', 'D1']);
+  const ids = Object.fromEntries(state.spaces.map((s) => [s.name, s.id]));
+  await send('pinTab', win, find(state, 'F1').index, true);
+  state = await internalsState(cdp);
+  await send('pinTab', win, find(state, 'F2').index, true);
+  await send('switchSpace', win, ids.Work);
+  for (const name of ['W1', 'W2']) await openTestTab(cdp, name);
+  await send('switchSpace', win, ids.Play);
+  for (const name of ['P1', 'P2']) await openTestTab(cdp, name);
+  state = await waitForNamedTabs(cdp, ['W1', 'W2', 'P1', 'P2']);
+  check('tabs opened in each space start out together', ordered(state), order(state));
+
+  // Chromium puts Cmd+T at the end of the strip, after Play's tabs.
+  await send('switchSpace', win, ids.Work);
+  await send('runCommand', win, 'newTab');
+  state = await internalsState(cdp);
+  check("a new tab goes at the end of the active space's tabs",
+        active(state)?.space === 'Work' && active(state)?.index === Math.max(...run(state, 'Work')) && ordered(state),
+        order(state));
+
+  // Chromium puts a link opened from a pinned tab first among unpinned tabs,
+  // which are the default space's.
+  await send('activateTab', win, find(state, 'F1').index);
+  await send('openLink', win, 'data:text/html,<title>W3</title>W3', true);
+  state = await waitForNamedTabs(cdp, ['W3']);
+  check("a link opened from a favorite goes first among the active space's tabs",
+        find(state, 'W3')?.space === 'Work' && find(state, 'W3')?.index === run(state, 'Work')[0] && ordered(state),
+        order(state));
+
+  await send('moveTab', win, find(state, 'W1').index, find(state, 'P2').index);
+  state = await internalsState(cdp);
+  check("an extension moving a tab among another space's tabs leaves it at the end of its own",
+        find(state, 'W1')?.index === Math.max(...run(state, 'Work')) && ordered(state), order(state));
+
+  await send('activateTab', win, find(state, 'W2').index);
+  await send('moveSelectedTabs', win, find(state, 'P1').index);
+  state = await internalsState(cdp);
+  check("a tab dropped among another space's tabs stays at the end of its own",
+        find(state, 'W2')?.index === Math.max(...run(state, 'Work')) && ordered(state), order(state));
+
+  // Pinned tabs: F1 F2 W2 P1. Pinning W1 would put it after P1.
+  await send('pinTab', win, find(state, 'W2').index, true);
+  await send('switchSpace', win, ids.Play);
+  state = await internalsState(cdp);
+  await send('pinTab', win, find(state, 'P1').index, true);
+  await send('switchSpace', win, ids.Work);
+  state = await internalsState(cdp);
+  await send('pinTab', win, find(state, 'W1').index, true);
+  state = await internalsState(cdp);
+  check("a pinned tab goes with its space's pinned tabs, after the favorites",
+        find(state, 'W2')?.index === 2 && find(state, 'W1')?.index === 3 && find(state, 'P1')?.index === 4 &&
+        ordered(state), order(state));
+
+  await send('activateTab', win, find(state, 'W1').index);
+  await send('moveSelectedTabs', win, 0);
+  state = await internalsState(cdp);
+  check('a pinned tab dragged over the favorites stays after them',
+        find(state, 'W1')?.index === 2 && ordered(state), order(state));
+
+  // Chromium puts an unpinned tab first among unpinned tabs, the default space's.
+  await send('pinTab', win, find(state, 'W2').index, false);
+  state = await internalsState(cdp);
+  check("an unpinned tab goes first among its space's tabs",
+        find(state, 'W2')?.index === run(state, 'Work')[0] && ordered(state), order(state));
+
+  // Play's tabs are last, so P2 would stay after them.
+  await send('assignTab', win, find(state, 'P2').index, ids.Work);
+  state = await internalsState(cdp);
+  check("a tab moved to another space goes to the end of that space's tabs",
+        find(state, 'P2')?.space === 'Work' && find(state, 'P2')?.index === Math.max(...run(state, 'Work')) &&
+        ordered(state), order(state));
+
+  // The default space's tabs come before Work's, so the pair would end up
+  // after them.
+  await send('splitTabs', win, [find(state, 'W3').index, find(state, 'P2').index]);
+  state = await internalsState(cdp);
+  await send('assignTab', win, find(state, 'W3').index, '');
+  state = await internalsState(cdp);
+  const defaults = run(state, 'default');
+  check('a tab in a split view moves to another space with the other tab, to the end of its tabs',
+        find(state, 'W3')?.space === 'default' && find(state, 'P2')?.space === 'default' &&
+        defaults.slice(-2).join() === [find(state, 'W3')?.index, find(state, 'P2')?.index].sort((a, b) => a - b).join() &&
+        ordered(state), order(state));
+
+  // Pinned, the default space's split becomes two favorites, which Chromium
+  // would put after Work's and Play's pinned tabs.
+  await send('tabMenuCommand', win, find(state, 'W3').index, 'togglePinned');
+  state = await internalsState(cdp);
+  check('a pinned split view of the default space goes with the favorites',
+        find(state, 'W3')?.pinned && find(state, 'P2')?.pinned &&
+        [find(state, 'W3')?.index, find(state, 'P2')?.index].sort().join() === '2,3' && ordered(state),
+        order(state));
+
+  // A tab added to a group joins the group's space.
+  const playTab = tabList(state).find((t) => t.space === 'Play' && !t.pinned);
+  await send('groupTabs', win, [playTab.index]);
+  state = await internalsState(cdp);
+  await send('addToGroup', win, find(state, 'D1').index, playTab.index);
+  state = await internalsState(cdp);
+  const playGroup = tabList(state).find((t) => t.id === playTab.id)?.group;
+  check("a tab added to another space's group joins that space",
+        find(state, 'D1')?.space === 'Play' && find(state, 'D1')?.group === playGroup && ordered(state),
+        order(state));
+
+  await send('groupTabs', win, [find(state, 'W2').index]);
+  state = await internalsState(cdp);
+  await send('moveGroup', win, find(state, 'W2').index, 0);
+  state = await internalsState(cdp);
+  check("a group dragged among another space's tabs stays with its own",
+        find(state, 'W2')?.index === run(state, 'Work')[0] && ordered(state), order(state));
+
+  // Grouping unpins a favorite, which then joins the active space.
+  await send('groupTabs', win, [find(state, 'F2').index, find(state, 'W2').index]);
+  state = await internalsState(cdp);
+  check('a favorite grouped with tabs of the active space joins it',
+        find(state, 'F2')?.space === 'Work' && !find(state, 'F2')?.pinned &&
+        find(state, 'F2')?.group && find(state, 'F2')?.group === find(state, 'W2')?.group && ordered(state),
+        order(state));
+
+  // Reopening a tab puts it back at its old index. With the tab first among
+  // Work's, moving a Play tab to the default space, whose tabs come before
+  // Work's, puts that index among the default space's tabs.
+  const ungrouped = tabList(state).find((t) => t.space === 'Work' && !t.pinned && !t.grouped);
+  await send('moveTab', win, ungrouped.index, run(state, 'Work')[0]);
+  state = await internalsState(cdp);
+  const firstWork = tabList(state).find((t) => t.id === ungrouped.id);
+  await send('closeTab', win, firstWork.index);
+  state = await internalsState(cdp);
+  await send('assignTab', win, tabList(state).find((t) => t.space === 'Play' && !t.pinned).index, '');
+  await send('reopenClosedTab', win);
+  await sleep(500);
+  state = await internalsState(cdp);
+  const reopened = tabList(state).find((t) => t.url === firstWork.url && t.space === 'Work');
+  check("a reopened tab goes back among its space's tabs",
+        reopened && run(state, 'Work').includes(reopened.index) && ordered(state), order(state));
+
+  // Play's pinned tab becomes a favorite, so it moves before Work's pinned tab.
+  await send('removeSpace', ids.Play);
+  state = await internalsState(cdp);
+  check("removing a space puts its tabs with the default space's, and its pinned tabs with the favorites",
+        find(state, 'P1')?.space === 'default' && find(state, 'P1')?.index < find(state, 'W1')?.index &&
+        ordered(state), order(state));
+
+  for (const name of ['W4', 'W5']) await openTestTab(cdp, name);
+  state = await waitForNamedTabs(cdp, ['W4', 'W5']);
+  await send('runCommand', win, 'newWindow');
+  await sleep(500);
+  state = await internalsState(cdp);
+  const win2 = state.windows.find((w) => w.session_id !== win)?.session_id;
+  await send('switchSpace', win2, ids.Work);
+  state = await internalsState(cdp);
+  await send('moveTabToWindow', win, find(state, 'D1').index, win2, 0);
+  state = await internalsState(cdp);
+  check("a tab moved to another window joins that window's space",
+        find(state, 'D1', win2)?.space === 'Work' && find(state, 'D1', win2)?.active && ordered(state),
+        order(state, win2));
+  await send('moveTabToWindow', win, find(state, 'F1').index, win2, 0);
+  state = await internalsState(cdp);
+  check('a favorite moved to another window stays a favorite',
+        find(state, 'F1', win2)?.space === 'default' && find(state, 'F1', win2)?.pinned && ordered(state),
+        order(state, win2));
+  await send('splitTabs', win, [find(state, 'W4').index, find(state, 'W5').index]);
+  state = await internalsState(cdp);
+  await send('moveSplitToWindow', win, find(state, 'W4').index, win2, 0);
+  state = await internalsState(cdp);
+  check("a split view moved to another window joins that window's space",
+        find(state, 'W4', win2)?.space === 'Work' && find(state, 'W5', win2)?.space === 'Work' &&
+        ordered(state), order(state, win2));
+  await send('moveGroupToWindow', win, find(state, 'W2').index, win2, 0);
+  state = await internalsState(cdp);
+  check("a group moved to another window joins that window's space",
+        find(state, 'W2', win2)?.space === 'Work' && find(state, 'F2', win2)?.space === 'Work' &&
+        find(state, 'F2', win2)?.index === run(state, 'Work', win2)[0] && ordered(state),
+        order(state, win2));
+
+  // A split view of a favorite and Work's active tab: the favorite is unpinned
+  // and joins Work, the space of the split's first tab.
+  await send('switchSpace', win, '');
+  await send('runCommand', win, 'newTab');
+  state = await internalsState(cdp);
+  const favorite = active(state);
+  await send('pinTab', win, favorite.index, true);
+  await send('switchSpace', win, ids.Work);
+  await send('runCommand', win, 'newTab');
+  state = await internalsState(cdp);
+  const pivot = active(state);
+  await send('splitTabs', win, [pivot.index, tabList(state).find((t) => t.id === favorite.id).index]);
+  state = await internalsState(cdp);
+  const split = tabList(state).filter((t) => t.id === favorite.id || t.id === pivot.id);
+  check("a favorite split with the active space's tab joins its space",
+        split.length === 2 && split.every((t) => t.space === 'Work' && !t.pinned && t.split) && ordered(state),
+        order(state));
+
+  // Moved to a new window with a favorite, which arrives first, Work's tabs
+  // keep their space.
+  await send('runCommand', win, 'newTab');
+  state = await internalsState(cdp);
+  const workTab = active(state);
+  const fav = tabList(state).find((t) => t.pinned && t.space === 'default');
+  await send('moveTabsToNewWindow', win, [fav.index, workTab.index]);
+  await sleep(500);
+  state = await internalsState(cdp);
+  const win3 = state.windows.find((w) => w.session_id !== win && w.session_id !== win2)?.session_id;
+  const moved = tabList(state, win3);
+  check('tabs moved to a new window with a favorite keep their space',
+        moved.find((t) => t.id === workTab.id)?.space === 'Work' &&
+        moved.find((t) => t.id === fav.id)?.pinned && ordered(state),
+        win3 ? order(state, win3) : 'no new window');
+  await close();
+}
+
+// Keyboard tab moves and Shift-click ranges stay in the active space, and tab
+// menu commands only count its tabs.
+async function checkMovesInSpace() {
+  const profile = newProfile();
+  const { cdp, close } = await launch(profile, ['--enable-features=HeliumSpaces']);
+  let state = await internalsState(cdp);
+  const win = state.windows[0].session_id;
+  const send = (message, ...rest) => internalsSend(cdp, message, rest);
+  const find = (state, name) => tabList(state).find((t) => t.name === name);
+  const order = (state) => tabList(state).map((t) =>
+    `${t.name ?? (t.url.startsWith(INTERNALS) ? 'I' : 'N')}${t.pinned ? '*' : ''}:${t.space}`).join(' ');
+  const ordered = (state) => state.windows.every((w) => w.order_ok && w.order_fixes === 0);
+
+  await send('addSpace', 'Work');
+  await send('addSpace', 'Play');
+  await send('addSpace', 'Solo');
+  for (const name of ['F1', 'D1']) await openTestTab(cdp, name);
+  state = await waitForNamedTabs(cdp, ['F1', 'D1']);
+  const ids = Object.fromEntries(state.spaces.map((s) => [s.name, s.id]));
+  await send('pinTab', win, find(state, 'F1').index, true);
+  await send('switchSpace', win, ids.Play);
+  for (const name of ['P1', 'P2']) await openTestTab(cdp, name);
+  await send('switchSpace', win, ids.Work);
+  for (const name of ['W1', 'W2', 'W3']) await openTestTab(cdp, name);
+  state = await waitForNamedTabs(cdp, ['P1', 'P2', 'W1', 'W2', 'W3']);
+  // Solo gets a New Tab page, after Work's tabs.
+  await send('switchSpace', win, ids.Solo);
+  await send('switchSpace', win, ids.Work);
+  // F1* | I D1 | N P1 P2 | N W1 W2 W3 | N. Group Play's last tabs, so a Work
+  // tab moving left past its run would join a hidden group.
+  await send('groupTabs', win, [find(state, 'P1').index, find(state, 'P2').index]);
+  await send('pinTab', win, find(state, 'W1').index, true);
+  state = await internalsState(cdp);
+  const before = order(state);
+
+  // The first unpinned Work tab, after Play's group.
+  const firstWork = tabList(state).find((t) => t.space === 'Work' && !t.pinned);
+  await send('activateTab', win, firstWork.index);
+  await send('runCommand', win, 'moveTabPrevious');
+  state = await internalsState(cdp);
+  const moved = tabList(state).find((t) => t.id === firstWork.id);
+  check("Ctrl+Shift+PgUp stops at the start of the active space's tabs",
+        moved?.index === firstWork.index && moved?.space === 'Work' && !moved?.grouped && ordered(state),
+        `${before} -> ${order(state)}`);
+
+  // W1 is Work's only pinned tab, after the favorite F1.
+  await send('activateTab', win, find(state, 'W1').index);
+  await send('runCommand', win, 'moveTabPrevious');
+  state = await internalsState(cdp);
+  check("Ctrl+Shift+PgUp doesn't move a space's pinned tab before the favorites",
+        find(state, 'W1')?.index === 1 && ordered(state), order(state));
+
+  await send('activateTab', win, find(state, 'W3').index);
+  await send('runCommand', win, 'moveTabNext');
+  state = await internalsState(cdp);
+  const last = Math.max(...tabList(state).filter((t) => t.space === 'Work').map((t) => t.index));
+  check("Ctrl+Shift+PgDn stops at the end of the active space's tabs",
+        find(state, 'W3')?.index === last && ordered(state), order(state));
+  await send('runCommand', win, 'moveTabPrevious');
+  state = await internalsState(cdp);
+  check('Ctrl+Shift+PgUp still moves a tab within its space',
+        find(state, 'W3')?.index === last - 1 && ordered(state), order(state));
+
+  // From the favorite F1 to W3, past the default and Play tabs.
+  await send('activateTab', win, find(state, 'F1').index);
+  await send('selectRange', win, find(state, 'W3').index, false);
+  state = await internalsState(cdp);
+  const selected = tabList(state).filter((t) => t.selected);
+  check('a Shift-click range skips tabs of other spaces',
+        selected.length > 2 && selected.every((t) => t.in_active_space) &&
+        selected.some((t) => t.name === 'F1') && selected.some((t) => t.name === 'W3'),
+        selected.map((t) => t.name ?? t.url).join());
+  await send('activateTab', win, find(state, 'F1').index);
+  await send('selectRange', win, find(state, 'W2').index, true);
+  state = await internalsState(cdp);
+  const added = tabList(state).filter((t) => t.selected);
+  check('a Cmd+Shift-click range skips tabs of other spaces',
+        added.length > 2 && added.every((t) => t.in_active_space) && added.some((t) => t.name === 'W2'),
+        added.map((t) => t.name ?? t.url).join());
+
+  // "Close tabs to the left" on D1, hidden left of Work's tabs, closes
+  // nothing: only pinned and hidden tabs are to its left.
+  await send('activateTab', win, find(state, 'W2').index);
+  const workCount = tabList(state).filter((t) => t.space === 'Work').length;
+  await send('tabMenuCommand', win, find(state, 'D1').index, 'closeTabsToLeft');
+  state = await internalsState(cdp);
+  check('"Close tabs to the left" on a hidden tab only looks left of it',
+        tabList(state).filter((t) => t.space === 'Work').length === workCount && find(state, 'D1'),
+        order(state));
+
+  // Solo's only tab has no other tab of its space to close.
+  await send('switchSpace', win, ids.Solo);
+  state = await internalsState(cdp);
+  const solo = tabList(state).find((t) => t.space === 'Solo');
+  check('"Close other tabs" is off for the only tab of a space', solo && !solo.close_other_enabled,
+        `enabled: ${solo?.close_other_enabled}`);
+  await close();
+}
+
+// SPACES_SMOKE_ONLY=checkOrder runs one section; SPACES_SMOKE_STDERR=1 shows
+// the browser's stderr.
+const sections = { checkFlagOff, checkDefaultSpace, checkTabSpaces, checkSwitching, checkOrder, checkMovesInSpace };
 try {
-  await checkFlagOff();
-  await checkDefaultSpace();
-  await checkTabSpaces();
-  await checkSwitching();
+  for (const [name, section] of Object.entries(sections)) {
+    if (!process.env.SPACES_SMOKE_ONLY || process.env.SPACES_SMOKE_ONLY === name) await section();
+  }
 } catch (err) {
   check('smoke run', false, err.message);
 } finally {

@@ -8,7 +8,7 @@ enabled.
 
 --- a/chrome/browser/ui/spaces/BUILD.gn
 +++ b/chrome/browser/ui/spaces/BUILD.gn
-@@ -101,6 +101,31 @@ source_set("controller") {
+@@ -109,6 +109,31 @@ source_set("controller") {
    ]
  }
  
@@ -42,7 +42,7 @@ enabled.
  test("spaces_unittests") {
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/spaces_internals_ui.cc
-@@ -0,0 +1,416 @@
+@@ -0,0 +1,756 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -76,14 +76,23 @@ enabled.
 +#include "chrome/browser/ui/spaces/space_registry_factory.h"
 +#include "chrome/browser/ui/spaces/space_tab_helper.h"
 +#include "chrome/browser/ui/spaces/spaces_features.h"
++#include "chrome/browser/ui/tabs/split_tab_metrics.h"
 +#include "chrome/browser/ui/tabs/tab_enums.h"
 +#include "chrome/browser/ui/tabs/tab_strip_model.h"
++#include "components/sessions/content/session_tab_helper.h"
 +#include "components/sessions/core/session_id.h"
++#include "components/split_tabs/split_tab_visual_data.h"
++#include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/page_navigator.h"
 +#include "content/public/browser/web_contents.h"
 +#include "content/public/browser/web_ui.h"
 +#include "content/public/browser/web_ui_data_source.h"
 +#include "content/public/browser/web_ui_message_handler.h"
 +#include "content/public/common/url_constants.h"
++#include "ui/base/page_transition_types.h"
++#include "ui/base/window_open_disposition.h"
++#include "url/gurl.h"
 +
 +namespace spaces {
 +
@@ -108,16 +117,26 @@ enabled.
 +        for (int i = 0; i < tab_strip->count(); ++i) {
 +          content::WebContents* contents = tab_strip->GetWebContentsAt(i);
 +          const base::Uuid space_id = SpaceTabHelper::GetSpaceId(contents);
++          const std::optional<tab_groups::TabGroupId> group =
++              tab_strip->GetTabGroupForTab(i);
 +          tabs.Append(
 +              base::DictValue()
 +                  .Set("index", i)
++                  .Set("id",
++                       sessions::SessionTabHelper::IdForTab(contents).id())
 +                  .Set("url", contents->GetVisibleURL().spec())
 +                  .Set("title", base::UTF16ToUTF8(contents->GetTitle()))
 +                  .Set("active", i == tab_strip->active_index())
 +                  .Set("last_active", contents->GetLastActiveTime()
 +                                          .InMillisecondsFSinceUnixEpoch())
 +                  .Set("pinned", tab_strip->IsTabPinned(i))
-+                  .Set("grouped", tab_strip->GetTabGroupForTab(i).has_value())
++                  .Set("grouped", group.has_value())
++                  .Set("group", group ? group->ToString() : std::string())
++                  .Set("selected", tab_strip->IsTabSelected(i))
++                  .Set("split", tab_strip->GetSplitForTab(i).has_value())
++                  .Set("close_other_enabled",
++                       tab_strip->IsContextMenuCommandEnabled(
++                           i, TabStripModel::CommandCloseOtherTabs))
 +                  .Set("space_id", space_id.is_valid()
 +                                       ? space_id.AsLowercaseString()
 +                                       : std::string())
@@ -131,6 +150,9 @@ enabled.
 +                     controller
 +                         ? controller->active_space_id().AsLowercaseString()
 +                         : std::string())
++                .Set("order_ok", !controller || controller->IsOrderValid())
++                .Set("order_fixes",
++                     controller ? controller->order_fix_count() : 0)
 +                .Set("tabs", std::move(tabs)));
 +        return true;
 +      });
@@ -216,6 +238,48 @@ enabled.
 +    web_ui()->RegisterMessageCallback(
 +        "setLayout", base::BindRepeating(&SpacesInternalsHandler::SetLayout,
 +                                         base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "moveTab", base::BindRepeating(&SpacesInternalsHandler::MoveTab,
++                                       base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "moveTabToWindow",
++        base::BindRepeating(&SpacesInternalsHandler::MoveTabToWindow,
++                            base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "openLink", base::BindRepeating(&SpacesInternalsHandler::OpenLink,
++                                        base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "addToGroup", base::BindRepeating(&SpacesInternalsHandler::AddToGroup,
++                                          base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "selectRange", base::BindRepeating(&SpacesInternalsHandler::SelectRange,
++                                           base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "moveSelectedTabs",
++        base::BindRepeating(&SpacesInternalsHandler::MoveSelectedTabs,
++                            base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "moveGroup", base::BindRepeating(&SpacesInternalsHandler::MoveGroup,
++                                         base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "moveGroupToWindow",
++        base::BindRepeating(&SpacesInternalsHandler::MoveGroupToWindow,
++                            base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "moveTabsToNewWindow",
++        base::BindRepeating(&SpacesInternalsHandler::MoveTabsToNewWindow,
++                            base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "moveSplitToWindow",
++        base::BindRepeating(&SpacesInternalsHandler::MoveSplitToWindow,
++                            base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "splitTabs", base::BindRepeating(&SpacesInternalsHandler::SplitTabs,
++                                         base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "tabMenuCommand",
++        base::BindRepeating(&SpacesInternalsHandler::TabMenuCommand,
++                            base::Unretained(this)));
 +  }
 +
 + private:
@@ -334,6 +398,9 @@ enabled.
 +        {"selectPreviousTab", IDC_SELECT_PREVIOUS_TAB},
 +        {"selectFirstTab", IDC_SELECT_TAB_0},
 +        {"selectLastTab", IDC_SELECT_LAST_TAB},
++        {"moveTabNext", IDC_MOVE_TAB_NEXT},
++        {"moveTabPrevious", IDC_MOVE_TAB_PREVIOUS},
++        {"newWindow", IDC_NEW_WINDOW},
 +    };
 +    std::optional<int> window_id =
 +        args.size() == 2 ? args[0].GetIfInt() : std::nullopt;
@@ -386,6 +453,279 @@ enabled.
 +            browser ? HeliumLayoutStateController::From(browser) : nullptr) {
 +      layout_controller->SetBrowserLayout(
 +          static_cast<HeliumLayoutType>(*layout));
++    }
++  }
++
++  // moveTab(window_session_id, tab_index, to_index), as an extension's
++  // chrome.tabs.move() does.
++  void MoveTab(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 3 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> index =
++        args.size() == 3 ? args[1].GetIfInt() : std::nullopt;
++    std::optional<int> to =
++        args.size() == 3 ? args[2].GetIfInt() : std::nullopt;
++    if (!window_id || !index || !to) {
++      return;
++    }
++    TabStripModel* tab_strip = FindTabStrip(*window_id, *index);
++    if (tab_strip && tab_strip->ContainsIndex(*to)) {
++      tab_strip->MoveWebContentsAt(*index, *to, /*select_after_move=*/false);
++    }
++  }
++
++  // moveTabToWindow(window_session_id, tab_index, target_window_session_id,
++  // target_index): what dropping a dragged tab, or "Move tab to another
++  // window", does. The tab becomes active there.
++  void MoveTabToWindow(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 4 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> index =
++        args.size() == 4 ? args[1].GetIfInt() : std::nullopt;
++    std::optional<int> target_id =
++        args.size() == 4 ? args[2].GetIfInt() : std::nullopt;
++    std::optional<int> target_index =
++        args.size() == 4 ? args[3].GetIfInt() : std::nullopt;
++    if (!window_id || !index || !target_id || !target_index) {
++      return;
++    }
++    TabStripModel* tab_strip = FindTabStrip(*window_id, *index);
++    BrowserWindowInterface* target = FindBrowser(profile_, *target_id);
++    if (!tab_strip || !target || *target_id == *window_id) {
++      return;
++    }
++    const bool pinned = tab_strip->IsTabPinned(*index);
++    std::unique_ptr<tabs::TabModel> tab =
++        tab_strip->DetachTabAtForInsertion(*index);
++    target->GetTabStripModel()->InsertDetachedTabAt(
++        *target_index, std::move(tab),
++        AddTabTypes::ADD_ACTIVE | (pinned ? AddTabTypes::ADD_PINNED : 0));
++  }
++
++  // openLink(window_session_id, url, foreground): the active tab opens `url`
++  // in a new tab, as a link click with Cmd held does.
++  void OpenLink(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 3 ? args[0].GetIfInt() : std::nullopt;
++    const std::string* url = args.size() == 3 ? args[1].GetIfString() : nullptr;
++    std::optional<bool> foreground =
++        args.size() == 3 ? args[2].GetIfBool() : std::nullopt;
++    BrowserWindowInterface* browser =
++        window_id ? FindBrowser(profile_, *window_id) : nullptr;
++    content::WebContents* opener =
++        browser ? browser->GetTabStripModel()->GetActiveWebContents() : nullptr;
++    if (!opener || !url || !foreground) {
++      return;
++    }
++    opener->OpenURL(content::OpenURLParams(
++                        GURL(*url), content::Referrer(),
++                        *foreground ? WindowOpenDisposition::NEW_FOREGROUND_TAB
++                                    : WindowOpenDisposition::NEW_BACKGROUND_TAB,
++                        ui::PAGE_TRANSITION_LINK,
++                        /*is_renderer_initiated=*/false),
++                    {});
++  }
++
++  // addToGroup(window_session_id, tab_index, index_of_a_tab_in_the_group),
++  // as "Add tab to group" or an extension's chrome.tabs.group() does.
++  void AddToGroup(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 3 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> index =
++        args.size() == 3 ? args[1].GetIfInt() : std::nullopt;
++    std::optional<int> group_index =
++        args.size() == 3 ? args[2].GetIfInt() : std::nullopt;
++    if (!window_id || !index || !group_index) {
++      return;
++    }
++    TabStripModel* tab_strip = FindTabStrip(*window_id, *index);
++    const std::optional<tab_groups::TabGroupId> group =
++        tab_strip && tab_strip->ContainsIndex(*group_index)
++            ? tab_strip->GetTabGroupForTab(*group_index)
++            : std::nullopt;
++    if (group) {
++      tab_strip->AddToExistingGroup({*index}, *group);
++    }
++  }
++
++  // selectRange(window_session_id, tab_index, add): Shift-click from the
++  // active tab, or Cmd+Shift-click when `add` is true.
++  void SelectRange(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 3 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> index =
++        args.size() == 3 ? args[1].GetIfInt() : std::nullopt;
++    std::optional<bool> add =
++        args.size() == 3 ? args[2].GetIfBool() : std::nullopt;
++    if (!window_id || !index || !add) {
++      return;
++    }
++    if (TabStripModel* tab_strip = FindTabStrip(*window_id, *index)) {
++      if (*add) {
++        tab_strip->AddSelectionFromAnchorTo(*index);
++      } else {
++        tab_strip->ExtendSelectionTo(*index);
++      }
++    }
++  }
++
++  // moveSelectedTabs(window_session_id, to_index): what a tab drag does with
++  // the selected tabs, outside any group.
++  void MoveSelectedTabs(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 2 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> to =
++        args.size() == 2 ? args[1].GetIfInt() : std::nullopt;
++    if (!window_id || !to) {
++      return;
++    }
++    if (TabStripModel* tab_strip = FindTabStrip(*window_id, *to)) {
++      tab_strip->MoveSelectedTabsTo(*to, std::nullopt);
++    }
++  }
++
++  // moveGroup(window_session_id, index_of_a_tab_in_the_group, to_index): what
++  // dragging a group header does.
++  void MoveGroup(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 3 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> index =
++        args.size() == 3 ? args[1].GetIfInt() : std::nullopt;
++    std::optional<int> to =
++        args.size() == 3 ? args[2].GetIfInt() : std::nullopt;
++    if (!window_id || !index || !to) {
++      return;
++    }
++    TabStripModel* tab_strip = FindTabStrip(*window_id, *index);
++    const std::optional<tab_groups::TabGroupId> group =
++        tab_strip ? tab_strip->GetTabGroupForTab(*index) : std::nullopt;
++    if (group && tab_strip->ContainsIndex(*to)) {
++      tab_strip->MoveGroupTo(*group, *to);
++    }
++  }
++
++  // moveGroupToWindow(window_session_id, index_of_a_tab_in_the_group,
++  // target_window_session_id, target_index): dropping a dragged group header
++  // in another window.
++  void MoveGroupToWindow(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 4 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> index =
++        args.size() == 4 ? args[1].GetIfInt() : std::nullopt;
++    std::optional<int> target_id =
++        args.size() == 4 ? args[2].GetIfInt() : std::nullopt;
++    std::optional<int> target_index =
++        args.size() == 4 ? args[3].GetIfInt() : std::nullopt;
++    if (!window_id || !index || !target_id || !target_index) {
++      return;
++    }
++    TabStripModel* tab_strip = FindTabStrip(*window_id, *index);
++    BrowserWindowInterface* target = FindBrowser(profile_, *target_id);
++    const std::optional<tab_groups::TabGroupId> group =
++        tab_strip ? tab_strip->GetTabGroupForTab(*index) : std::nullopt;
++    if (!group || !target || *target_id == *window_id ||
++        !target->GetTabStripModel()->SupportsTabGroups()) {
++      return;
++    }
++    target->GetTabStripModel()->InsertDetachedTabGroupAt(
++        tab_strip->DetachTabGroupForInsertion(*group), *target_index);
++  }
++
++  // moveTabsToNewWindow(window_session_id, [tab_index, ...]), as the tab
++  // menu's "Move tabs to new window" does.
++  void MoveTabsToNewWindow(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 2 ? args[0].GetIfInt() : std::nullopt;
++    const base::ListValue* list =
++        args.size() == 2 ? args[1].GetIfList() : nullptr;
++    BrowserWindowInterface* browser =
++        window_id ? FindBrowser(profile_, *window_id) : nullptr;
++    if (!browser || !list) {
++      return;
++    }
++    std::vector<int> indices;
++    for (const base::Value& value : *list) {
++      std::optional<int> index = value.GetIfInt();
++      if (!index || !browser->GetTabStripModel()->ContainsIndex(*index)) {
++        return;
++      }
++      indices.push_back(*index);
++    }
++    if (chrome::CanMoveTabsToNewWindow(browser, indices)) {
++      chrome::MoveTabsToNewWindow(browser, indices);
++    }
++  }
++
++  // moveSplitToWindow(window_session_id, index_of_a_tab_in_the_split,
++  // target_window_session_id, target_index): dropping a dragged split view in
++  // another window.
++  void MoveSplitToWindow(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 4 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> index =
++        args.size() == 4 ? args[1].GetIfInt() : std::nullopt;
++    std::optional<int> target_id =
++        args.size() == 4 ? args[2].GetIfInt() : std::nullopt;
++    std::optional<int> target_index =
++        args.size() == 4 ? args[3].GetIfInt() : std::nullopt;
++    if (!window_id || !index || !target_id || !target_index) {
++      return;
++    }
++    TabStripModel* tab_strip = FindTabStrip(*window_id, *index);
++    BrowserWindowInterface* target = FindBrowser(profile_, *target_id);
++    const std::optional<split_tabs::SplitTabId> split =
++        tab_strip ? tab_strip->GetTabAtIndex(*index)->GetSplit() : std::nullopt;
++    if (!split || !target || *target_id == *window_id) {
++      return;
++    }
++    const bool pinned = tab_strip->IsTabPinned(*index);
++    target->GetTabStripModel()->InsertDetachedSplitTabAt(
++        tab_strip->DetachSplitTabForInsertion(*split), *target_index, pinned);
++  }
++
++  // splitTabs(window_session_id, [tab_index, tab_index]): a split view.
++  void SplitTabs(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 2 ? args[0].GetIfInt() : std::nullopt;
++    const base::ListValue* list =
++        args.size() == 2 ? args[1].GetIfList() : nullptr;
++    BrowserWindowInterface* browser =
++        window_id ? FindBrowser(profile_, *window_id) : nullptr;
++    if (!browser || !list || list->size() != 2) {
++      return;
++    }
++    std::vector<int> indices;
++    for (const base::Value& value : *list) {
++      std::optional<int> index = value.GetIfInt();
++      if (!index || !browser->GetTabStripModel()->ContainsIndex(*index)) {
++        return;
++      }
++      indices.push_back(*index);
++    }
++    browser->GetTabStripModel()->AddToNewSplit(
++        indices, split_tabs::SplitTabVisualData(),
++        split_tabs::SplitTabCreatedSource::kTabContextMenu);
++  }
++
++  // tabMenuCommand(window_session_id, tab_index, name): a tab context menu
++  // command on the tab at `tab_index`.
++  void TabMenuCommand(const base::ListValue& args) {
++    static const std::map<std::string, TabStripModel::ContextMenuCommand>
++        kCommands = {
++            {"closeTabsToLeft", TabStripModel::CommandCloseTabsToLeft},
++            {"togglePinned", TabStripModel::CommandTogglePinned},
++        };
++    std::optional<int> window_id =
++        args.size() == 3 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> index =
++        args.size() == 3 ? args[1].GetIfInt() : std::nullopt;
++    const std::string* name =
++        args.size() == 3 ? args[2].GetIfString() : nullptr;
++    if (!window_id || !index || !name || !kCommands.contains(*name)) {
++      return;
++    }
++    if (TabStripModel* tab_strip = FindTabStrip(*window_id, *index)) {
++      tab_strip->ExecuteContextMenuCommand(*index, kCommands.at(*name));
 +    }
 +  }
 +

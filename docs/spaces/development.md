@@ -199,9 +199,16 @@ binary.
 
 ```bash
 node --experimental-websocket devutils/spaces_smoke.mjs
+# One section, with the browser's stderr (FATAL check failures land there):
+SPACES_SMOKE_ONLY=checkOrder SPACES_SMOKE_STDERR=1 node --experimental-websocket devutils/spaces_smoke.mjs
 ```
 
 The flag is only needed on Node 20 and 21; Node 22+ has WebSocket built in.
+
+Tab order checks don't just look at where a tab ends up. `SpaceController`
+fixes a broken order in a posted task, so by the time the page reloads the
+order may look right. `chrome://spaces-internals` reports each window's
+`order_fixes`, and every order check fails if it went up.
 
 Headless mode draws no tab strip, so `devutils/spaces_screenshots.mjs` opens a
 real window instead, builds a fixture of favorites, space-pinned tabs and a
