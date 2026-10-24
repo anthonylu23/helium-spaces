@@ -3,8 +3,9 @@
 **Current phase: 3 (Spaces v1). Steps 1 and 2 committed on branch
 `spaces/registry`. Step 3a (`SpaceController`, model and command hooks)
 pushed on branch `spaces/controller`. Step 3b (hiding tabs in the tab
-strip views) visually checked in all four layouts and pushed there too; next
-is 3c. Step 0 spike: code review and
+strip views) visually checked in all four layouts and pushed there too.
+Step 3c (tab order, keyboard moves, ranges, drag) built and checked
+headless on branch `spaces/order`; its drag check by hand is open. Step 0 spike: code review and
 computer-use checks support option C; actual dragging and human animation
 review remain open.**
 
@@ -18,7 +19,7 @@ Last updated 2026-10-23. Deferred work and deliberate decisions are in
 | Helium | 0.20.1.1 (core `f29a2596`, macOS `9aa975a`) |
 | Chromium | 156.0.8078.47 |
 | Machine | M3 Pro, 11 cores, 18 GB RAM, Xcode 26.2 (upstream CI uses 26.5) |
-| Our patches | 7, in `patches/spaces/` |
+| Our patches | 9, in `patches/spaces/` |
 
 ## Measured build costs
 
@@ -112,8 +113,44 @@ Last updated 2026-10-23. Deferred work and deliberate decisions are in
           design. Open: a hover card already showing for a tab fades out over
           the new space instead of vanishing, and keyboard focus on hidden
           tabs is untested; both are in `deferred.md`.
-       c. Range selection, keyboard tab moves, drag targets and the
-          contiguity rule.
+       c. Built: `spaces/core/keep-space-tabs-together.patch` and
+          `spaces/ui/keep-tab-moves-in-active-space.patch`. Each space's
+          tabs stay together in the tab strip: pinned and unpinned apart,
+          favorites first (`space_order.h`, unit tested).
+          - `TabStripModel` asks `SpaceController` where tabs may go,
+            next to its pinned clamps: inserts, moves, drops, pinning,
+            new groups.
+          - New tabs go at the end of the active space's tabs. A tab moved
+            to another space goes to the end of that space's tabs, and a
+            split view moves as a pair.
+          - A tab dropped into another window joins the space it shows,
+            as in Arc. Unpinning or grouping a favorite moves it to the
+            active space, and a tab added to a group joins the group's
+            space.
+          - Shift-click ranges and keyboard moves skip other spaces' tabs,
+            and never join a hidden group.
+          - A broken order is fixed in a posted task and counted; the
+            smoke test fails on the count.
+          - Split views stay in one space, and a dragged tab put back in
+            its window keeps its space.
+          - Every model and controller hook, and three from step 3a, fail
+            a smoke check when removed. The view hooks (keyboard moves of
+            a focused tab, a dragged tab's group, the drag start and end)
+            need the drag check by hand.
+          - A review workflow (3 reviewers, adversarial verify) confirmed 7
+            findings, 5 distinct, all fixed: a crash when a dragged tab
+            came back into a window's strip, split views spanning two
+            spaces, a favorite moved to a new window taking the other tabs
+            to the default space, a dragged pinned tab becoming a favorite
+            after hovering another window, and a space id saved under the
+            wrong window.
+          - Codex's pointer-drag check (`checks/step-3c-drag-check.md`,
+            2026-10-23) passed 13 of 16 items in all layouts tried,
+            including the crash regression, with the order valid and never
+            fixed in all 62 captured states. It found that dragging a group
+            to another window switched the source window to the space of
+            the tab after the group; fixed, and Codex's recheck passed. Keyboard
+            focus on tabs and drag smoothness stay unverified.
     4. Switcher strip, keyboard switching, tab context menu.
 3. Consider Xcode 26.5 to match upstream CI before the first rebase.
 
@@ -130,8 +167,15 @@ Automated (`devutils/spaces_smoke.mjs`):
   joining the active space, Ctrl+Tab, Cmd+1/Cmd+9, favorites, "Close other
   tabs", closing a space's last tab, activating a tab elsewhere, removing the
   active space, and the active space after a restart with a favorite active.
+- Tab order: new tabs, links from a favorite, extension moves, drops,
+  pinning and unpinning, pinned split views, moving tabs and split views to
+  another space, groups, reopened tabs, removing a space, and tabs, split
+  views and groups moved to another window.
+- Keyboard moves at the ends of a space's tabs, Shift-click ranges, "Close
+  tabs to the left" on a hidden tab, and "Close other tabs" in a space with
+  one tab.
 
-Unit (`spaces_unittests`): 12 `SpaceList` tests.
+Unit (`spaces_unittests`): 12 `SpaceList` tests, 11 `SpaceOrder` tests.
 
 Manual, until automated:
 

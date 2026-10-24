@@ -35,9 +35,17 @@ model, so session restore, drag and drop, and tab commands keep working.
   has one permanent default space with a fixed id; a tab with no space id
   belongs to it. Pinned with no space id = a favorite, shown in every space.
 - Tab groups work inside a space, as in Arc. Spaces are not tab groups.
-- Each space's tabs stay together in the underlying TabStripModel order. New
-  tabs go at the end of the active space; dragging a tab across that boundary
-  changes its space.
+- Each space's tabs stay together in the underlying TabStripModel order:
+  its pinned tabs in one run, its other tabs in another, with favorites before
+  every space's pinned tabs. New tabs go at the end of the active space's tabs.
+  Moves, extensions' included, stay inside the tab's space; changing space is
+  explicit (the tab menu, or dropping a tab on a switcher icon).
+- A tab dropped into another window joins the space that window shows, as in
+  Arc. Favorites stay favorites. Once spaces can have their own logins, Arc's
+  warning ("you could be logged out") applies when the two spaces' logins
+  differ.
+- Unpinning a favorite moves it to the active space, as in Arc. A tab added to
+  a tab group joins the group's space.
 - Spaces must work in every Helium layout: Classic, Compact, Vertical, Dynamic.
   The sidebar is the main UI, but filtering and switching apply in all of them.
 - Off for incognito and guest profiles.
