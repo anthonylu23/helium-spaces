@@ -8,7 +8,12 @@ Step 3c (tab order, keyboard moves, ranges, drag) pushed on branch
 `spaces/order`. Step 4 (switcher, shortcuts, tab menu) built, checked headless and checked
 by hand on branch `spaces/switcher`.
 Step 0 spike: code review and computer-use checks support option C; human
-animation review remains open.**
+animation review remains open.
+Phase 5 isolation spike: prototype built on `spaces/isolation-spike`, its
+scripted experiments pass and most hands-on ones too; notifications fail in
+an isolated space. Gate 2 waits on the experiments that need an unlocked
+screen and real accounts. The dev build's
+GPU process hangs at launch: run it with `--in-process-gpu` for now.**
 
 Last updated 2026-10-26. Deferred work and deliberate decisions are in
 `deferred.md`.
@@ -19,8 +24,8 @@ Last updated 2026-10-26. Deferred work and deliberate decisions are in
 | --- | --- |
 | Helium | 0.20.1.1 (core `f29a2596`, macOS `9aa975a`) |
 | Chromium | 156.0.8078.47 |
-| Machine | M3 Pro, 11 cores, 18 GB RAM, Xcode 26.2 (upstream CI uses 26.5) |
-| Our patches | 13, in `patches/spaces/` |
+| Machine | M3 Pro, 11 cores, 18 GB RAM, Xcode 26.5 (as upstream CI), selected by `spaces-dev.sh` |
+| Our patches | 13, in `patches/spaces/`, plus the isolation prototype on `spaces/isolation-spike` |
 
 ## Measured build costs
 
@@ -214,10 +219,31 @@ Last updated 2026-10-26. Deferred work and deliberate decisions are in
    holds up in daily use, and the step 0 spike's animation review by eye.
 4. Phase 5's isolation spike comes before Phase 4's polish (decided
    2026-10-24): it is the biggest unknown and can change the design, while
-   the polish items wait safely in `deferred.md`.
-5. Xcode 26.5 to match upstream CI before the first rebase. On 2026-10-24
-   the Command Line Tools were updated (macOS 27.0 SDK), but `Xcode.app` is
-   still 26.2, which is what the build uses.
+   the polish items wait safely in `deferred.md`. Plan, from a read of the
+   source: `spikes/space-isolation.md`. On 2026-10-25 the four-hook
+   prototype built and passed every scripted experiment (E1, E2, E4, and
+   the scripted part of E3); the session cookie is lost at a restart, as
+   expected without the v1 hook. Codex's hands-on run, over DevTools with
+   the screen locked, passed accounts, popups, downloads, the content
+   blocker, extension scripts and tabs, PiP and internal pages. It found
+   that notifications are denied in an isolated space (a Chromium
+   permission check, fixable with a hook) and confirmed the expected gaps:
+   `chrome.cookies` is blind to a space, and discard loses the partition.
+   Left before Gate 2: link clicks, password prompts and the DevTools panels
+   with the screen unlocked, and real accounts (the user).
+5. Done (2026-10-24): builds use Xcode 26.5, as upstream CI does. It is
+   installed as `/Applications/Xcode-26.5.0.app` next to the system Xcode
+   (27.1), and `spaces-dev.sh` selects it through `DEVELOPER_DIR` without
+   changing `xcode-select`.
+6. Fix the dev build's GPU process, which hangs at launch (found
+   2026-10-25 in the first Xcode 26.5 build). It sits in `open()` while
+   `dyld` loads its first library, the renderers wait for a GPU channel, and
+   so any page that needs a new renderer process never loads, headless or
+   not. The renderer and utility processes, launched from the same helper
+   binary, start fine, and release Helium is unaffected. `--in-process-gpu`
+   works around it; the smoke test's isolation section uses it. Before the
+   Xcode switch nothing needed a new renderer headless, so whether the old
+   build had it is unknown.
 
 ## Smoke checklist
 
@@ -247,6 +273,10 @@ Automated (`devutils/spaces_smoke.mjs`):
 - Gate 1: three spaces of ten tabs each, with a favorite, space-pinned tabs
   (the default space's too) and groups, keep their space, pin, group and order through two restarts,
   and the window comes back in its space on its active tab.
+- Isolation spike (`spaces/isolation-spike` only): an isolated space's new
+  tabs, cross-site redirects, popups with and without opener and
+  `target=_blank` links stay in its partition with its cookies, apart from
+  the default space's both ways; restored and reopened tabs come back in it.
 
 Unit (`spaces_unittests`): 14 `SpaceList` tests, 11 `SpaceOrder` tests.
 

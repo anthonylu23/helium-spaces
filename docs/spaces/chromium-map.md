@@ -59,6 +59,13 @@ New files we add (under `chrome/browser/ui/spaces/` and
 | `chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc`, `.h` | `spaces/ui/drop-tabs-on-space-switcher.patch` | Include; `GetTabDragTarget()` override returns the `SpaceSwitcherDropTarget` over a space's icon, else the base class's; drop target created next to the switcher; member | 156.0.8078.47 |
 | `chrome/browser/ui/BUILD.gn` | `spaces/ui/drop-tabs-on-space-switcher.patch` | `views/spaces/space_switcher_drop_target.*` in the views sources of `ui` | 156.0.8078.47 |
 | `chrome/browser/ui/views/tabs/hovercard/tab_hover_card_controller.cc`, `.h` | `spaces/ui/hide-tabs-outside-active-space.patch` | `HideHoverCardImmediately()`: closes the card without the fade-out | 156.0.8078.47 |
+| `chrome/browser/ui/navigator/browser_navigator.cc` | `spaces/core/isolate-space-storage.patch` (spike branch) | Include; in `CreateTargetContents()`, a tab with no opener takes `spaces::GetSiteInstanceForNewTab()` when the window's active space has its own partition | 156.0.8078.47 |
+| `chrome/browser/ui/navigator/BUILD.gn` | `spaces/core/isolate-space-storage.patch` (spike branch) | Dep on `//chrome/browser/ui/spaces:partition` in `impl`, non-Android block | 156.0.8078.47 |
+| `content/browser/web_contents/web_contents_impl.cc` | `spaces/core/isolate-space-storage.patch` (spike branch) | In `CreateNewWindow()`, a noopener window from a SiteInstance fixed to a partition gets `CreateForFixedStoragePartition()` in it, next to the guest case. Our only `content/` hook | 156.0.8078.47 |
+| `chrome/browser/ui/browser_tabrestore.cc` | `spaces/core/isolate-space-storage.patch` (spike branch) | Include; `create_params.site_instance` from `GetSiteInstanceForRestoredTab()` in `CreateRestoredTab()` | 156.0.8078.47 |
+| `chrome/browser/ui/BUILD.gn` | `spaces/core/isolate-space-storage.patch` (spike branch) | Dep on `//chrome/browser/ui/spaces:partition` in `browser_tabrestore_impl` | 156.0.8078.47 |
+| `chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.cc` | `spaces/core/isolate-space-storage.patch` (spike branch) | Include; `IsPrerender2Supported()` refuses prerender for a tab in a space's partition | 156.0.8078.47 |
+| `chrome/browser/ui/browser_web_contents_delegate/BUILD.gn` | `spaces/core/isolate-space-storage.patch` (spike branch) | Dep on `//chrome/browser/ui/spaces:partition` | 156.0.8078.47 |
 | `chrome/browser/ui/webui/BUILD.gn` | `spaces/tooling/add-spaces-internals.patch` | Dep on `//chrome/browser/ui/spaces:internals` in `configs`, `enable_session_service` block | 156.0.8078.47 |
 | `chrome/browser/ui/webui/chrome_web_ui_configs.cc` | `spaces/tooling/add-spaces-internals.patch` | Include and `AddWebUIConfig()` for `SpacesInternalsUIConfig`, `ENABLE_SESSION_SERVICE` block | 156.0.8078.47 |
 | `tools/typescript/validate_tsconfig.py` | `spaces/tooling/ts-ignore-out-of-tree-definitions.patch` | Skip `.d.ts` files outside the source tree in the undeclared-deps check | 156.0.8078.47 |
@@ -68,11 +75,11 @@ New files we add (under `chrome/browser/ui/spaces/` and
 | File | Feature | Hook |
 | --- | --- | --- |
 | `chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc` | Spaces | Favorites grid; route scroll to the swipe handler (phase 4), next to tab group focus mode's `VerticalTabStripFocusSwipeController`, which also takes horizontal swipes |
-| `chrome/browser/ui/browser_tabstrip.cc` and tab creation path | Isolation | Isolated spaces pass a SiteInstance. (New tabs join the active space from `SpaceController`, with no hook) |
 | `chrome/browser/ui/tabs/tab_menu_model.cc` | Folders | Add to folder |
 | `chrome/browser/prefs/browser_prefs.cc` | Archive | Register prefs, only if a pref can't be registered by its service factory. Spaces prefs are registered by `SpaceRegistryFactory` |
 | `chrome/browser/ui/webui/tab_search/` | Tab Search | Space column and filter |
-| `chrome/browser/chrome_content_browser_client.cc` | Isolation | Only if the spike shows a site-to-partition override is needed |
+| `chrome/browser/chrome_content_browser_client.cc` | Isolation | Probably not needed: a fixed SiteInstance carries its partition, so `GetStoragePartitionConfigForSite()` isn't asked (`spikes/space-isolation.md`) |
+| `tab_lifecycle_unit.cc`, `profile_network_context_service.cc`, `garbage_collect_storage_partitions_command.cc` | Isolation v1 | Discard, session cookies and partition GC, if the spike passes (`spikes/space-isolation.md`) |
 
 ## Helium patches we depend on
 
