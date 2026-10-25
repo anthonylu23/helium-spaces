@@ -91,8 +91,14 @@ bookmarks, history, passwords, extensions, settings.
   must answer: do uBlock filters apply, do content scripts inject, which jar
   does `chrome.cookies` see, does password fill work, do downloads/PiP/DevTools
   work. Fallback: ship isolation as an advanced setting with a warning.
+  Gate 2 (2026-10-25) chose the fallback: notifications, push and
+  `chrome.cookies` don't work in an isolated space
+  (`spikes/space-isolation.md`).
 - True profile-per-space is a stretch goal, out of scope until partitions ship,
-  but a wanted future feature. A Browser has exactly one Profile, so it likely
+  but a wanted future feature, with its own spike after Phase 5. It doesn't
+  replace partitions: a partition keeps history, passwords and extensions
+  shared, a profile separates everything and makes notifications and
+  extensions work. A Browser has exactly one Profile, so it likely
   means swapping windows on switch. Keep it open: isolation is an enum, space
   ids are globally unique, and the switcher reads spaces through an interface
   rather than straight from the window's profile.

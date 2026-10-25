@@ -11,8 +11,8 @@ Step 0 spike: code review and computer-use checks support option C; human
 animation review remains open.
 Phase 5 isolation spike: prototype built on `spaces/isolation-spike`, its
 scripted experiments pass and most hands-on ones too; notifications fail in
-an isolated space. Gate 2 waits on the experiments that need an unlocked
-screen and real accounts. The dev build's
+an isolated space. Gate 2 decided: ship behind a warning, provisional on the
+experiments that need an unlocked screen and real accounts. The dev build's
 GPU process hangs at launch: run it with `--in-process-gpu` for now.**
 
 Last updated 2026-10-26. Deferred work and deliberate decisions are in
@@ -229,8 +229,11 @@ Last updated 2026-10-26. Deferred work and deliberate decisions are in
    that notifications are denied in an isolated space (a Chromium
    permission check, fixable with a hook) and confirmed the expected gaps:
    `chrome.cookies` is blind to a space, and discard loses the partition.
-   Left before Gate 2: link clicks, password prompts and the DevTools panels
-   with the screen unlocked, and real accounts (the user).
+   Gate 2 (2026-10-25): ship behind a warning, as an advanced per-space
+   setting; no notification hook, since per-space profiles will fix
+   notifications and push. Provisional on link clicks, password prompts
+   and the DevTools panels with the screen unlocked, and real accounts (the
+   user). Then isolation v1's hooks (`deferred.md`) and the setting's UI.
 5. Done (2026-10-24): builds use Xcode 26.5, as upstream CI does. It is
    installed as `/Applications/Xcode-26.5.0.app` next to the system Xcode
    (27.1), and `spaces-dev.sh` selects it through `DEVELOPER_DIR` without
@@ -244,6 +247,8 @@ Last updated 2026-10-26. Deferred work and deliberate decisions are in
    works around it; the smoke test's isolation section uses it. Before the
    Xcode switch nothing needed a new renderer headless, so whether the old
    build had it is unknown.
+7. After Phase 5: a spike on per-space profiles (`deferred.md`), which
+   come in addition to partitions, not instead of them.
 
 ## Smoke checklist
 

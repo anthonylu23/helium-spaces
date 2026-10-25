@@ -7,9 +7,10 @@ warning, or drop.
 
 Status (2026-10-25): the prototype (`spaces/core/isolate-space-storage.patch`
 on branch `spaces/isolation-spike`) is built. The scripted experiments pass,
-and Codex ran most of the hands-on ones; see Results. Left: the experiments
-that need an unlocked screen (E3 clicks, E10, E13), real accounts (E5, the
-user), and the Gate 2 decision.
+and Codex ran most of the hands-on ones; see Results. Gate 2 decided
+(2026-10-25): ship behind a warning, if the experiments that need an
+unlocked screen (E3 clicks, E10, E13) and real accounts (E5, the user) don't
+turn up a reason to drop.
 Paths are under `build/src` at Chromium 156.0.8078.47. [V] = read in the
 source, [I] = inferred, to be settled by an experiment.
 
@@ -191,6 +192,35 @@ routing changed.
   so, as the spec's fallback.
 - **Drop**: logins leak between spaces through a path no hook can close, or
   core features (passwords, downloads, uBlock) break.
+
+### Decision (2026-10-25): ship behind a warning
+
+Logins, popups, downloads, the content blocker and extension scripts work
+per space, and nothing crashed, so not drop. Not plain ship either: push
+doesn't work, and `chrome.cookies` can't see a space's jar (E8, E14, E15).
+Isolation ships as an advanced per-space setting, off by default, whose
+description says notifications, push and cookie extensions don't work in
+the space. Provisional on E3, E10 and E13 with an unlocked screen and the
+user's real accounts (E5): a password manager that can't fill in an
+isolated space would still mean drop.
+
+- **No notification hook.** It would fix notifications but not push, and
+  per-space profiles fix both. Not worth a hook in the permission code
+  before then.
+- **Partitions stay when profiles come.** The spec's `isolation` enum has
+  room for both. A space with its own partition shares history, passwords,
+  bookmarks and extensions with the profile and keeps separate logins, which
+  profiles can't do; a space with its own profile gets everything that
+  breaks here. Arc has only profiles, so partitions are an addition to
+  Arc's behavior, not a change to it. Most of the work so far (a tab's
+  space through restore, the new tab and popup hooks, the isolation
+  setting) serves both; only `space_partition.cc` and its four hooks are
+  partition-only.
+- **Per-space profiles get their own spike after Phase 5.** The open
+  question is that a Browser has exactly one Profile, so a window can't
+  show spaces from two profiles without swapping windows or something
+  heavier. Skipping partitions to answer that first would hold up Phase 5
+  on an untested design.
 
 Open risks: internal pages and extension pages inside a fixed partition
 (E20), and Helium's own ways of creating tabs that skip `Navigate()`. Our
