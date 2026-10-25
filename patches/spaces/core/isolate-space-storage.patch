@@ -1,0 +1,309 @@
+--- a/chrome/browser/ui/BUILD.gn
++++ b/chrome/browser/ui/BUILD.gn
+@@ -478,6 +478,7 @@ if (!is_android) {
+       "//chrome/browser/sessions",
+       "//chrome/browser/ui/browser_window",
+       "//chrome/browser/ui/send_tab_to_self",
++      "//chrome/browser/ui/spaces:partition",
+       "//chrome/browser/ui/spaces:tab_space",
+       "//chrome/browser/ui/tabs:tab_enums",
+       "//chrome/browser/ui/tabs:tab_group",
+--- a/chrome/browser/ui/browser_tabrestore.cc
++++ b/chrome/browser/ui/browser_tabrestore.cc
+@@ -42,6 +42,7 @@
+ #include "ui/gfx/range/range.h"
+ 
+ // helium-spaces
++#include "chrome/browser/ui/spaces/space_partition.h"
+ #include "chrome/browser/ui/spaces/space_tab_helper.h"
+ 
+ using content::NavigationEntry;
+@@ -75,6 +76,9 @@ std::unique_ptr<WebContents> CreateResto
+       content::CreateMapWithDefaultSessionStorageNamespace(
+           browser->GetProfile(), session_storage_namespace);
+   WebContents::CreateParams create_params(browser->GetProfile());
++  // A tab of a space with its own storage is restored into its partition.
++  create_params.site_instance =
++      spaces::GetSiteInstanceForRestoredTab(browser->GetProfile(), extra_data);
+   create_params.initially_hidden = initially_hidden;
+   create_params.desired_renderer_state =
+       WebContents::CreateParams::kNoRendererProcess;
+--- a/chrome/browser/ui/browser_web_contents_delegate/BUILD.gn
++++ b/chrome/browser/ui/browser_web_contents_delegate/BUILD.gn
+@@ -34,6 +34,7 @@ if (!is_android) {
+       "//chrome/browser/ui/browser_ui_controller",
+       "//chrome/browser/ui/exclusive_access",
+       "//chrome/browser/ui/location_bar",
++      "//chrome/browser/ui/spaces:partition",
+       "//chrome/browser/ui/views:status_bubble",
+       "//chrome/browser/ui/views/frame:browser_view_header",
+       "//chrome/browser/ui/views/frame:contents_web_view",
+--- a/chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.cc
++++ b/chrome/browser/ui/browser_web_contents_delegate/browser_web_contents_delegate.cc
+@@ -44,6 +44,7 @@
+ #include "chrome/browser/ui/location_bar/location_bar.h"
+ #include "chrome/browser/ui/navigator/browser_navigator.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
++#include "chrome/browser/ui/spaces/space_partition.h"
+ #include "chrome/browser/ui/tab_dialogs.h"
+ #include "chrome/browser/ui/tab_modal_confirm_dialog.h"
+ #include "chrome/browser/ui/tabs/tab_enums.h"
+@@ -516,6 +517,10 @@ content::PreloadingEligibility
+ BrowserWebContentsDelegate::IsPrerender2Supported(
+     content::WebContents& web_contents,
+     content::PreloadingTriggerType trigger_type) {
++  // A prerendered page would start in the default partition, not the space's.
++  if (spaces::IsInSpacePartition(web_contents)) {
++    return content::PreloadingEligibility::kPreloadingUnsupportedByWebContents;
++  }
+   Profile* profile =
+       Profile::FromBrowserContext(web_contents.GetBrowserContext());
+   return prefetch::IsSomePreloadingEnabled(*profile->GetPrefs());
+--- a/chrome/browser/ui/navigator/BUILD.gn
++++ b/chrome/browser/ui/navigator/BUILD.gn
+@@ -93,6 +93,7 @@ source_set("impl") {
+       "//chrome/browser/ui/browser_ui_controller",
+       "//chrome/browser/ui/browser_window",
+       "//chrome/browser/ui/location_bar",
++      "//chrome/browser/ui/spaces:partition",
+       "//chrome/browser/ui/tabs:tab_strip",
+       "//chrome/browser/ui/web_applications",
+       "//chrome/browser/ui/web_applications:launch_utils",
+--- a/chrome/browser/ui/navigator/browser_navigator.cc
++++ b/chrome/browser/ui/navigator/browser_navigator.cc
+@@ -40,6 +40,7 @@
+ #include "chrome/browser/ui/navigator/browser_navigator_params.h"
+ #include "chrome/browser/ui/navigator/browser_navigator_params_utils.h"
+ #include "chrome/browser/ui/singleton_tabs.h"
++#include "chrome/browser/ui/spaces/space_partition.h"
+ #include "chrome/browser/ui/status_bubble.h"
+ #include "chrome/browser/ui/tab_helpers.h"
+ #include "chrome/browser/ui/tabs/split_tab_metrics.h"
+@@ -573,6 +574,13 @@ std::unique_ptr<content::WebContents> Cr
+       params.opener ? params.opener->GetSiteInstance()
+                     : tab_util::GetSiteInstanceForNewTab(
+                           params.browser->GetProfile(), url);
++  // A new tab of a space with its own storage starts in its partition.
++  if (!params.opener) {
++    if (scoped_refptr<content::SiteInstance> space_site_instance =
++            spaces::GetSiteInstanceForNewTab(params.browser)) {
++      initial_site_instance_for_new_contents = std::move(space_site_instance);
++    }
++  }
+ 
+   WebContents::CreateParams create_params(
+       params.browser->GetProfile(), initial_site_instance_for_new_contents);
+--- a/chrome/browser/ui/spaces/BUILD.gn
++++ b/chrome/browser/ui/spaces/BUILD.gn
+@@ -109,6 +109,28 @@ source_set("controller") {
+   ]
+ }
+ 
++# Per-space storage partitions: which partition a new or restored tab of a
++# space starts in.
++source_set("partition") {
++  sources = [
++    "space_partition.cc",
++    "space_partition.h",
++  ]
++  public_deps = [
++    "//base",
++    "//content/public/browser",
++  ]
++  deps = [
++    ":controller",
++    ":features",
++    ":spaces",
++    ":tab_space",
++    "//chrome/browser/profiles:profile",
++    "//chrome/browser/ui/browser_window",
++    "//url",
++  ]
++}
++
+ # Spaces items of the tab context menu.
+ source_set("menu") {
+   sources = [
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_partition.cc
+@@ -0,0 +1,109 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/spaces/space_partition.h"
++
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/spaces/space.h"
++#include "chrome/browser/ui/spaces/space_controller.h"
++#include "chrome/browser/ui/spaces/space_registry.h"
++#include "chrome/browser/ui/spaces/space_registry_factory.h"
++#include "chrome/browser/ui/spaces/space_tab_helper.h"
++#include "chrome/browser/ui/spaces/spaces_features.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/site_instance.h"
++#include "content/public/browser/storage_partition.h"
++#include "content/public/browser/web_contents.h"
++#include "url/gurl.h"
++
++namespace spaces {
++
++namespace {
++
++// Each space gets its own partition domain, so that one space's storage can
++// be deleted as a whole. A domain may only hold [a-z], so the id's hex digits
++// are spelled with the letters a to p.
++constexpr char kPartitionDomainPrefix[] = "heliumspace";
++
++std::string PartitionDomain(const base::Uuid& space_id) {
++  std::string domain = kPartitionDomainPrefix;
++  for (char c : space_id.AsLowercaseString()) {
++    if (c >= '0' && c <= '9') {
++      domain += static_cast<char>('a' + (c - '0'));
++    } else if (c >= 'a' && c <= 'f') {
++      domain += static_cast<char>('a' + 10 + (c - 'a'));
++    }
++  }
++  return domain;
++}
++
++scoped_refptr<content::SiteInstance> SiteInstanceForSpace(
++    Profile* profile,
++    const base::Uuid& space_id) {
++  std::optional<content::StoragePartitionConfig> config =
++      GetPartitionConfig(profile, space_id);
++  if (!config) {
++    return nullptr;
++  }
++  return content::SiteInstance::CreateForFixedStoragePartition(profile, GURL(),
++                                                               *config);
++}
++
++}  // namespace
++
++std::optional<content::StoragePartitionConfig> GetPartitionConfig(
++    Profile* profile,
++    const base::Uuid& space_id) {
++  if (!features::IsSpacesEnabled()) {
++    return std::nullopt;
++  }
++  SpaceRegistry* registry = SpaceRegistryFactory::GetForProfile(profile);
++  if (!registry) {
++    return std::nullopt;
++  }
++  // An unknown id is the default space's, as everywhere else.
++  const Space* space =
++      space_id.is_valid() ? registry->GetSpace(space_id) : nullptr;
++  if (!space) {
++    space = &registry->GetDefaultSpace();
++  }
++  if (space->isolation != SpaceIsolation::kPartition) {
++    return std::nullopt;
++  }
++  return content::StoragePartitionConfig::Create(
++      profile, PartitionDomain(space->id), space->partition,
++      /*in_memory=*/profile->IsOffTheRecord());
++}
++
++scoped_refptr<content::SiteInstance> GetSiteInstanceForNewTab(
++    BrowserWindowInterface* browser) {
++  // New tabs always join the window's active space.
++  SpaceController* controller =
++      browser ? SpaceController::From(browser) : nullptr;
++  if (!controller) {
++    return nullptr;
++  }
++  return SiteInstanceForSpace(browser->GetProfile(),
++                              controller->active_space_id());
++}
++
++scoped_refptr<content::SiteInstance> GetSiteInstanceForRestoredTab(
++    Profile* profile,
++    const std::map<std::string, std::string>& extra_data) {
++  auto it = extra_data.find(kSpaceIdExtraDataKey);
++  return SiteInstanceForSpace(
++      profile, it != extra_data.end() ? base::Uuid::ParseLowercase(it->second)
++                                      : base::Uuid());
++}
++
++bool IsInSpacePartition(content::WebContents& contents) {
++  return contents.GetPrimaryMainFrame()
++      ->GetStoragePartition()
++      ->GetConfig()
++      .partition_domain()
++      .starts_with(kPartitionDomainPrefix);
++}
++
++}  // namespace spaces
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_partition.h
+@@ -0,0 +1,54 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_SPACES_SPACE_PARTITION_H_
++#define CHROME_BROWSER_UI_SPACES_SPACE_PARTITION_H_
++
++#include <map>
++#include <optional>
++#include <string>
++
++#include "base/memory/scoped_refptr.h"
++#include "base/uuid.h"
++#include "content/public/browser/storage_partition_config.h"
++
++class BrowserWindowInterface;
++class Profile;
++
++namespace content {
++class SiteInstance;
++class WebContents;
++}  // namespace content
++
++namespace spaces {
++
++// Per-space isolation (Phase 5 spike, `spikes/space-isolation.md`). A space
++// with SpaceIsolation::kPartition keeps its tabs in its own StoragePartition:
++// cookies, cache and site storage. A tab's partition is fixed when it is
++// created, so it only follows the space a new or restored tab joins.
++
++// The partition `space_id`'s tabs use, or nullopt for the profile's default
++// one. Also nullopt while HeliumSpaces is disabled.
++std::optional<content::StoragePartitionConfig> GetPartitionConfig(
++    Profile* profile,
++    const base::Uuid& space_id);
++
++// The SiteInstance a new tab with no opener starts in when it opens in
++// `browser`: in the partition of the space it will join, the active one. Null
++// if that space uses the default partition.
++scoped_refptr<content::SiteInstance> GetSiteInstanceForNewTab(
++    BrowserWindowInterface* browser);
++
++// The SiteInstance for a tab being restored with `extra_data`, in its space's
++// partition, or null if that space uses the default partition.
++scoped_refptr<content::SiteInstance> GetSiteInstanceForRestoredTab(
++    Profile* profile,
++    const std::map<std::string, std::string>& extra_data);
++
++// Whether `contents` is in a space's own partition.
++bool IsInSpacePartition(content::WebContents& contents);
++
++}  // namespace spaces
++
++#endif  // CHROME_BROWSER_UI_SPACES_SPACE_PARTITION_H_
+--- a/content/browser/web_contents/web_contents_impl.cc
++++ b/content/browser/web_contents/web_contents_impl.cc
+@@ -5779,6 +5779,11 @@ FrameTree* WebContentsImpl::CreateNewWin
+       // as long as they preserve the guest's StoragePartition.
+       site_instance =
+           SiteInstance::CreateForGuest(GetBrowserContext(), partition_config);
++    } else if (source_site_instance->IsFixedStoragePartition()) {
++      // helium-spaces: a noopener window from a tab fixed to a partition, such
++      // as a space's own storage, stays in that partition.
++      site_instance = SiteInstance::CreateForFixedStoragePartition(
++          GetBrowserContext(), GURL(), partition_config);
+     } else {
+       site_instance = SiteInstance::Create(GetBrowserContext());
+     }
