@@ -14,6 +14,16 @@ else
     echo "warn: python@3.13 not found; run: brew install python@3.13" >&2
 fi
 
+# Build with the Xcode upstream CI uses (status.md), installed next to the
+# system one, without changing xcode-select. Set HELIUM_XCODE to override.
+_helium_xcode="${HELIUM_XCODE:-/Applications/Xcode-26.5.0.app}"
+if [ -d "$_helium_xcode/Contents/Developer" ]; then
+    export DEVELOPER_DIR="$_helium_xcode/Contents/Developer"
+else
+    echo "warn: $_helium_xcode not found; building with $(xcode-select -p)" >&2
+fi
+unset _helium_xcode
+
 # `he format` calls clang-format by name; use the one Chromium ships.
 if [ -d "${0:A:h}/build/src/buildtools/mac_arm64-format" ]; then
     export PATH="${0:A:h}/build/src/buildtools/mac_arm64-format:$PATH"
