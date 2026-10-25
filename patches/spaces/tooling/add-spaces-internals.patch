@@ -8,7 +8,7 @@ enabled.
 
 --- a/chrome/browser/ui/spaces/BUILD.gn
 +++ b/chrome/browser/ui/spaces/BUILD.gn
-@@ -131,6 +131,34 @@ source_set("menu") {
+@@ -153,6 +153,34 @@ source_set("menu") {
    ]
  }
  
@@ -45,7 +45,7 @@ enabled.
  test("spaces_unittests") {
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/spaces_internals_ui.cc
-@@ -0,0 +1,1002 @@
+@@ -0,0 +1,1034 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -62,9 +62,9 @@ enabled.
 +#include "base/json/json_writer.h"
 +#include "base/memory/raw_ptr.h"
 +#include "base/memory/ref_counted_memory.h"
-+#include "base/supports_user_data.h"
 +#include "base/strings/escape.h"
 +#include "base/strings/utf_string_conversions.h"
++#include "base/supports_user_data.h"
 +#include "base/uuid.h"
 +#include "base/values.h"
 +#include "chrome/app/chrome_command_ids.h"
@@ -95,6 +95,8 @@ enabled.
 +#include "components/tabs/public/tab_interface.h"
 +#include "content/public/browser/navigation_controller.h"
 +#include "content/public/browser/page_navigator.h"
++#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/storage_partition.h"
 +#include "content/public/browser/web_contents.h"
 +#include "content/public/browser/web_ui.h"
 +#include "content/public/browser/web_ui_data_source.h"
@@ -257,7 +259,11 @@ enabled.
 +                  .Set("favorite",
 +                       controller &&
 +                           controller->IsFavorite(tab_strip->GetTabAtIndex(i)))
-+                  .Set("in_active_space", tab_strip->IsTabInActiveSpace(i)));
++                  .Set("in_active_space", tab_strip->IsTabInActiveSpace(i))
++                  .Set("partition", contents->GetPrimaryMainFrame()
++                                        ->GetStoragePartition()
++                                        ->GetConfig()
++                                        .partition_domain()));
 +        }
 +        windows.Append(
 +            base::DictValue()
@@ -331,6 +337,10 @@ enabled.
 +    web_ui()->RegisterMessageCallback(
 +        "rewriteSession",
 +        base::BindRepeating(&SpacesInternalsHandler::RewriteSession,
++                            base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "setIsolation",
++        base::BindRepeating(&SpacesInternalsHandler::SetIsolation,
 +                            base::Unretained(this)));
 +    web_ui()->RegisterMessageCallback(
 +        "removeSpace", base::BindRepeating(&SpacesInternalsHandler::RemoveSpace,
@@ -450,6 +460,28 @@ enabled.
 +    } else {
 +      SpaceTabHelper::SetSpaceId(tab_strip->GetWebContentsAt(*index), space_id);
 +    }
++  }
++
++  // setIsolation(space_id or "" for default, isolated): whether the space's
++  // new and restored tabs use its own storage partition.
++  void SetIsolation(const base::ListValue& args) {
++    SpaceRegistry* registry = SpaceRegistryFactory::GetForProfile(profile_);
++    const std::string* id = args.size() == 2 ? args[0].GetIfString() : nullptr;
++    std::optional<bool> isolated =
++        args.size() == 2 ? args[1].GetIfBool() : std::nullopt;
++    if (!registry || !id || !isolated) {
++      return;
++    }
++    const Space* found =
++        id->empty() ? &registry->GetDefaultSpace()
++                    : registry->GetSpace(base::Uuid::ParseLowercase(*id));
++    if (!found) {
++      return;
++    }
++    Space space = *found;
++    space.isolation =
++        *isolated ? SpaceIsolation::kPartition : SpaceIsolation::kNone;
++    registry->UpdateSpace(space);
 +  }
 +
 +  void RemoveSpace(const base::ListValue& args) {

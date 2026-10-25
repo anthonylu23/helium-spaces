@@ -22,6 +22,8 @@
 //      a space's icon.
 //   9. Flag on: three spaces of ten tabs each, with a favorite, space-pinned
 //      tabs and groups, come back the same after two restarts (Gate 1).
+//  10. Flag on: a space with its own storage (Phase 5 spike) keeps its
+//      cookies from other spaces, through navigations, popups and restarts.
 // Needs a global WebSocket: Node 22+, or Node 20.10+ with --experimental-websocket.
 // Exits non-zero on any failed check.
 
@@ -31,6 +33,7 @@ if (typeof WebSocket === 'undefined') {
 }
 
 import { spawn } from 'node:child_process';
+import { createServer } from 'node:http';
 import { existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
@@ -1099,9 +1102,157 @@ async function checkRestartAtScale() {
   }
 }
 
+// A local site for the isolation checks. /show?tag=X answers with a page
+// titled "X|<the cookies it was sent>|<a request count>", the count telling a
+// reloaded page from one restored with its old title; /set?c=a=1 and
+// /setsession set a persistent and a session cookie, in a page titled
+// "set a=1|"; /go navigates the page by script; /redirect answers
+// with a redirect; /popup opens /show in a new window, with or without an
+// opener; /blank clicks a target=_blank link to /show.
+function startSite() {
+  let requests = 0;
+  const server = createServer((req, res) => {
+    const url = new URL(req.url, 'http://x');
+    const q = (name) => url.searchParams.get(name) ?? '';
+    const page = (title, body = '') => {
+      // Uncached, so that a restored tab asks again, with its cookies.
+      res.writeHead(200, { 'content-type': 'text/html', 'cache-control': 'no-store' });
+      res.end(`<title>${title}</title>${body}`);
+    };
+    switch (url.pathname) {
+      case '/show': return page(`${q('tag')}|${req.headers.cookie ?? ''}|${++requests}`);
+      case '/set':
+        res.setHeader('set-cookie', `${q('c')}; Max-Age=86400; Path=/`);
+        return page(`set ${q('c')}|`);
+      case '/setsession':
+        res.setHeader('set-cookie', `${q('c')}; Path=/`);
+        return page(`set ${q('c')}|`);
+      case '/go': return page('go', `<script>location.href = ${JSON.stringify(q('to'))};</script>`);
+      case '/redirect':
+        res.writeHead(302, { location: q('to') });
+        return res.end();
+      case '/popup': return page('popup', `<script>window.open(${JSON.stringify('/show?tag=' + q('tag'))}, '_blank', ${JSON.stringify(q('mode') === 'noopener' ? 'noopener' : '')});</script>`);
+      case '/blank': return page('blank', `<a id="a" target="_blank" href="/show?tag=${q('tag')}">a</a><script>document.getElementById('a').click();</script>`);
+      default:
+        res.writeHead(404);
+        return res.end();
+    }
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server)));
+}
+
+// Phase 5 spike, `docs/spaces/spikes/space-isolation.md`: Work keeps its tabs
+// in its own storage partition, and the default space doesn't.
+async function checkIsolation() {
+  const server = await startSite();
+  const port = server.address().port;
+  const site = `http://127.0.0.1:${port}`;
+  const other = `http://localhost:${port}`;
+  const profile = newProfile();
+  // The GPU process of a dev build doesn't start on this machine (status.md),
+  // and without it no new renderer process can load a page.
+  const args = ['--enable-features=HeliumSpaces', '--disable-popup-blocking', '--in-process-gpu'];
+  try {
+    let { cdp, close } = await launch(profile, args);
+    let state = await internalsState(cdp);
+    const win = state.windows[0].session_id;
+    const send = (message, ...rest) => internalsSend(cdp, message, rest);
+    const tabs = (state) => state.windows.flatMap((w) => w.tabs.map((t) => ({ ...t, window: w.session_id })));
+    // The tab whose /show page has `tag`, once it has loaded, and loaded
+    // again if `before` is the tab as it was.
+    const shown = (state, tag) => tabs(state).find((t) => t.title.startsWith(`${tag}|`));
+    const waitForShown = async (tag, before = undefined) => {
+      for (let i = 0; i < 40; i++) {
+        state = await internalsState(cdp);
+        const tab = shown(state, tag);
+        if (tab && tab.title !== before?.title) return tab;
+        await sleep(250);
+      }
+      return undefined;
+    };
+    const cookies = (tab) => tab?.title.split('|')[1] ?? '(not loaded)';
+    const inWorkPartition = (tab) => !!tab && tab.partition.startsWith('heliumspace');
+    const open = (url) => send('openLink', win, url, true);
+
+    await send('addSpace', 'Work');
+    state = await internalsState(cdp);
+    const work = state.spaces.find((s) => s.name === 'Work').id;
+    await send('setIsolation', work, true);
+
+    // Default space first: its cookie must never reach Work.
+    await open(`${site}/set?c=d=1`);
+    await waitForShown('set d=1');
+    await send('switchSpace', win, work);
+    await open(`${site}/set?c=w=1`);
+    await waitForShown('set w=1');
+    await open(`${site}/setsession?c=s=1`);
+    await waitForShown('set s=1');
+    await open(`${site}/show?tag=W1`);
+    let tab = await waitForShown('W1');
+    check('a new tab of an isolated space opens in its own partition', inWorkPartition(tab), tab?.partition);
+    check("an isolated space sees only its own cookies", cookies(tab) === 'w=1; s=1' || cookies(tab) === 's=1; w=1', cookies(tab));
+
+    const defaultSpace = state.spaces.find((s) => s.default).id;
+    await send('switchSpace', win, defaultSpace);
+    await open(`${site}/show?tag=D1`);
+    tab = await waitForShown('D1');
+    check("the default space doesn't see an isolated space's cookies, nor it the default's",
+          tab?.partition === '' && cookies(tab) === 'd=1', `${tab?.partition} ${cookies(tab)}`);
+
+    await send('switchSpace', win, work);
+    const show = (tag) => encodeURIComponent(`${site}/show?tag=${tag}`);
+    await open(`${other}/go?to=${encodeURIComponent(`${site}/redirect?to=`)}${show('W2')}`);
+    tab = await waitForShown('W2');
+    check('a cross-site navigation and a redirect stay in the partition',
+          inWorkPartition(tab) && cookies(tab).includes('w=1'), `${tab?.partition} ${cookies(tab)}`);
+
+    for (const [tag, path, what] of [['W3', 'popup?mode=noopener&', 'a noopener popup'],
+                                     ['W4', 'popup?mode=opener&', 'a popup with an opener'],
+                                     ['W5', 'blank?', 'a target=_blank link']]) {
+      await open(`${site}/${path}tag=${tag}`);
+      tab = await waitForShown(tag);
+      check(`${what} stays in the partition`, inWorkPartition(tab) && cookies(tab).includes('w=1'),
+            `${tab?.partition} ${cookies(tab)}`);
+    }
+
+    // Restore: the tab comes back in Work's partition with the persistent
+    // cookie. Session cookies of other partitions aren't kept across a restart
+    // (a v1 hook); record what happens without failing.
+    const beforeRestart = { W1: shown(state, 'W1'), D1: shown(state, 'D1') };
+    await close({ waitForSessionSave: true });
+    ({ cdp, close } = await launch(profile, [...args, '--restore-last-session'], undefined, INTERNALS));
+    // A restored tab loads once it is activated.
+    const loadRestored = async (tag) => {
+      state = await internalsState(cdp);
+      const restored = tabs(state).find((t) => t.url.endsWith(`/show?tag=${tag}`));
+      if (restored) await send('activateTab', restored.window, restored.index);
+      return waitForShown(tag, beforeRestart[tag]);
+    };
+    tab = await loadRestored('W1');
+    check("a restored tab of an isolated space is back in its partition, with its cookies",
+          inWorkPartition(tab) && cookies(tab).includes('w=1') && !cookies(tab).includes('d=1'),
+          `${tab?.partition} ${cookies(tab)}`);
+    console.log(`NOTE  session cookie after a restart in an isolated space: ${cookies(tab).includes('s=1') ? 'kept' : 'lost'}`);
+    tab = await loadRestored('D1');
+    check('a restored tab of the default space stays in the default partition',
+          tab?.partition === '' && cookies(tab) === 'd=1', `${tab?.partition} ${cookies(tab)}`);
+
+    state = await internalsState(cdp);
+    tab = tabs(state).find((t) => t.url.endsWith('/show?tag=W2'));
+    await send('closeTab', tab.window, tab.index);
+    await sleep(500);
+    await send('reopenClosedTab', tab.window);
+    tab = await waitForShown('W2');
+    check('a reopened tab of an isolated space is back in its partition', inWorkPartition(tab), tab?.partition);
+    await close();
+  } finally {
+    server.close();
+  }
+}
+
 // SPACES_SMOKE_ONLY=checkOrder runs one section; SPACES_SMOKE_STDERR=1 shows
 // the browser's stderr.
-const sections = { checkFlagOff, checkDefaultSpace, checkTabSpaces, checkSwitching, checkOrder, checkMovesInSpace, checkSpaceCommands, checkRestartAtScale };
+const sections = { checkFlagOff, checkDefaultSpace, checkTabSpaces, checkSwitching, checkOrder, checkMovesInSpace, checkSpaceCommands, checkRestartAtScale, checkIsolation };
 try {
   for (const [name, section] of Object.entries(sections)) {
     if (!process.env.SPACES_SMOKE_ONLY || process.env.SPACES_SMOKE_ONLY === name) await section();
