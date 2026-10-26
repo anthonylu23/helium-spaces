@@ -32,6 +32,19 @@ git -C helium-chromium remote set-url --push upstream DISABLED
 `brew unlink binutils` if Homebrew binutils is installed; the build must use
 Xcode's.
 
+Keep `build/` out of the folders macOS privacy controls protect (`~/Documents`,
+`~/Desktop`, `~/Downloads`, iCloud Drive), or a dev build's GPU process can
+hang at launch (Known environment issues). If the checkout is in one of them,
+make `build/` a symlink to a folder elsewhere before `he setup`; on the same
+volume an existing `build/` moves with a rename, and the next build has
+nothing to do:
+
+```bash
+mkdir -p ~/Developer && mv build ~/Developer/helium-spaces-build
+ln -s ~/Developer/helium-spaces-build build
+echo /build >> .git/info/exclude   # .gitignore's build/ doesn't match a symlink
+```
+
 ccache is picked up automatically by `he configure`. Give it room for a full
 Chromium build, otherwise rebuilds after a rebase get no benefit:
 
@@ -87,7 +100,7 @@ substitution, so patches must never depend on substituted domains.
 | Patches refresh with `Index:` and `src.orig/` headers | `QUILT_*` variables from `dev.sh` not set | `source spaces-dev.sh` first, then `quilt --quiltrc -` |
 | `he format`: `Failed to run "clang-format ..."` | No `clang-format` on `PATH` | `spaces-dev.sh` adds `build/src/buildtools/mac_arm64-format` |
 | `browser_tests`, `unit_tests`, `base_unittests` fail on missing inputs | The `-base` source tarball has no test data | Use `spaces_unittests`, below |
-| Dev build: a page that needs a new renderer process never loads (a new site, a new tab, leaving a `chrome://` page); `Page.navigate` never answers | The GPU helper process hangs at launch, blocked in `open()` while `dyld` loads its first library, so renderers wait for a GPU channel forever. Seen since the first build with Xcode 26.5 on macOS 27.0.1 (2026-10-25); cause unknown, release Helium is fine | Launch with `--in-process-gpu` (`he run` doesn't take flags, so run `out/Default/Helium.app/Contents/MacOS/Helium` directly). See `status.md` |
+| Dev build: a page that needs a new renderer process never loads (a new site, a new tab, leaving a `chrome://` page); `Page.navigate` never answers | The GPU helper hangs at launch in `open()` while `dyld` loads its first library, so renderers wait for a GPU channel forever. Launched from a terminal or agent, the browser doesn't own its macOS privacy (TCC) permissions, so Chromium launches the GPU process, and only it, as its own TCC identity (`kMacDisclaimGpuTccResponsibility`, `gpu_process_host.cc`). Its libraries were in `~/Documents`, so TCC asked for Documents access, a prompt nobody sees headless or with the screen locked. Ad-hoc signing means a rebuilt helper can be asked again. Release Helium, in `/Applications` and launched by launchd, never is. Found 2026-10-25 | `build/` lives outside the protected folders (Prerequisites). The smoke and screenshot scripts also pass `--disable-features=MacDisclaimGpuTccResponsibility`, so the GPU process keeps the terminal's permissions |
 
 ## Where patches live
 
@@ -201,8 +214,7 @@ spaces and tabs as JSON and takes `chrome.send()` messages; see
   for the default one. `checkIsolation` serves a local site on 127.0.0.1 and
   localhost whose `/show` page titles itself with the cookies it was sent,
   uncached so that a restored tab asks again. Restored tabs load only once
-  activated, so it activates them first. It runs with `--in-process-gpu`
-  (Known environment issues).
+  activated, so it activates them first.
 - `collapseGroup` and `dropOnSpace` make the model calls the views make when
   a group is collapsed and when tabs are dropped on a switcher icon.
 - Every DevTools call times out after 30 s. A bug that closes the tab the test

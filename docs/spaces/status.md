@@ -13,7 +13,8 @@ Phase 5 isolation spike: prototype built on `spaces/isolation-spike`, its
 scripted experiments pass and most hands-on ones too; notifications fail in
 an isolated space. Gate 2 decided: ship behind a warning, provisional on the
 experiments that need an unlocked screen and real accounts. The dev build's
-GPU process hangs at launch: run it with `--in-process-gpu` for now.**
+GPU process hang is fixed: it was a macOS privacy prompt for `~/Documents`, and
+`build/` now lives in `~/Developer`.**
 
 Last updated 2026-10-26. Deferred work and deliberate decisions are in
 `deferred.md`.
@@ -238,15 +239,19 @@ Last updated 2026-10-26. Deferred work and deliberate decisions are in
    installed as `/Applications/Xcode-26.5.0.app` next to the system Xcode
    (27.1), and `spaces-dev.sh` selects it through `DEVELOPER_DIR` without
    changing `xcode-select`.
-6. Fix the dev build's GPU process, which hangs at launch (found
-   2026-10-25 in the first Xcode 26.5 build). It sits in `open()` while
-   `dyld` loads its first library, the renderers wait for a GPU channel, and
-   so any page that needs a new renderer process never loads, headless or
-   not. The renderer and utility processes, launched from the same helper
-   binary, start fine, and release Helium is unaffected. `--in-process-gpu`
-   works around it; the smoke test's isolation section uses it. Before the
-   Xcode switch nothing needed a new renderer headless, so whether the old
-   build had it is unknown.
+6. Done (2026-10-25): the dev build's GPU process hang. Launched from a
+   terminal or agent, Chromium gives the GPU process, and only it, its own
+   macOS privacy (TCC) identity, and its libraries were in `~/Documents`, so
+   TCC held its `open()` on a Documents-access prompt nobody could see. The
+   TCC log showed the check, and someone (not the user, who doesn't recall
+   it; possibly an agent's computer-use session) had since allowed it, so it
+   no longer hung, but a rebuilt, ad-hoc signed helper can be asked again.
+   Fixed by moving `build/` to `~/Developer/helium-spaces-build`, with a
+   symlink at `build/`: no Documents checks after the move, and the next build
+   had no work to do. The smoke and screenshot scripts also pass
+   `--disable-features=MacDisclaimGpuTccResponsibility`, and the isolation
+   section dropped `--in-process-gpu` and passes with the GPU in its own
+   process. See `development.md`, Known environment issues.
 7. After Phase 5: a spike on per-space profiles (`deferred.md`), which
    come in addition to partitions, not instead of them.
 
