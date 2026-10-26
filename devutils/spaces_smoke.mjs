@@ -106,6 +106,11 @@ async function launch(profile, extraArgs = [], url = 'about:blank', attachTo = u
     `--user-data-dir=${profile}`,
     '--use-mock-keychain',
     '--no-first-run',
+    // Launched from a terminal, the GPU process otherwise gets its own macOS
+    // privacy (TCC) identity, and with no Documents grant it hangs at launch
+    // on a consent prompt nobody sees (development.md, Known environment
+    // issues).
+    '--disable-features=MacDisclaimGpuTccResponsibility',
     ...extraArgs,
     ...(attachTo ? [] : [url]),
   ], { stdio: ['ignore', 'ignore', process.env.SPACES_SMOKE_STDERR ? 'inherit' : 'ignore'] });
@@ -1149,9 +1154,7 @@ async function checkIsolation() {
   const site = `http://127.0.0.1:${port}`;
   const other = `http://localhost:${port}`;
   const profile = newProfile();
-  // The GPU process of a dev build doesn't start on this machine (status.md),
-  // and without it no new renderer process can load a page.
-  const args = ['--enable-features=HeliumSpaces', '--disable-popup-blocking', '--in-process-gpu'];
+  const args = ['--enable-features=HeliumSpaces', '--disable-popup-blocking'];
   try {
     let { cdp, close } = await launch(profile, args);
     let state = await internalsState(cdp);

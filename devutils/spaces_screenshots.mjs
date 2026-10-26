@@ -62,6 +62,8 @@ const port = 9800 + Math.floor(Math.random() * 100);
 const browser = spawn(join(app, 'Contents/MacOS/Helium'), [
   `--remote-debugging-port=${port}`, `--user-data-dir=${profile}`, '--use-mock-keychain',
   '--no-first-run', '--no-default-browser-check', '--enable-features=HeliumSpaces',
+  // See launch() in spaces_smoke.mjs.
+  '--disable-features=MacDisclaimGpuTccResponsibility',
   '--window-position=40,60', '--window-size=1100,700', 'about:blank',
 ], { stdio: 'ignore' });
 
