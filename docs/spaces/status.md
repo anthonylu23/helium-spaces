@@ -10,7 +10,7 @@ by hand on branch `spaces/switcher`.
 Step 0 spike: code review and computer-use checks support option C; human
 animation review remains open.**
 
-Last updated 2026-10-24. Deferred work and deliberate decisions are in
+Last updated 2026-10-26. Deferred work and deliberate decisions are in
 `deferred.md`.
 
 ## Baseline
@@ -196,6 +196,19 @@ Last updated 2026-10-24. Deferred work and deliberate decisions are in
          stop at the edges of the space). The order was valid and never
          fixed in all 159 captured states. It noticed a brief near-empty
          sidebar while switching in Vertical (in `deferred.md`).
+    5. Built (2026-10-26): favorites match Arc. They belong to the profile
+       instead of being the default space's pinned tabs: a favorite is a
+       pinned tab stored with a reserved favorites id
+       (`spaces::GetFavoritesId()`), so every space, the default one too, has
+       its own pinned tabs. Changed in the controller, order, commands, tab
+       menu, switcher and internals patches. The tab menu offers Pin and "Add
+       to Favorites" in every space; the default space's Pin no longer reads
+       "Add to Favorites". Removing a space makes its pinned tabs the default
+       space's. The smoke test makes favorites through the real "Add to
+       Favorites" command, checks that the default space's pinned tabs stay
+       in it, and Gate 1 restores a favorite and a default-space pinned tab.
+       Arc's saved-address behavior for favorites and pinned tabs waits for
+       Phase 7 (the user, 2026-10-26).
 3. Close Phase 3. Gate 1's automated part passes (`checkRestartAtScale`,
    2026-10-24). Still open: the human verdict on whether the sidebar filter
    holds up in daily use, and the step 0 spike's animation review by eye.
@@ -216,7 +229,8 @@ Automated (`devutils/spaces_smoke.mjs`):
 - Tabs assigned to spaces keep them after a restart, a second restart, a
   forced session-file rewrite, and close plus reopen (Cmd+Shift+T).
 - Switching (to an empty space, back to a space's most recent tab), new tabs
-  joining the active space, Ctrl+Tab, Cmd+1/Cmd+9, favorites, "Close other
+  joining the active space, Ctrl+Tab, Cmd+1/Cmd+9, favorites and the default
+  space's pinned tabs, "Close other
   tabs", closing a space's last tab, activating a tab elsewhere, removing the
   active space, and the active space after a restart with a favorite active.
 - Tab order: new tabs, links from a favorite, extension moves, drops,
@@ -230,8 +244,8 @@ Automated (`devutils/spaces_smoke.mjs`):
   and group list; swapping a favorite into a split view; collapsing the
   active tab's group and closing next to a collapsed group; tabs and groups
   dropped on a space's icon.
-- Gate 1: three spaces of ten tabs each, with favorites, space-pinned tabs
-  and groups, keep their space, pin, group and order through two restarts,
+- Gate 1: three spaces of ten tabs each, with a favorite, space-pinned tabs
+  (the default space's too) and groups, keep their space, pin, group and order through two restarts,
   and the window comes back in its space on its active tab.
 
 Unit (`spaces_unittests`): 14 `SpaceList` tests, 11 `SpaceOrder` tests.

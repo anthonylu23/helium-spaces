@@ -33,7 +33,10 @@ model, so session restore, drag and drop, and tab commands keep working.
   session file, so we also hook the rewrite and tab restore paths. A tab's
   space is assigned once it is in a window. Each profile
   has one permanent default space with a fixed id; a tab with no space id
-  belongs to it. Pinned with no space id = a favorite, shown in every space.
+  belongs to it. Favorites belong to the profile, as in Arc, not to a space:
+  a favorite is a pinned tab stored with a reserved favorites id instead of a
+  space id, and shows in every space. Every space, the default one too, has
+  its own pinned tabs.
 - Tab groups work inside a space, as in Arc. Spaces are not tab groups.
 - Each space's tabs stay together in the underlying TabStripModel order:
   its pinned tabs in one run, its other tabs in another, with favorites before
@@ -64,8 +67,9 @@ model, so session restore, drag and drop, and tab commands keep working.
 - Switcher: one icon per space (its emoji, or a dot in its color) and "+",
   at the bottom of the vertical sidebar; right-click to edit or delete a
   space. Collapsed, only the active space's icon shows, and it opens a menu
-  of spaces. Tab menu: "Move to Space", "Add to Favorites" / "Remove from
-  Favorites"; "Add Tab to Group" lists only the shown space's groups.
+  of spaces. Tab menu: "Move to Space", Pin and "Add to Favorites", "Remove
+  from Favorites" on a favorite; "Add Tab to Group" lists only the shown
+  space's groups.
 - Persistence: space list in a profile dictionary pref. The active space
   follows the active tab: activating a tab in another space switches to it,
   and while a favorite is active the window shows the space of its most
