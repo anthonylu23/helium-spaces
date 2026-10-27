@@ -11,7 +11,7 @@
      ]
 --- a/chrome/browser/ui/spaces/space_controller.cc
 +++ b/chrome/browser/ui/spaces/space_controller.cc
-@@ -18,10 +18,12 @@
+@@ -19,10 +19,12 @@
  #include "chrome/browser/ui/spaces/space_registry_factory.h"
  #include "chrome/browser/ui/spaces/space_tab_helper.h"
  #include "chrome/browser/ui/spaces/spaces_features.h"
@@ -24,7 +24,7 @@
  #include "components/tabs/public/tab_interface.h"
  #include "content/public/browser/web_contents.h"
  #include "url/gurl.h"
-@@ -144,6 +146,67 @@ void SpaceController::MoveTabToSpace(tab
+@@ -149,6 +151,67 @@ void SpaceController::MoveTabToSpace(tab
    tab_visibility_changed_callbacks_.Notify();
  }
  
@@ -94,8 +94,8 @@
    return tab_visibility_changed_callbacks_.Add(std::move(callback));
 --- a/chrome/browser/ui/spaces/space_controller.h
 +++ b/chrome/browser/ui/spaces/space_controller.h
-@@ -98,6 +98,17 @@ class SpaceController : public TabSpaceF
-   // another tab there.
+@@ -102,6 +102,17 @@ class SpaceController : public TabSpaceF
+   // tab there.
    void MoveTabToSpace(tabs::TabInterface* tab, const base::Uuid& space_id);
  
 +  // Moves `group` to the end of `space_id`'s tabs, as a group.
@@ -109,8 +109,8 @@
 +                              std::optional<tab_groups::TabGroupId> group,
 +                              const base::Uuid& space_id);
 +
-   // The space `tab` belongs to: the default space if it has none, or if its
-   // space no longer exists.
+   // The space `tab` belongs to: GetFavoritesId() for a favorite, or the
+   // default space if it has none, or if its space no longer exists.
    base::Uuid GetSpaceOfTab(const tabs::TabInterface* tab) const;
 --- a/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc
 +++ b/chrome/browser/ui/views/frame/vertical_tab_strip_region_view.cc

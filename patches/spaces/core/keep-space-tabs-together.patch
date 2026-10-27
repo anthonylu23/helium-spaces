@@ -57,10 +57,10 @@
  #include "base/functional/bind.h"
  #include "base/location.h"
 +#include "base/logging.h"
+ #include "base/no_destructor.h"
  #include "base/task/sequenced_task_runner.h"
  #include "chrome/browser/profiles/profile.h"
- #include "chrome/browser/tab_list/tab_removed_reason.h"
-@@ -19,6 +21,7 @@
+@@ -20,6 +22,7 @@
  #include "chrome/browser/ui/tabs/tab_strip_model.h"
  #include "chrome/browser/ui/tabs/tab_strip_model_delegate.h"
  #include "chrome/browser/ui/tabs/tab_strip_user_gesture_details.h"
@@ -68,7 +68,7 @@
  #include "components/tabs/public/tab_interface.h"
  #include "content/public/browser/web_contents.h"
  #include "url/gurl.h"
-@@ -53,6 +56,7 @@ SpaceController::SpaceController(Browser
+@@ -60,6 +63,7 @@ SpaceController::SpaceController(Browser
                                   SpaceRegistry* registry)
      : tab_strip_model_(browser->GetTabStripModel()),
        registry_(registry),
@@ -76,8 +76,8 @@
        active_space_id_(registry->GetDefaultSpace().id),
        scoped_data_(browser->GetUnownedUserDataHost(), *this) {
    tab_strip_model_->AddObserver(this);
-@@ -80,11 +84,37 @@ void SpaceController::MoveTabToSpace(tab
-   if (space == GetSpaceOfTab(tab)) {
+@@ -91,11 +95,37 @@ void SpaceController::MoveTabToSpace(tab
+       (space == GetFavoritesId() && !tab->IsPinned())) {
      return;
    }
 +  const std::optional<split_tabs::SplitTabId> split = tab->GetSplit();
@@ -117,12 +117,27 @@
      ActivateTabInActiveSpace();
    }
    tab_visibility_changed_callbacks_.Notify();
-@@ -108,6 +138,118 @@ bool SpaceController::IsTabInActiveSpace
+@@ -107,8 +137,13 @@ base::CallbackListSubscription SpaceCont
+ }
+ 
+ base::Uuid SpaceController::GetSpaceOfTab(const tabs::TabInterface* tab) const {
++  return GetSpaceOfTab(tab, tab->IsPinned());
++}
++
++base::Uuid SpaceController::GetSpaceOfTab(const tabs::TabInterface* tab,
++                                          bool pinned) const {
+   const base::Uuid space_id = SpaceTabHelper::GetSpaceId(tab->GetContents());
+-  if (space_id == GetFavoritesId() && !tab->IsPinned()) {
++  if (space_id == GetFavoritesId() && !pinned) {
+     // Favorites are pinned; one unpinned some other way is the default
+     // space's.
+     return registry_->GetDefaultSpace().id;
+@@ -124,6 +159,118 @@ bool SpaceController::IsTabInActiveSpace
    return IsFavorite(tab) || GetSpaceOfTab(tab) == active_space_id_;
  }
  
 +bool SpaceController::IsOrderValid() const {
-+  return IsTabOrderValid(GetOrderKeys({}), registry_->GetDefaultSpace().id);
++  return IsTabOrderValid(GetOrderKeys({}), GetFavoritesId());
 +}
 +
 +int SpaceController::WillInsertTabs(
@@ -133,7 +148,6 @@
 +  if (tabs.empty()) {
 +    return index;
 +  }
-+  const base::Uuid& default_space = registry_->GetDefaultSpace().id;
 +  const std::optional<base::Uuid> group_space =
 +      group ? GetSpaceOfGroup(*group, {}) : std::nullopt;
 +  // A window that only has favorites, such as one a selection was just moved
@@ -156,7 +170,7 @@
 +                  /*before_insert=*/true);
 +    } else if (last_window_id.is_valid() && last_window_id != window_id_ &&
 +               window_shows_a_space &&
-+               !(pinned && GetSpaceOfTab(tab) == default_space)) {
++               GetSpaceOfTab(tab, pinned) != GetFavoritesId()) {
 +      // Moved from another window: it joins the space shown here, where it
 +      // was dropped, as in Arc. Favorites stay favorites.
 +      SetTabSpace(contents, active_space_id_, /*before_insert=*/true);
@@ -166,9 +180,9 @@
 +  if (group_space || fixing_order_) {
 +    return index;
 +  }
-+  return static_cast<int>(
-+      ConstrainTabIndex(GetOrderKeys({}), {GetSpaceOfTab(tabs[0]), pinned},
-+                        static_cast<size_t>(index), default_space));
++  return static_cast<int>(ConstrainTabIndex(
++      GetOrderKeys({}), {GetSpaceOfTab(tabs[0], pinned), pinned},
++      static_cast<size_t>(index), GetFavoritesId()));
 +}
 +
 +int SpaceController::ConstrainMoveIndex(
@@ -184,17 +198,18 @@
 +  if (group && GetSpaceOfGroup(*group, tabs)) {
 +    return index;
 +  }
-+  const base::Uuid space = GetSpaceOfTab(tabs[0]);
-+  if (!std::ranges::all_of(tabs, [this, &space](const tabs::TabInterface* tab) {
-+        return GetSpaceOfTab(tab) == space;
-+      })) {
++  const base::Uuid space = GetSpaceOfTab(tabs[0], pinned);
++  if (!std::ranges::all_of(
++          tabs, [this, &space, pinned](const tabs::TabInterface* tab) {
++            return GetSpaceOfTab(tab, pinned) == space;
++          })) {
 +    // Tabs of several spaces, which only an extension can select: let them
 +    // go, and fix the order afterwards.
 +    return index;
 +  }
 +  return static_cast<int>(ConstrainTabIndex(GetOrderKeys(tabs), {space, pinned},
 +                                            static_cast<size_t>(index),
-+                                            registry_->GetDefaultSpace().id));
++                                            GetFavoritesId()));
 +}
 +
 +void SpaceController::WillSetTabPinned(tabs::TabInterface* tab, bool pinned) {
@@ -236,7 +251,7 @@
  void SpaceController::OnTabStripModelChanged(
      TabStripModel* tab_strip_model,
      const TabStripModelChange& change,
-@@ -115,10 +257,10 @@ void SpaceController::OnTabStripModelCha
+@@ -131,10 +278,10 @@ void SpaceController::OnTabStripModelCha
    bool emptied_active_space = false;
    switch (change.type()) {
      case TabStripModelChange::kInserted:
@@ -250,7 +265,7 @@
        }
        break;
      case TabStripModelChange::kRemoved:
-@@ -145,6 +287,7 @@ void SpaceController::OnTabStripModelCha
+@@ -161,6 +308,7 @@ void SpaceController::OnTabStripModelCha
    if (tab_strip_model_->closing_all()) {
      return;
    }
@@ -258,7 +273,7 @@
    if (emptied_active_space) {
      // WillCloseTabs() opens a tab first when tabs are closed through the tab
      // strip; this covers tabs deleted any other way. The tab strip can't be
-@@ -181,6 +324,30 @@ void SpaceController::OnTabPinnedStateCh
+@@ -197,6 +345,30 @@ void SpaceController::OnTabPinnedStateCh
    }
  }
  
@@ -289,20 +304,20 @@
  void SpaceController::WillCloseTabs(
      const std::vector<tabs::TabInterface*>& tabs) {
    const tabs::TabInterface* active_tab = tab_strip_model_->GetActiveTab();
-@@ -201,7 +368,11 @@ void SpaceController::WillCloseTabs(
+@@ -217,7 +389,11 @@ void SpaceController::WillCloseTabs(
  }
  
  void SpaceController::OnSpacesChanged() {
 -  // Tabs of a removed space now belong to the default space.
-+  // Tabs of a removed space now belong to the default space, and its pinned
-+  // tabs are favorites. Put them with the default space's tabs.
++  // Tabs of a removed space now belong to the default space, its pinned tabs
++  // too. Put them with the default space's tabs.
 +  if (!IsOrderValid()) {
 +    FixOrder();
 +  }
    if (!registry_->GetSpace(active_space_id_)) {
      SetActiveSpace(GetSpaceForActiveTab());
    }
-@@ -300,10 +471,118 @@ void SpaceController::OpenTabInEmptiedSp
+@@ -317,10 +493,117 @@ void SpaceController::OpenTabInEmptiedSp
  }
  
  void SpaceController::SetTabSpace(content::WebContents* contents,
@@ -403,8 +418,7 @@
 +
 +  base::AutoReset<bool> fixing(&fixing_order_, true);
 +  int target = 0;
-+  for (size_t unit_index :
-+       GetValidTabOrder(keys, registry_->GetDefaultSpace().id)) {
++  for (size_t unit_index : GetValidTabOrder(keys, GetFavoritesId())) {
 +    const Unit& unit = units[unit_index];
 +    tabs::TabInterface* first_tab = unit.first_tab.Get();
 +    const int index = tab_strip_model_->GetIndexOfTab(first_tab);
@@ -448,7 +462,7 @@
  #include "components/tabs/public/tab_interface.h"
  #include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
  
-@@ -38,8 +42,15 @@ namespace spaces {
+@@ -43,8 +47,15 @@ const base::Uuid& GetFavoritesId();
  //   space of the most recently active tab that isn't a favorite.
  // - Switching to a space activates the tab last active there.
  // - New tabs join the active space. Restored tabs keep the space they had.
@@ -464,22 +478,26 @@
  // Owned by EmbedderBrowserWindowFeatures.
  class SpaceController : public TabSpaceFilter,
                          public TabStripModelObserver,
-@@ -67,9 +78,10 @@ class SpaceController : public TabSpaceF
-   // new tab in it if it has none. An unknown id means the default space.
+@@ -73,11 +84,12 @@ class SpaceController : public TabSpaceF
+   // default space.
    void SwitchToSpace(const base::Uuid& space_id);
  
--  // Moves `tab` to `space_id`; an unknown id means the default space. It
--  // leaves its tab group, since a group stays within one space. If `tab` was
--  // the active tab, the window stays in the active space and activates
-+  // Moves `tab` to the end of `space_id`'s tabs; an unknown id means the
-+  // default space. It leaves its tab group, since a group stays within one
-+  // space, and a tab in a split view moves with the other tab in it. If `tab`
-+  // was the active tab, the window stays in the active space and activates
-   // another tab there.
+-  // Moves `tab` to `space_id`, or to the favorites if it is GetFavoritesId()
+-  // and `tab` is pinned; an unknown id means the default space. It leaves its
+-  // tab group, since a group stays within one space. If `tab` was the active
+-  // tab, the window stays in the active space and activates another tab
+-  // there.
++  // Moves `tab` to the end of `space_id`'s tabs, or of the favorites if it
++  // is GetFavoritesId() and `tab` is pinned; an unknown id means the default
++  // space. It leaves its tab group, since a group stays within one space, and
++  // a tab in a split view moves with the other tab in it. If `tab` was the
++  // active tab, the window stays in the active space and activates another
++  // tab there.
    void MoveTabToSpace(tabs::TabInterface* tab, const base::Uuid& space_id);
  
-@@ -81,9 +93,31 @@ class SpaceController : public TabSpaceF
-   // every space.
+   // The space `tab` belongs to: GetFavoritesId() for a favorite, or the
+@@ -88,9 +100,31 @@ class SpaceController : public TabSpaceF
+   // shown in every space.
    bool IsFavorite(const tabs::TabInterface* tab) const;
  
 +  // Whether the window's tabs follow the order rule.
@@ -510,7 +528,7 @@
    base::CallbackListSubscription RegisterTabVisibilityChanged(
        base::RepeatingClosure callback) override;
  
-@@ -93,6 +127,11 @@ class SpaceController : public TabSpaceF
+@@ -100,11 +134,19 @@ class SpaceController : public TabSpaceF
        const TabStripModelChange& change,
        const TabStripSelectionChange& selection) override;
    void OnTabPinnedStateChanged(tabs::TabInterface* tab, int index) override;
@@ -522,7 +540,15 @@
  
    // SpaceRegistry::Observer:
    void OnSpacesChanged() override;
-@@ -124,15 +163,45 @@ class SpaceController : public TabSpaceF
+ 
+  private:
++  // The space `tab` belongs to once it is pinned as `pinned` says.
++  base::Uuid GetSpaceOfTab(const tabs::TabInterface* tab, bool pinned) const;
++
+   // Returns `space_id` if it is in the registry or the favorites', else the
+   // default space.
+   base::Uuid ResolveSpace(const base::Uuid& space_id) const;
+@@ -132,15 +174,45 @@ class SpaceController : public TabSpaceF
    void OpenTabInEmptiedSpace();
  
    // Stores `space_id` on `contents`, where the default space is stored as no
@@ -572,7 +598,7 @@
        registry_observation_{this};
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/space_order.cc
-@@ -0,0 +1,126 @@
+@@ -0,0 +1,125 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -587,8 +613,8 @@
 +
 +namespace {
 +
-+bool IsFavorite(const TabOrderKey& key, const base::Uuid& default_space) {
-+  return key.pinned && key.space == default_space;
++bool IsFavorite(const TabOrderKey& key, const base::Uuid& favorites) {
++  return key.pinned && key.space == favorites;
 +}
 +
 +// The number of tabs at the start of `keys` that `predicate` accepts.
@@ -604,17 +630,17 @@
 +}  // namespace
 +
 +bool IsTabOrderValid(base::span<const TabOrderKey> keys,
-+                     const base::Uuid& default_space) {
++                     const base::Uuid& favorites) {
 +  const size_t pinned_count =
 +      CountLeading(keys, [](const TabOrderKey& key) { return key.pinned; });
 +  const size_t favorite_count =
-+      CountLeading(keys, [&default_space](const TabOrderKey& key) {
-+        return IsFavorite(key, default_space);
++      CountLeading(keys, [&favorites](const TabOrderKey& key) {
++        return IsFavorite(key, favorites);
 +      });
 +  std::vector<TabOrderKey> finished_runs;
 +  for (size_t i = 0; i < keys.size(); ++i) {
 +    if (keys[i].pinned != (i < pinned_count) ||
-+        IsFavorite(keys[i], default_space) != (i < favorite_count)) {
++        IsFavorite(keys[i], favorites) != (i < favorite_count)) {
 +      return false;
 +    }
 +    if (i > 0 && keys[i - 1] != keys[i]) {
@@ -630,17 +656,17 @@
 +size_t ConstrainTabIndex(base::span<const TabOrderKey> keys,
 +                         const TabOrderKey& key,
 +                         size_t index,
-+                         const base::Uuid& default_space) {
++                         const base::Uuid& favorites) {
 +  const size_t pinned_count =
 +      CountLeading(keys, [](const TabOrderKey& key) { return key.pinned; });
 +  const size_t favorite_count =
-+      CountLeading(keys, [&default_space](const TabOrderKey& key) {
-+        return IsFavorite(key, default_space);
++      CountLeading(keys, [&favorites](const TabOrderKey& key) {
++        return IsFavorite(key, favorites);
 +      });
 +
 +  size_t begin = key.pinned ? 0 : pinned_count;
 +  size_t end = key.pinned ? pinned_count : keys.size();
-+  if (IsFavorite(key, default_space)) {
++  if (IsFavorite(key, favorites)) {
 +    end = favorite_count;
 +  } else if (key.pinned) {
 +    begin = std::min(favorite_count, end);
@@ -674,7 +700,7 @@
 +}
 +
 +std::vector<size_t> GetValidTabOrder(base::span<const TabOrderKey> units,
-+                                     const base::Uuid& default_space) {
++                                     const base::Uuid& favorites) {
 +  // Each run sorts by region (favorites, other pinned, unpinned), then by its
 +  // first unit.
 +  std::vector<TabOrderKey> runs;
@@ -684,8 +710,7 @@
 +    if (it == runs.end()) {
 +      it = runs.insert(runs.end(), key);
 +    }
-+    const size_t region =
-+        IsFavorite(key, default_space) ? 0 : (key.pinned ? 1 : 2);
++    const size_t region = IsFavorite(key, favorites) ? 0 : (key.pinned ? 1 : 2);
 +    rank.emplace_back(region, static_cast<size_t>(it - runs.begin()));
 +  }
 +
@@ -719,8 +744,8 @@
 +
 +// Which run of the tab strip a tab belongs to. The tab strip keeps pinned tabs
 +// first, and within that each space's pinned tabs together, and the same for
-+// unpinned tabs. Favorites, the default space's pinned tabs, come before
-+// every other pinned tab.
++// unpinned tabs. Favorites, pinned tabs whose space is `favorites`, come
++// before every other pinned tab.
 +struct TabOrderKey {
 +  base::Uuid space;
 +  bool pinned = false;
@@ -730,7 +755,7 @@
 +
 +// Whether `keys`, one per tab in tab strip order, follow the rule above.
 +bool IsTabOrderValid(base::span<const TabOrderKey> keys,
-+                     const base::Uuid& default_space);
++                     const base::Uuid& favorites);
 +
 +// Where a tab with `key` may go if inserted at `index` among `keys`, which
 +// are in order and don't include it: `index`, clamped to the pinned or
@@ -739,21 +764,21 @@
 +size_t ConstrainTabIndex(base::span<const TabOrderKey> keys,
 +                         const TabOrderKey& key,
 +                         size_t index,
-+                         const base::Uuid& default_space);
++                         const base::Uuid& favorites);
 +
 +// The order, as indices into `units`, that follows the rule above. A unit is
 +// a tab, or tabs that must stay together, such as a tab group. Changes as
 +// little as it can: units keep their order within a run, and runs keep the
 +// order of their first units, except that favorites come first.
 +std::vector<size_t> GetValidTabOrder(base::span<const TabOrderKey> units,
-+                                     const base::Uuid& default_space);
++                                     const base::Uuid& favorites);
 +
 +}  // namespace spaces
 +
 +#endif  // CHROME_BROWSER_UI_SPACES_SPACE_ORDER_H_
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/space_order_unittest.cc
-@@ -0,0 +1,156 @@
+@@ -0,0 +1,170 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -772,14 +797,16 @@
 +namespace {
 +
 +// Tabs are written as one letter each: D, W and P for unpinned tabs of the
-+// default, Work and Play spaces, and lower case for pinned ones, so "d" is a
++// default, Work and Play spaces, lower case for pinned ones, and "f" for a
 +// favorite.
 +class SpaceOrderTest : public testing::Test {
 + protected:
 +  TabOrderKey Key(char letter) const {
 +    const char upper = static_cast<char>(std::toupper(letter));
 +    const base::Uuid& space =
-+        upper == 'W' ? work_ : (upper == 'P' ? play_ : default_);
++        upper == 'F'
++            ? favorites_
++            : (upper == 'W' ? work_ : (upper == 'P' ? play_ : default_));
 +    return {space, letter != upper};
 +  }
 +
@@ -792,22 +819,23 @@
 +  }
 +
 +  bool IsValid(const std::string& tabs) const {
-+    return IsTabOrderValid(Keys(tabs), default_);
++    return IsTabOrderValid(Keys(tabs), favorites_);
 +  }
 +
 +  size_t Constrain(const std::string& tabs, char tab, size_t index) const {
-+    return ConstrainTabIndex(Keys(tabs), Key(tab), index, default_);
++    return ConstrainTabIndex(Keys(tabs), Key(tab), index, favorites_);
 +  }
 +
 +  // `tabs` reordered by GetValidTabOrder().
 +  std::string Fix(const std::string& tabs) const {
 +    std::string fixed;
-+    for (size_t index : GetValidTabOrder(Keys(tabs), default_)) {
++    for (size_t index : GetValidTabOrder(Keys(tabs), favorites_)) {
 +      fixed += tabs[index];
 +    }
 +    return fixed;
 +  }
 +
++  const base::Uuid favorites_ = base::Uuid::GenerateRandomV4();
 +  const base::Uuid default_ = base::Uuid::GenerateRandomV4();
 +  const base::Uuid work_ = base::Uuid::GenerateRandomV4();
 +  const base::Uuid play_ = base::Uuid::GenerateRandomV4();
@@ -818,9 +846,12 @@
 +  EXPECT_TRUE(IsValid("D"));
 +  EXPECT_TRUE(IsValid("DDWWPP"));
 +  EXPECT_TRUE(IsValid("PPDDWW"));
-+  EXPECT_TRUE(IsValid("ddwwppDWP"));
-+  EXPECT_TRUE(IsValid("ddppwwWWDD"));
++  EXPECT_TRUE(IsValid("ffwwppDWP"));
++  EXPECT_TRUE(IsValid("ffppwwWWDD"));
 +  EXPECT_TRUE(IsValid("wwPP"));
++  // The default space's pinned tabs are a run like any space's.
++  EXPECT_TRUE(IsValid("ffddwwDW"));
++  EXPECT_TRUE(IsValid("wwddPP"));
 +}
 +
 +TEST_F(SpaceOrderTest, InvalidOrders) {
@@ -828,7 +859,8 @@
 +  EXPECT_FALSE(IsValid("DWWPD"));
 +  EXPECT_FALSE(IsValid("wpwW"));
 +  // Favorites come before other pinned tabs.
-+  EXPECT_FALSE(IsValid("wdW"));
++  EXPECT_FALSE(IsValid("wfW"));
++  EXPECT_FALSE(IsValid("dfD"));
 +  // Pinned tabs come first.
 +  EXPECT_FALSE(IsValid("Ww"));
 +}
@@ -859,26 +891,30 @@
 +
 +TEST_F(SpaceOrderTest, ConstrainKeepsPinnedTabsApart) {
 +  // Unpinned tabs go after every pinned tab.
-+  EXPECT_EQ(Constrain("dwWW", 'W', 0), 2u);
++  EXPECT_EQ(Constrain("fwWW", 'W', 0), 2u);
 +  // Pinned tabs go before every unpinned tab.
-+  EXPECT_EQ(Constrain("dwWW", 'w', 4), 2u);
++  EXPECT_EQ(Constrain("fwWW", 'w', 4), 2u);
 +}
 +
 +TEST_F(SpaceOrderTest, ConstrainKeepsFavoritesFirst) {
-+  EXPECT_EQ(Constrain("ddwwpp", 'd', 6), 2u);
-+  EXPECT_EQ(Constrain("ddwwpp", 'd', 4), 2u);
-+  EXPECT_EQ(Constrain("wwpp", 'd', 3), 0u);
-+  EXPECT_EQ(Constrain("ddwwpp", 'w', 0), 2u);
-+  // A space's first pinned tab goes after the favorites.
-+  EXPECT_EQ(Constrain("ddpp", 'w', 0), 2u);
-+  EXPECT_EQ(Constrain("ddpp", 'w', 4), 4u);
-+  EXPECT_EQ(Constrain("ddpp", 'w', 3), 4u);
++  EXPECT_EQ(Constrain("ffwwpp", 'f', 6), 2u);
++  EXPECT_EQ(Constrain("ffwwpp", 'f', 4), 2u);
++  EXPECT_EQ(Constrain("wwpp", 'f', 3), 0u);
++  EXPECT_EQ(Constrain("ffwwpp", 'w', 0), 2u);
++  // A space's first pinned tab goes after the favorites, the default space's
++  // too.
++  EXPECT_EQ(Constrain("ffpp", 'w', 0), 2u);
++  EXPECT_EQ(Constrain("ffpp", 'w', 4), 4u);
++  EXPECT_EQ(Constrain("ffpp", 'w', 3), 4u);
++  EXPECT_EQ(Constrain("ffwwpp", 'd', 0), 2u);
++  EXPECT_EQ(Constrain("ddwwpp", 'f', 3), 0u);
 +}
 +
 +TEST_F(SpaceOrderTest, ConstrainGivesAValidOrder) {
-+  const std::string orders[] = {"", "D", "ddwwpp", "DDWWPP", "dpPPWWDD"};
++  const std::string orders[] = {"",       "D",        "ffwwpp",
++                                "DDWWPP", "fpPPWWDD", "ffddwwDD"};
 +  for (const std::string& order : orders) {
-+    for (char tab : std::string("DWPdwp")) {
++    for (char tab : std::string("DWPdwpf")) {
 +      for (size_t index = 0; index <= order.size(); ++index) {
 +        std::string result = order;
 +        result.insert(Constrain(order, tab, index), 1, tab);
@@ -891,20 +927,23 @@
 +
 +TEST_F(SpaceOrderTest, FixLeavesValidOrdersAlone) {
 +  EXPECT_EQ(Fix(""), "");
-+  EXPECT_EQ(Fix("ddwwppDDWWPP"), "ddwwppDDWWPP");
++  EXPECT_EQ(Fix("ffwwppDDWWPP"), "ffwwppDDWWPP");
 +  EXPECT_EQ(Fix("PPWWDD"), "PPWWDD");
 +}
 +
 +TEST_F(SpaceOrderTest, FixJoinsRunsInOrderOfTheirFirstTab) {
 +  EXPECT_EQ(Fix("WPW"), "WWP");
 +  EXPECT_EQ(Fix("DWPDPW"), "DDWWPP");
-+  // A removed space's tabs become default tabs.
++  // A removed space's tabs become default tabs, and its pinned tabs the
++  // default space's pinned tabs.
 +  EXPECT_EQ(Fix("DDPPDD"), "DDDDPP");
++  EXPECT_EQ(Fix("ffddwwdd"), "ffddddww");
 +}
 +
 +TEST_F(SpaceOrderTest, FixPutsFavoritesFirst) {
-+  EXPECT_EQ(Fix("wwdpd"), "ddwwp");
-+  EXPECT_EQ(Fix("wdWDw"), "dwwWD");
++  EXPECT_EQ(Fix("wwfpf"), "ffwwp");
++  EXPECT_EQ(Fix("wfWDw"), "fwwWD");
++  EXPECT_EQ(Fix("dwf"), "fdw");
 +}
 +
 +}  // namespace

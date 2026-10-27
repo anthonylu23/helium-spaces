@@ -31,20 +31,14 @@
  test("spaces_unittests") {
 --- a/chrome/browser/ui/spaces/space_controller.cc
 +++ b/chrome/browser/ui/spaces/space_controller.cc
-@@ -78,6 +78,19 @@ void SpaceController::SwitchToSpace(cons
+@@ -88,6 +88,13 @@ void SpaceController::SwitchToSpace(cons
    ActivateTabInActiveSpace();
  }
  
-+const base::Uuid& SpaceController::default_space_id() const {
-+  return registry_->GetDefaultSpace().id;
-+}
-+
 +void SpaceController::AddTabsToFavorites(
 +    const std::vector<tabs::TabInterface*>& tabs) {
 +  for (tabs::TabInterface* tab : tabs) {
-+    if (tab->IsPinned()) {
-+      MoveTabToSpace(tab, default_space_id());
-+    }
++    MoveTabToSpace(tab, GetFavoritesId());
 +  }
 +}
 +
@@ -53,19 +47,16 @@
        GetAdjacentSpaceId(registry_->spaces(), active_space_id_, forward));
 --- a/chrome/browser/ui/spaces/space_controller.h
 +++ b/chrome/browser/ui/spaces/space_controller.h
-@@ -74,6 +74,11 @@ class SpaceController : public TabSpaceF
+@@ -79,6 +79,8 @@ class SpaceController : public TabSpaceF
    // The id of the space shown. Always a space in the registry.
    const base::Uuid& active_space_id() const { return active_space_id_; }
  
-+  // The id of the profile's default space.
-+  const base::Uuid& default_space_id() const;
-+
 +  SpaceRegistry* registry() const { return registry_; }
 +
    // Shows `space_id` and activates its most recently active tab, or opens a
-   // new tab in it if it has none. An unknown id means the default space.
-   void SwitchToSpace(const base::Uuid& space_id);
-@@ -124,6 +129,8 @@ class SpaceController : public TabSpaceF
+   // new tab in it if it has none. An unknown id, or the favorites', means the
+   // default space.
+@@ -131,6 +133,8 @@ class SpaceController : public TabSpaceF
    void WillSplitTabs(const std::vector<tabs::TabInterface*>& tabs,
                       const tabs::TabInterface* pivot) override;
    void WillSwapTabs(tabs::TabInterface* a, tabs::TabInterface* b) override;
@@ -76,7 +67,7 @@
    base::CallbackListSubscription RegisterTabVisibilityChanged(
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/space_menu_model.cc
-@@ -0,0 +1,152 @@
+@@ -0,0 +1,150 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -147,13 +138,12 @@
 +  if (!controller || menu_tabs.empty()) {
 +    return std::nullopt;
 +  }
-+  // Only when every tab the item acts on would join or leave the favorites.
-+  if (std::ranges::all_of(menu_tabs, [&](const tabs::TabInterface* tab) {
-+        return controller->GetSpaceOfTab(tab) ==
-+               controller->default_space_id();
++  // Only when every tab the item acts on would leave the favorites.
++  if (!will_pin &&
++      std::ranges::all_of(menu_tabs, [&](const tabs::TabInterface* tab) {
++        return controller->IsFavorite(tab);
 +      })) {
-+    return will_pin ? IDS_SPACES_TAB_CXMENU_ADD_TO_FAVORITES
-+                    : IDS_SPACES_TAB_CXMENU_REMOVE_FROM_FAVORITES;
++    return IDS_SPACES_TAB_CXMENU_REMOVE_FROM_FAVORITES;
 +  }
 +  return std::nullopt;
 +}
@@ -161,8 +151,7 @@
 +bool ShouldShowAddToFavorites(TabStripModel* tab_strip, int context_index) {
 +  SpaceController* controller = GetController(tab_strip);
 +  return controller && tab_strip->ContainsIndex(context_index) &&
-+         controller->GetSpaceOfTab(tab_strip->GetTabAtIndex(context_index)) !=
-+             controller->default_space_id();
++         !controller->IsFavorite(tab_strip->GetTabAtIndex(context_index));
 +}
 +
 +// static
@@ -231,7 +220,7 @@
 +}  // namespace spaces
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/space_menu_model.h
-@@ -0,0 +1,76 @@
+@@ -0,0 +1,75 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -265,15 +254,14 @@
 +
 +// The string of the Pin item for the tab at `context_index`, which pins if
 +// `will_pin` and unpins otherwise, or nullopt to keep Chromium's
-+// "Pin"/"Unpin". Pinning tabs of the default space makes them favorites, so
-+// it reads "Add to Favorites", and unpinning favorites reads "Remove from
-+// Favorites", when the item acts only on tabs of the default space.
++// "Pin"/"Unpin". Unpinning favorites reads "Remove from Favorites" when the
++// item acts only on favorites.
 +std::optional<int> GetPinMenuItemStringId(TabStripModel* tab_strip,
 +                                          int context_index,
 +                                          bool will_pin);
 +
-+// Whether the tab menu offers "Add to Favorites" next to Pin: for tabs of
-+// spaces other than the default one, where Pin keeps a tab in its space.
++// Whether the tab menu offers "Add to Favorites" next to Pin, which keeps a
++// tab in its space: for tabs that aren't favorites.
 +bool ShouldShowAddToFavorites(TabStripModel* tab_strip, int context_index);
 +
 +// The "Move to space" submenu: the spaces other than the context tab's, in
@@ -341,12 +329,11 @@
  </grit-part>
 --- a/chrome/browser/ui/spaces/tab_space_filter.h
 +++ b/chrome/browser/ui/spaces/tab_space_filter.h
-@@ -76,6 +76,11 @@ class TabSpaceFilter {
+@@ -76,6 +76,10 @@ class TabSpaceFilter {
    // spaces too.
    virtual void WillSwapTabs(tabs::TabInterface* a, tabs::TabInterface* b) = 0;
  
-+  // Moves `tabs`, which are pinned, to the default space, which makes them
-+  // favorites.
++  // Makes `tabs`, which are pinned, favorites, shown in every space.
 +  virtual void AddTabsToFavorites(
 +      const std::vector<tabs::TabInterface*>& tabs) = 0;
 +
@@ -441,7 +428,7 @@
 -  AddItemWithStringId(
 -      TabStripModel::CommandTogglePinned,
 -      will_pin ? IDS_TAB_CXMENU_PIN_TAB : IDS_TAB_CXMENU_UNPIN_TAB);
-+  // helium-spaces: Pinning a tab of the default space makes it a favorite.
++  // helium-spaces: Unpinning a favorite reads "Remove from Favorites".
 +  AddItemWithStringId(TabStripModel::CommandTogglePinned,
 +                      spaces::GetPinMenuItemStringId(tab_strip_, index,
 +                                                     will_pin)
@@ -450,11 +437,12 @@
  
    if (features::IsMenuSimplificationEnabled()) {
      SetIconForCommandId(
-@@ -530,6 +542,12 @@ void TabMenuModel::Build(int index) {
+@@ -530,6 +542,13 @@ void TabMenuModel::Build(int index) {
              ui::kColorMenuIcon, ui::SimpleMenuModel::kDefaultIconSize));
    }
  
-+  // helium-spaces: In other spaces, Pin keeps a tab in its space.
++  // helium-spaces: Pin keeps a tab in its space; this shows it in every
++  // space.
 +  if (spaces::ShouldShowAddToFavorites(tab_strip_, index)) {
 +    AddItemWithStringId(TabStripModel::CommandAddToFavorites,
 +                        IDS_SPACES_TAB_CXMENU_ADD_TO_FAVORITES);

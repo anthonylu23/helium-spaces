@@ -119,7 +119,7 @@
  test("spaces_unittests") {
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/space_controller.cc
-@@ -0,0 +1,319 @@
+@@ -0,0 +1,336 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -131,6 +131,7 @@
 +
 +#include "base/functional/bind.h"
 +#include "base/location.h"
++#include "base/no_destructor.h"
 +#include "base/task/sequenced_task_runner.h"
 +#include "chrome/browser/profiles/profile.h"
 +#include "chrome/browser/tab_list/tab_removed_reason.h"
@@ -148,6 +149,12 @@
 +namespace spaces {
 +
 +DEFINE_USER_DATA(SpaceController);
++
++const base::Uuid& GetFavoritesId() {
++  static const base::NoDestructor<base::Uuid> id(
++      base::Uuid::ParseLowercase("c0c43411-377a-4717-9d67-f52924a6d0a6"));
++  return *id;
++}
 +
 +// static
 +std::unique_ptr<SpaceController> SpaceController::MaybeCreate(
@@ -188,7 +195,10 @@
 +}
 +
 +void SpaceController::SwitchToSpace(const base::Uuid& space_id) {
-+  const base::Uuid space = ResolveSpace(space_id);
++  // The favorites show in every space, so they are none to switch to.
++  const base::Uuid space = space_id == GetFavoritesId()
++                               ? registry_->GetDefaultSpace().id
++                               : ResolveSpace(space_id);
 +  if (space == active_space_id_) {
 +    return;
 +  }
@@ -199,7 +209,8 @@
 +void SpaceController::MoveTabToSpace(tabs::TabInterface* tab,
 +                                     const base::Uuid& space_id) {
 +  const base::Uuid space = ResolveSpace(space_id);
-+  if (space == GetSpaceOfTab(tab)) {
++  if (space == GetSpaceOfTab(tab) ||
++      (space == GetFavoritesId() && !tab->IsPinned())) {
 +    return;
 +  }
 +  if (tab->GetGroup()) {
@@ -218,12 +229,17 @@
 +}
 +
 +base::Uuid SpaceController::GetSpaceOfTab(const tabs::TabInterface* tab) const {
-+  return ResolveSpace(SpaceTabHelper::GetSpaceId(tab->GetContents()));
++  const base::Uuid space_id = SpaceTabHelper::GetSpaceId(tab->GetContents());
++  if (space_id == GetFavoritesId() && !tab->IsPinned()) {
++    // Favorites are pinned; one unpinned some other way is the default
++    // space's.
++    return registry_->GetDefaultSpace().id;
++  }
++  return ResolveSpace(space_id);
 +}
 +
 +bool SpaceController::IsFavorite(const tabs::TabInterface* tab) const {
-+  return tab->IsPinned() &&
-+         GetSpaceOfTab(tab) == registry_->GetDefaultSpace().id;
++  return GetSpaceOfTab(tab) == GetFavoritesId();
 +}
 +
 +bool SpaceController::IsTabInActiveSpace(const tabs::TabInterface* tab) const {
@@ -338,7 +354,8 @@
 +}
 +
 +base::Uuid SpaceController::ResolveSpace(const base::Uuid& space_id) const {
-+  return space_id.is_valid() && registry_->GetSpace(space_id)
++  return space_id.is_valid() &&
++                 (space_id == GetFavoritesId() || registry_->GetSpace(space_id))
 +             ? space_id
 +             : registry_->GetDefaultSpace().id;
 +}
@@ -441,7 +458,7 @@
 +}  // namespace spaces
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/space_controller.h
-@@ -0,0 +1,149 @@
+@@ -0,0 +1,157 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -473,6 +490,11 @@
 +}
 +
 +namespace spaces {
++
++// The space id stored on a favorite, which is no space in the registry. As in
++// Arc, favorites belong to the profile rather than to a space, and show in
++// every space.
++const base::Uuid& GetFavoritesId();
 +
 +// Shows one space at a time in a normal browser window, and keeps the window's
 +// tabs in their spaces:
@@ -508,21 +530,23 @@
 +  const base::Uuid& active_space_id() const { return active_space_id_; }
 +
 +  // Shows `space_id` and activates its most recently active tab, or opens a
-+  // new tab in it if it has none. An unknown id means the default space.
++  // new tab in it if it has none. An unknown id, or the favorites', means the
++  // default space.
 +  void SwitchToSpace(const base::Uuid& space_id);
 +
-+  // Moves `tab` to `space_id`; an unknown id means the default space. It
-+  // leaves its tab group, since a group stays within one space. If `tab` was
-+  // the active tab, the window stays in the active space and activates
-+  // another tab there.
++  // Moves `tab` to `space_id`, or to the favorites if it is GetFavoritesId()
++  // and `tab` is pinned; an unknown id means the default space. It leaves its
++  // tab group, since a group stays within one space. If `tab` was the active
++  // tab, the window stays in the active space and activates another tab
++  // there.
 +  void MoveTabToSpace(tabs::TabInterface* tab, const base::Uuid& space_id);
 +
-+  // The space `tab` belongs to: the default space if it has none, or if its
-+  // space no longer exists.
++  // The space `tab` belongs to: GetFavoritesId() for a favorite, or the
++  // default space if it has none, or if its space no longer exists.
 +  base::Uuid GetSpaceOfTab(const tabs::TabInterface* tab) const;
 +
-+  // Whether `tab` is a favorite: pinned, in the default space, and shown in
-+  // every space.
++  // Whether `tab` is a favorite: pinned, stored with GetFavoritesId(), and
++  // shown in every space.
 +  bool IsFavorite(const tabs::TabInterface* tab) const;
 +
 +  // TabSpaceFilter:
@@ -542,7 +566,8 @@
 +  void OnSpacesChanged() override;
 +
 + private:
-+  // Returns `space_id` if it is in the registry, else the default space.
++  // Returns `space_id` if it is in the registry or the favorites', else the
++  // default space.
 +  base::Uuid ResolveSpace(const base::Uuid& space_id) const;
 +
 +  // Sets the active space and tells the tab strips if it changed.
