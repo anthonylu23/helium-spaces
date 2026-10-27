@@ -20,7 +20,7 @@
 //      space, and tab menu commands only count its tabs.
 //   8. Flag on: the space commands, the tab menu's Spaces items, and drops on
 //      a space's icon.
-//   9. Flag on: three spaces of ten tabs each, with favorites, space-pinned
+//   9. Flag on: three spaces of ten tabs each, with a favorite, space-pinned
 //      tabs and groups, come back the same after two restarts (Gate 1).
 // Needs a global WebSocket: Node 22+, or Node 20.10+ with --experimental-websocket.
 // Exits non-zero on any failed check.
@@ -237,7 +237,7 @@ function tabList(state, windowId = undefined) {
   const window = windowId === undefined ? state.windows[0] : state.windows.find((w) => w.session_id === windowId);
   return window.tabs.map((tab) => ({
     ...tab, window: window.session_id, name: testTabName(tab.url),
-    space: names.get(tab.space_id) ?? 'default',
+    space: tab.favorite ? 'favorites' : (names.get(tab.space_id) ?? 'default'),
   }));
 }
 
@@ -346,11 +346,20 @@ async function checkSwitching() {
   check('Cmd+1 and Cmd+9 pick the first and last tab of the active space',
         first === workIndices[0] && last === workIndices.at(-1), `got ${first}, ${last}; Work tabs ${workIndices}`);
 
-  // A pinned tab in the default space is a favorite, shown in every space.
-  await send('pinTab', win, find(state, 'D1').index, true);
+  // A favorite shows in every space, as in Arc.
+  await send('tabMenuCommand', win, find(state, 'D1').index, 'addToFavorites');
   state = await internalsState(cdp);
-  check('a pinned default tab is shown in other spaces',
-        find(state, 'D1')?.pinned && find(state, 'D1')?.in_active_space && !find(state, 'D2')?.in_active_space);
+  check('a favorite is shown in other spaces',
+        find(state, 'D1')?.favorite && find(state, 'D1')?.pinned && find(state, 'D1')?.in_active_space &&
+        !find(state, 'D2')?.in_active_space, JSON.stringify(find(state, 'D1')));
+  // Pinning keeps a tab in its space, the default space's too.
+  await send('pinTab', win, find(state, 'D2').index, true);
+  state = await internalsState(cdp);
+  check("a pinned tab of the default space is no favorite, and hidden in other spaces",
+        find(state, 'D2')?.pinned && find(state, 'D2')?.space === 'default' && !find(state, 'D2')?.in_active_space,
+        JSON.stringify(find(state, 'D2')));
+  await send('pinTab', win, find(state, 'D2').index, false);
+  state = await internalsState(cdp);
   await send('runCommand', win, 'selectFirstTab');
   state = await internalsState(cdp);
   check('activating a favorite keeps the active space',
@@ -363,10 +372,8 @@ async function checkSwitching() {
   check('unpinning the active favorite moves it to the active space',
         activeSpace(state) === 'Work' && active(state)?.name === 'D1' && find(state, 'D1')?.space === 'Work',
         `active space ${activeSpace(state)}, D1 in ${find(state, 'D1')?.space}`);
-  // Make it a favorite again: a pinned tab of the default space.
-  await send('pinTab', win, find(state, 'D1').index, true);
-  state = await internalsState(cdp);
-  await send('assignTab', win, find(state, 'D1').index, '');
+  // Make it a favorite again.
+  await send('tabMenuCommand', win, find(state, 'D1').index, 'addToFavorites');
   state = await internalsState(cdp);
 
   await send('switchSpace', win, ids.Play);
@@ -425,7 +432,7 @@ async function checkSwitching() {
         spaceTabs(state, 'Work').length === 1 && shownOnTheWay.length === 0,
         `active space ${activeSpace(state)}, active tab ${active(state)?.name ?? active(state)?.url} in ${active(state)?.space}, ` +
         `shown on the way: ${shownOnTheWay.map((t) => t.name ?? t.url)}`);
-  await send('assignTab', win, find(state, 'D1').index, '');
+  await send('tabMenuCommand', win, find(state, 'D1').index, 'addToFavorites');
 
   await send('activateTab', win, find(state, 'P1').index);
   state = await internalsState(cdp);
@@ -450,7 +457,7 @@ async function checkSwitching() {
   ({ cdp, close } = await launch(profile, [...args, '--restore-last-session'], undefined, INTERNALS));
   state = await waitForNamedTabs(cdp, ['D1', 'D2', 'W3', 'P1']);
   check('the active space survives a restart with a favorite active',
-        activeSpace(state) === 'Work' && active(state)?.name === 'D1' && find(state, 'D1')?.pinned,
+        activeSpace(state) === 'Work' && active(state)?.name === 'D1' && find(state, 'D1')?.favorite,
         `active space ${activeSpace(state)}, active tab ${active(state)?.name ?? active(state)?.url}`);
   await close();
 }
@@ -546,9 +553,9 @@ async function checkOrder() {
   for (const name of ['F1', 'F2', 'D1']) await openTestTab(cdp, name);
   state = await waitForNamedTabs(cdp, ['F1', 'F2', 'D1']);
   const ids = Object.fromEntries(state.spaces.map((s) => [s.name, s.id]));
-  await send('pinTab', win, find(state, 'F1').index, true);
+  await send('tabMenuCommand', win, find(state, 'F1').index, 'addToFavorites');
   state = await internalsState(cdp);
-  await send('pinTab', win, find(state, 'F2').index, true);
+  await send('tabMenuCommand', win, find(state, 'F2').index, 'addToFavorites');
   await send('switchSpace', win, ids.Work);
   for (const name of ['W1', 'W2']) await openTestTab(cdp, name);
   await send('switchSpace', win, ids.Play);
@@ -628,12 +635,12 @@ async function checkOrder() {
         defaults.slice(-2).join() === [find(state, 'W3')?.index, find(state, 'P2')?.index].sort((a, b) => a - b).join() &&
         ordered(state), order(state));
 
-  // Pinned, the default space's split becomes two favorites, which Chromium
-  // would put after Work's and Play's pinned tabs.
-  await send('tabMenuCommand', win, find(state, 'W3').index, 'togglePinned');
+  // Added to the favorites, the default space's split moves from the end of
+  // the pinned tabs, after Work's and Play's, to the favorites.
+  await send('tabMenuCommand', win, find(state, 'W3').index, 'addToFavorites');
   state = await internalsState(cdp);
-  check('a pinned split view of the default space goes with the favorites',
-        find(state, 'W3')?.pinned && find(state, 'P2')?.pinned &&
+  check('a split view added to the favorites goes with them',
+        find(state, 'W3')?.favorite && find(state, 'P2')?.favorite &&
         [find(state, 'W3')?.index, find(state, 'P2')?.index].sort().join() === '2,3' && ordered(state),
         order(state));
 
@@ -680,12 +687,12 @@ async function checkOrder() {
   check("a reopened tab goes back among its space's tabs",
         reopened && run(state, 'Work').includes(reopened.index) && ordered(state), order(state));
 
-  // Play's pinned tab becomes a favorite, so it moves before Work's pinned tab.
+  // Play's pinned tab becomes a pinned tab of the default space, not a
+  // favorite.
   await send('removeSpace', ids.Play);
   state = await internalsState(cdp);
-  check("removing a space puts its tabs with the default space's, and its pinned tabs with the favorites",
-        find(state, 'P1')?.space === 'default' && find(state, 'P1')?.index < find(state, 'W1')?.index &&
-        ordered(state), order(state));
+  check("removing a space puts its tabs with the default space's, its pinned tabs too",
+        find(state, 'P1')?.space === 'default' && find(state, 'P1')?.pinned && ordered(state), order(state));
 
   for (const name of ['W4', 'W5']) await openTestTab(cdp, name);
   state = await waitForNamedTabs(cdp, ['W4', 'W5']);
@@ -703,7 +710,7 @@ async function checkOrder() {
   await send('moveTabToWindow', win, find(state, 'F1').index, win2, 0);
   state = await internalsState(cdp);
   check('a favorite moved to another window stays a favorite',
-        find(state, 'F1', win2)?.space === 'default' && find(state, 'F1', win2)?.pinned && ordered(state),
+        find(state, 'F1', win2)?.favorite && ordered(state),
         order(state, win2));
   await send('splitTabs', win, [find(state, 'W4').index, find(state, 'W5').index]);
   state = await internalsState(cdp);
@@ -725,7 +732,7 @@ async function checkOrder() {
   await send('runCommand', win, 'newTab');
   state = await internalsState(cdp);
   const favorite = active(state);
-  await send('pinTab', win, favorite.index, true);
+  await send('tabMenuCommand', win, favorite.index, 'addToFavorites');
   await send('switchSpace', win, ids.Work);
   await send('runCommand', win, 'newTab');
   state = await internalsState(cdp);
@@ -742,7 +749,7 @@ async function checkOrder() {
   await send('runCommand', win, 'newTab');
   state = await internalsState(cdp);
   const workTab = active(state);
-  const fav = tabList(state).find((t) => t.pinned && t.space === 'default');
+  const fav = tabList(state).find((t) => t.favorite);
   await send('moveTabsToNewWindow', win, [fav.index, workTab.index]);
   await sleep(500);
   state = await internalsState(cdp);
@@ -750,7 +757,7 @@ async function checkOrder() {
   const moved = tabList(state, win3);
   check('tabs moved to a new window with a favorite keep their space',
         moved.find((t) => t.id === workTab.id)?.space === 'Work' &&
-        moved.find((t) => t.id === fav.id)?.pinned && ordered(state),
+        moved.find((t) => t.id === fav.id)?.favorite && ordered(state),
         win3 ? order(state, win3) : 'no new window');
   await close();
 }
@@ -774,7 +781,7 @@ async function checkMovesInSpace() {
   for (const name of ['F1', 'D1']) await openTestTab(cdp, name);
   state = await waitForNamedTabs(cdp, ['F1', 'D1']);
   const ids = Object.fromEntries(state.spaces.map((s) => [s.name, s.id]));
-  await send('pinTab', win, find(state, 'F1').index, true);
+  await send('tabMenuCommand', win, find(state, 'F1').index, 'addToFavorites');
   await send('switchSpace', win, ids.Play);
   for (const name of ['P1', 'P2']) await openTestTab(cdp, name);
   await send('switchSpace', win, ids.Work);
@@ -885,7 +892,7 @@ async function checkSpaceCommands() {
   for (const name of ['F1', 'D1']) await openTestTab(cdp, name);
   state = await waitForNamedTabs(cdp, ['F1', 'D1']);
   const ids = Object.fromEntries(state.spaces.map((s) => [s.name, s.id]));
-  await send('pinTab', win, find(state, 'F1').index, true);
+  await send('tabMenuCommand', win, find(state, 'F1').index, 'addToFavorites');
   await send('switchSpace', win, ids.Work);
   for (const name of ['W1', 'W2', 'W3', 'W4', 'W5']) await openTestTab(cdp, name);
   await send('switchSpace', win, ids.Play);
@@ -936,8 +943,8 @@ async function checkSpaceCommands() {
 
   await send('switchSpace', win, ids[undefined] ?? state.spaces.find((s) => s.default).id);
   items = await menu('D1');
-  check("Pin reads Add to Favorites for the default space's tabs",
-        labels(items).filter((l) => l === 'Add to Favorites').length === 1 && !labels(items).includes('Pin'),
+  check("a tab of the default space offers Pin and Add to Favorites too",
+        labels(items).includes('Pin') && labels(items).filter((l) => l === 'Add to Favorites').length === 1,
         labels(items).join());
 
   await send('switchSpace', win, ids.Work);
@@ -958,7 +965,7 @@ async function checkSpaceCommands() {
   await send('activateTab', win, find(state, 'W2').index);
   state = await menuItem('W2', 'Add to Favorites');
   check('"Add to Favorites" makes the active tab a favorite and keeps the space',
-        find(state, 'W2')?.pinned && find(state, 'W2')?.space === 'default' && !find(state, 'W2')?.grouped &&
+        find(state, 'W2')?.favorite && find(state, 'W2')?.pinned && !find(state, 'W2')?.grouped &&
         find(state, 'W2')?.active && activeSpace(state) === 'Work' && ordered(state), order(state));
   state = await menuItem('W2', 'Remove from Favorites');
   check('"Remove from Favorites" moves a favorite to the active space',
@@ -971,7 +978,7 @@ async function checkSpaceCommands() {
   state = await menuItem('F1', 'Move Tab into Split View', 'Swap with Left View');
   check('swapping a favorite into a split view swaps the two tabs\' spaces',
         find(state, 'F1')?.space === 'Work' && !find(state, 'F1')?.pinned && find(state, 'F1')?.split &&
-        find(state, 'W2')?.space === 'default' && find(state, 'W2')?.pinned && ordered(state), order(state));
+        find(state, 'W2')?.favorite && ordered(state), order(state));
 
   // Leave Work with W6, W7 and W8, then group W7 and W8, the last of Work's
   // tabs, followed by Play's.
@@ -1043,10 +1050,14 @@ async function checkRestartAtScale() {
     await send('switchSpace', win, ids[space]);
     for (let i = 0; i < 10; i++) await openTestTab(cdp, prefix + i, { background: true });
     state = await waitForNamedTabs(cdp, names.filter((n) => n.startsWith(prefix)));
-    // Pins 0 and 1 (favorites in the default space) and groups 2 to 4.
+    // Pins 0 and 1, but makes D0 a favorite, and groups 2 to 4.
     for (const n of [0, 1]) {
       state = await internalsState(cdp);
-      await send('pinTab', win, find(state, prefix + n).index, true);
+      if (prefix + n === 'D0') {
+        await send('tabMenuCommand', win, find(state, prefix + n).index, 'addToFavorites');
+      } else {
+        await send('pinTab', win, find(state, prefix + n).index, true);
+      }
     }
     state = await internalsState(cdp);
     await send('groupTabs', win, [2, 3, 4].map((n) => find(state, prefix + n).index));
@@ -1070,6 +1081,7 @@ async function checkRestartAtScale() {
   check('30 tabs in three spaces, with favorites, space-pinned tabs and groups',
         tabList(state).filter((t) => t.name).length === 30 && ordered(state) &&
         ['D0', 'D1', 'W0', 'W1', 'P0', 'P1'].every((n) => find(state, n)?.pinned) &&
+        find(state, 'D0')?.favorite && find(state, 'D1')?.space === 'default' &&
         ['D', 'W', 'P'].every((p) => find(state, p + 2)?.grouped && find(state, p + 2)?.group === find(state, p + 4)?.group) &&
         activeSpace(state) === 'Work' && active(state) === 'W5', before);
   await close({ waitForSessionSave: true });

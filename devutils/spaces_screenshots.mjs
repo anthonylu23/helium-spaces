@@ -4,7 +4,7 @@
 // logged-in macOS session, and Screen Recording permission for the terminal
 // that runs it (screencapture). Builds this fixture through
 // chrome://spaces-internals:
-//   default space: F1 (pinned, so a favorite), D1, and the internals tab
+//   default space: F1 (a favorite), D1, and the internals tab
 //   Work:          W1, W2 and W3, with W2 and W3 in a tab group
 //   Play:          P1 (pinned, so only shown in Play) and P2
 // then, for each layout (Classic, Compact, Vertical, Dynamic) and each space,
@@ -99,7 +99,7 @@ try {
   for (const name of ['P1', 'P2']) await open(name);
   await sleep(1500);
   s = await state();
-  await send('pinTab', win, index(s, 'F1'), true);
+  await send('tabMenuCommand', win, index(s, 'F1'), 'addToFavorites');
   s = await state();
   await send('pinTab', win, index(s, 'P1'), true);
   s = await state();

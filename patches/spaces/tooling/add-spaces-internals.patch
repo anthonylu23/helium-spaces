@@ -45,7 +45,7 @@ enabled.
  test("spaces_unittests") {
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/spaces_internals_ui.cc
-@@ -0,0 +1,999 @@
+@@ -0,0 +1,1002 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -226,6 +226,7 @@ enabled.
 +  ProfileBrowserCollection::GetForProfile(profile)->ForEach(
 +      [&windows](BrowserWindowInterface* browser) {
 +        TabStripModel* tab_strip = browser->GetTabStripModel();
++        SpaceController* controller = SpaceController::From(browser);
 +        base::ListValue tabs;
 +        for (int i = 0; i < tab_strip->count(); ++i) {
 +          content::WebContents* contents = tab_strip->GetWebContentsAt(i);
@@ -253,9 +254,11 @@ enabled.
 +                  .Set("space_id", space_id.is_valid()
 +                                       ? space_id.AsLowercaseString()
 +                                       : std::string())
++                  .Set("favorite",
++                       controller &&
++                           controller->IsFavorite(tab_strip->GetTabAtIndex(i)))
 +                  .Set("in_active_space", tab_strip->IsTabInActiveSpace(i)));
 +        }
-+        SpaceController* controller = SpaceController::From(browser);
 +        windows.Append(
 +            base::DictValue()
 +                .Set("session_id", browser->GetSessionID().id())
