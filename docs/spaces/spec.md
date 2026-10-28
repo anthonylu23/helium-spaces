@@ -35,8 +35,8 @@ model, so session restore, drag and drop, and tab commands keep working.
   has one permanent default space with a fixed id; a tab with no space id
   belongs to it. Favorites belong to the profile, as in Arc, not to a space:
   a favorite is a pinned tab stored with a reserved favorites id instead of a
-  space id, and shows in every space. Every space, the default one too, has
-  its own pinned tabs.
+  space id, and shows in every space without separate logins (Feature 2).
+  Every space, the default one too, has its own pinned tabs.
 - Tab groups work inside a space, as in Arc. Spaces are not tab groups.
 - Each space's tabs stay together in the underlying TabStripModel order:
   its pinned tabs in one run, its other tabs in another, with favorites before
@@ -44,9 +44,9 @@ model, so session restore, drag and drop, and tab commands keep working.
   Moves, extensions' included, stay inside the tab's space; changing space is
   explicit (the tab menu, or dropping a tab on a switcher icon).
 - A tab dropped into another window joins the space that window shows, as in
-  Arc. Favorites stay favorites. Once spaces can have their own logins, Arc's
-  warning ("you could be logged out") applies when the two spaces' logins
-  differ.
+  Arc. Favorites stay favorites. Arc's warning ("you could be logged out")
+  would apply when the two spaces' logins differ; not built yet
+  (`deferred.md`).
 - Unpinning a favorite moves it to the active space, as in Arc. A tab added to
   a tab group joins the group's space.
 - Spaces must work in every Helium layout: Classic, Compact, Vertical, Dynamic.
@@ -86,7 +86,18 @@ cookies, cache, localStorage/IndexedDB/Cache API, service workers. Shared:
 bookmarks, history, passwords, extensions, settings.
 
 - A new tab in an isolated space gets a SiteInstance bound to that space's
-  partition. Moving a tab across partitions reloads it there.
+  partition. Moving a tab across partitions reloads it there: any change of
+  a tab's space, and turning a space's isolation on or off. Discarded,
+  restored and reopened tabs stay in their partition, session cookies last
+  across restarts, and the startup storage cleanup keeps every space's
+  storage. Turning isolation off keeps the storage; removing the space
+  deletes it.
+- The setting is "Separate logins in this space" in the Edit space bubble,
+  with a description of what doesn't work in such a space.
+- Favorites live in the profile's default partition, so a space with
+  separate logins doesn't show them, and offers Pin instead of "Add to
+  Favorites" (the user, 2026-10-27). Its pinned tabs take their place until
+  the favorites grid (Phase 7) can give such a space favorites of its own.
 - Extension behavior in non-default partitions is unverified. A spike (Phase 5)
   must answer: do uBlock filters apply, do content scripts inject, which jar
   does `chrome.cookies` see, does password fill work, do downloads/PiP/DevTools
@@ -132,7 +143,7 @@ New classes under `chrome/browser/ui/spaces/` and `chrome/browser/ui/views/space
 | SpaceRegistry (KeyedService) | Space list per profile, persisted to prefs |
 | SpaceTabHelper (per WebContents) | Space and folder id on each tab |
 | SpaceController (per Browser) | Active space per window, switching rules |
-| SpacePartitionManager | Space id to StoragePartitionConfig and SiteInstance |
+| space_partition.h, space_storage.h | Space id to StoragePartitionConfig and SiteInstance; a space's storage on disk |
 | TabArchiveService (KeyedService) | Archive timer and per-space archive list |
 | SpaceSwitcherView, SpaceSettingsBubble | Switcher strip and settings popover |
 | SpaceSwipeHandler | Turns sidebar horizontal scroll into space switches |

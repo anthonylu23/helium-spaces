@@ -209,12 +209,19 @@ spaces and tabs as JSON and takes `chrome.send()` messages; see
   which follows a path of labels. Labels are the Mac's Title Case ones.
   Untitled groups are labeled from their tabs' titles, which a background
   test tab may not have yet.
-- `setIsolation(space_id, true)` gives a space its own storage partition
-  (Phase 5 spike); each tab's `partition` is its partition's domain, empty
-  for the default one. `checkIsolation` serves a local site on 127.0.0.1 and
-  localhost whose `/show` page titles itself with the cookies it was sent,
-  uncached so that a restored tab asks again. Restored tabs load only once
+- `setIsolation(space_id, true)` gives a space its own storage partition;
+  each tab's `partition` is its partition's domain, empty for the default
+  one. A tab moved to other storage gets it in a posted task, so poll for it.
+  Each window's `partition_fixes` counts new tabs that opened in the wrong
+  partition and were moved; `checkIsolation` fails if it went up.
+  `checkIsolation` serves a local site on 127.0.0.1 and localhost whose
+  `/show` page titles itself with the cookies it was sent, uncached so that
+  a restored tab asks again. Restored and discarded tabs load only once
   activated, so it activates them first.
+- `discardTab` discards a tab as Memory Saver does; Helium turns off
+  `chrome://discards`. A window's session id changes at a restart.
+- `openLinkInNewWindow` opens a link from a window's active tab in a new
+  window, as "Open Link in New Window" and Shift-click do.
 - `collapseGroup` and `dropOnSpace` make the model calls the views make when
   a group is collapsed and when tabs are dropped on a switcher icon.
 - Every DevTools call times out after 30 s. A bug that closes the tab the test

@@ -226,3 +226,43 @@ Open risks: internal pages and extension pages inside a fixed partition
 (E20), and Helium's own ways of creating tabs that skip `Navigate()`. Our
 dev build isn't an official build, so DCHECKs are on and catch misuse of a
 fixed partition during the experiments.
+
+## Isolation v1 (2026-10-27)
+
+Branch `spaces/isolation-v1`. The prototype's four hooks, plus:
+
+| v1 item | How | Check |
+| --- | --- | --- |
+| Discard (E17) | `FinishDiscard()` creates the replacement WebContents with a SiteInstance fixed to the old one's partition | Smoke: a discarded tab reloads in its partition with its cookies |
+| Session cookies (E4) | `ConfigureNetworkContextParamsInternal()` treats a partition under `Storage/ext/heliumspace…` like the main one | Smoke: a session cookie survives a restart |
+| Storage cleanup (E19) | `GetSpaceStoragePaths()` in the allowlist of `GarbageCollectStoragePartitionsCommand`: every existing space's folder, isolated or not | Smoke: after a restart a removed space's folder is gone and another space's kept |
+| Clearing a space's data | `SpaceRegistry::RemoveSpace()` runs `ClearSpaceStorage()`: `AsyncObliterateStoragePartition()`, which clears what's open now and asks for the cleanup at the next startup, as extension uninstalls do | Smoke, as above |
+| webRequest loader reset (E6) | `WebRequestAPI::ResetURLLoaderFactories()` also resets space partitions | Not checked headless (`deferred.md`) |
+| Moving a tab between partitions (E18) | `SpaceController::SetTabSpace()`, the one place a tab's space is written, queues the tab; a posted task gives it a new WebContents in its space's partition, with its history through the session format, by `TabStripModel::DiscardWebContents()`. It waits for a tab drag to end. Removing a space or turning its isolation on or off queues its tabs | Smoke: moves both ways, isolation off and on, removal |
+| Favorites | Hidden in an isolated space (the user's choice) | Smoke: hidden, no "Add to Favorites", activating one switches to a space that shows it |
+| Setting | Checkbox and description in the Edit space bubble | By hand (below) |
+| A link opened in a new window | `StartNewWindowInSourceSpace()`, from `Navigate()`: a window opened from a tab starts in that tab's space, so `GetSiteInstanceForNewTab()` gives its first tab that space's partition | Smoke: the new window shows Work, its tab is in Work's partition with Work's cookie |
+
+sessionStorage on restore and on a move is not carried over (`deferred.md`).
+Hooks in Chromium files: eight, one in `content/` and one in `extensions/`.
+
+### Hands-on (Codex, 2026-10-28)
+
+The `BRIEF.md` items with native input on a built test browser, fake accounts
+on a local server. Report and evidence: `~/Desktop/spaces-isolation-v1/`.
+Across 80 internals snapshots `partition_fixes` and `order_fixes` stayed 0;
+no crash or CHECK.
+
+| Item | Result |
+| --- | --- |
+| Separate-logins setting in the Edit space bubble: wraps, off and on reload the tabs with the other cookie, Cancel keeps it, a new space starts unchecked | Pass |
+| Favorites hidden in Work in Vertical and Classic; Work's tab menu has Pin, no "Add to Favorites" | Pass |
+| Move to Space and a drop on a space's icon reload in the new space's storage, Back works | Pass |
+| Drop into another window's space moves the storage; a drag back or Escape doesn't reload | Pass |
+| E3: Cmd-click, middle-click, Open Link in New Tab stay in Work | Pass |
+| E3: Open Link in New Window opened in Default with `d=1` | Fail, fixed: the new window now starts in the link's space (smoke check added) |
+| E10: passwords, address autofill | Passwords don't apply (Helium has no password manager); address autofill unchecked (`deferred.md`) |
+| E13: DevTools shows Work's cookie in Application and on requests | Pass |
+| Hibernate Other Tabs: a Work tab reloads in Work's storage, signed in | Pass |
+| E6: uBlock Origin enabled with tabs open blocks on the first navigation, Work and Default | Pass |
+| Cmd+Q and relaunch: Work's tabs back in its storage, signed in, favorites hidden in Work | Pass |

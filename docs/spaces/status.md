@@ -12,11 +12,14 @@ animation review remains open.
 Phase 5 isolation spike: prototype built on `spaces/isolation-spike`, its
 scripted experiments pass and most hands-on ones too; notifications fail in
 an isolated space. Gate 2 decided: ship behind a warning, provisional on the
-experiments that need an unlocked screen and real accounts. The dev build's
+experiments that need an unlocked screen and real accounts. Isolation v1
+built on `spaces/isolation-v1`, checked headless and by hand (2026-10-28);
+the one hands-on failure, a link opened in a new window losing its space,
+is fixed. The dev build's
 GPU process hang is fixed: it was a macOS privacy prompt for `~/Documents`, and
 `build/` now lives in `~/Developer`.**
 
-Last updated 2026-10-26. Deferred work and deliberate decisions are in
+Last updated 2026-10-28. Deferred work and deliberate decisions are in
 `deferred.md`.
 
 ## Baseline
@@ -235,6 +238,32 @@ Last updated 2026-10-26. Deferred work and deliberate decisions are in
    notifications and push. Provisional on link clicks, password prompts
    and the DevTools panels with the screen unlocked, and real accounts (the
    user). Then isolation v1's hooks (`deferred.md`) and the setting's UI.
+   Built (2026-10-27) on `spaces/isolation-v1`, branched from the spike:
+   - `spaces/core/isolate-space-storage.patch` grows from the spike's four
+     hooks to eight: discard (`FinishDiscard()`), session cookies
+     (`profile_network_context_service.cc`), the startup storage cleanup's
+     allowlist, and the webRequest loader reset for space partitions. A
+     removed space's storage is deleted through the registry.
+   - One choke point, `SpaceController::SetTabSpace()`: a tab that changes
+     space by any route, or whose space's isolation changes, gets a new
+     WebContents in its space's partition with its history, after any tab
+     drag ends. New tabs that land in the wrong partition anyway are moved
+     and counted.
+   - Favorites are hidden in a space with separate logins, which offers Pin
+     instead of "Add to Favorites" (the user, 2026-10-27).
+   - `spaces/ui/add-space-isolation-setting.patch`: "Separate logins in this
+     space" and its description in the Edit space bubble.
+   - `checkIsolation` passes: session cookies after a restart, discard,
+     favorites, moves both ways, isolation off and on, removal and the
+     storage cleanup at the next startup.
+   - Codex's hands-on run (2026-10-28) passed the bubble on screen,
+     favorites, moves and drags, clicks (E3), DevTools (E13), Hibernate, an
+     extension enabled while a space's tabs are open (E6) and restart.
+     "Open Link in New Window" opened in the default space with its logins;
+     a window opened from a tab now starts in that tab's space, with a smoke
+     check. Passwords (E10) don't apply, since Helium has no password
+     manager; address autofill is unchecked (`deferred.md`).
+   Still open: real accounts (E5). Then merge into `main`.
 5. Done (2026-10-24): builds use Xcode 26.5, as upstream CI does. It is
    installed as `/Applications/Xcode-26.5.0.app` next to the system Xcode
    (27.1), and `spaces-dev.sh` selects it through `DEVELOPER_DIR` without
