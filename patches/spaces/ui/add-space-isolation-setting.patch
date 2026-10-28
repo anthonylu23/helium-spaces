@@ -1,0 +1,68 @@
+--- a/chrome/browser/ui/spaces/spaces_strings.grdp
++++ b/chrome/browser/ui/spaces/spaces_strings.grdp
+@@ -54,6 +54,12 @@
+ <message name="IDS_SPACES_SETTINGS_ICON" desc="Label of the text field for a space's icon, an emoji shown in the space switcher.">
+   Emoji
+ </message>
++<message name="IDS_SPACES_SETTINGS_ISOLATION" desc="Label of the checkbox that gives a space its own cookies and site data, so the user can sign in to other accounts there.">
++  Separate logins in this space
++</message>
++<message name="IDS_SPACES_SETTINGS_ISOLATION_DESCRIPTION" desc="Explains the checkbox that gives a space its own cookies and site data, and what doesn't work in such a space.">
++  Sites in this space get their own cookies and site data, so you can sign in to other accounts here. Changing this reloads the space's tabs. A space with separate logins shows no favorites, and notifications, push messages and extensions that manage cookies don't work in it.
++</message>
+ <if expr="not use_titlecase">
+   <message name="IDS_SPACES_SWITCHER_NEW_SPACE" desc="Tooltip of the button that adds a space, and the menu item that does.">
+     New space
+--- a/chrome/browser/ui/views/spaces/space_settings_bubble.cc
++++ b/chrome/browser/ui/views/spaces/space_settings_bubble.cc
+@@ -44,6 +44,7 @@ namespace {
+ 
+ DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kSpaceNameFieldId);
+ DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kSpaceIconFieldId);
++DEFINE_LOCAL_ELEMENT_IDENTIFIER_VALUE(kSpaceIsolationFieldId);
+ 
+ // Long enough for any emoji sequence, short enough to stay an icon.
+ constexpr size_t kMaxIconBytes = 32;
+@@ -165,6 +166,14 @@ void Save(SpaceRegistry* registry,
+   base::TruncateUTF8ToByteSize(base::UTF16ToUTF8(icon), kMaxIconBytes,
+                                &space.icon);
+   space.color = color_picker->selected();
++  // Only a change of the checkbox changes the isolation, which may be a kind
++  // the bubble doesn't offer.
++  const bool isolated =
++      model->GetCheckboxByUniqueId(kSpaceIsolationFieldId)->is_checked();
++  if (isolated != (space.isolation == SpaceIsolation::kPartition)) {
++    space.isolation =
++        isolated ? SpaceIsolation::kPartition : SpaceIsolation::kNone;
++  }
+   registry->UpdateSpace(space);
+ }
+ 
+@@ -195,6 +204,15 @@ void ShowSpaceSettingsBubble(views::View
+               std::make_unique<views::BubbleDialogModelHost::CustomView>(
+                   std::move(color_picker),
+                   views::BubbleDialogModelHost::FieldType::kControl))
++          .AddCheckbox(kSpaceIsolationFieldId,
++                       ui::DialogModelLabel(l10n_util::GetStringUTF16(
++                           IDS_SPACES_SETTINGS_ISOLATION)),
++                       ui::DialogModelCheckbox::Params().SetIsChecked(
++                           space->isolation == SpaceIsolation::kPartition))
++          .AddParagraph(ui::DialogModelLabel(
++                            l10n_util::GetStringUTF16(
++                                IDS_SPACES_SETTINGS_ISOLATION_DESCRIPTION))
++                            .set_is_secondary())
+           .AddOkButton(base::BindOnce(&Save, registry, space_id, delegate_ptr,
+                                       color_picker_ptr),
+                        ui::DialogModel::Button::Params().SetLabel(
+--- a/chrome/browser/ui/views/spaces/space_settings_bubble.h
++++ b/chrome/browser/ui/views/spaces/space_settings_bubble.h
+@@ -18,7 +18,8 @@ namespace spaces {
+ class SpaceRegistry;
+ 
+ // Shows a bubble at `anchor` for editing the name, emoji and color of
+-// `space_id`, saved when the user clicks Done.
++// `space_id`, and whether it has separate logins (its own storage), saved when
++// the user clicks Done.
+ void ShowSpaceSettingsBubble(views::View* anchor,
+                              SpaceRegistry* registry,
+                              const base::Uuid& space_id);

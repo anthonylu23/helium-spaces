@@ -40,4 +40,5 @@ spaces/ui/add-space-tab-menu.patch
 spaces/ui/add-space-switcher.patch
 spaces/ui/drop-tabs-on-space-switcher.patch
 spaces/core/isolate-space-storage.patch
+spaces/ui/add-space-isolation-setting.patch
 spaces/tooling/add-spaces-internals.patch
