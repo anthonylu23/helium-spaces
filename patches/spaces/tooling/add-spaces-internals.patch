@@ -8,7 +8,7 @@ enabled.
 
 --- a/chrome/browser/ui/spaces/BUILD.gn
 +++ b/chrome/browser/ui/spaces/BUILD.gn
-@@ -153,6 +153,34 @@ source_set("menu") {
+@@ -160,6 +160,35 @@ source_set("menu") {
    ]
  }
  
@@ -27,6 +27,7 @@ enabled.
 +    "//base",
 +    "//chrome/app:command_ids",
 +    "//chrome/browser/profiles:profile",
++    "//chrome/browser/resource_coordinator",
 +    "//chrome/browser/sessions",
 +    "//chrome/browser/ui:browser_commands",
 +    "//chrome/browser/ui/browser_window",
@@ -45,7 +46,7 @@ enabled.
  test("spaces_unittests") {
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/spaces_internals_ui.cc
-@@ -0,0 +1,1034 @@
+@@ -0,0 +1,1085 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -69,6 +70,8 @@ enabled.
 +#include "base/values.h"
 +#include "chrome/app/chrome_command_ids.h"
 +#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/resource_coordinator/lifecycle_unit_state.mojom.h"
++#include "chrome/browser/resource_coordinator/tab_lifecycle_unit_external.h"
 +#include "chrome/browser/sessions/session_service.h"
 +#include "chrome/browser/sessions/session_service_factory.h"
 +#include "chrome/browser/ui/browser_commands.h"
@@ -260,6 +263,7 @@ enabled.
 +                       controller &&
 +                           controller->IsFavorite(tab_strip->GetTabAtIndex(i)))
 +                  .Set("in_active_space", tab_strip->IsTabInActiveSpace(i))
++                  .Set("discarded", contents->WasDiscarded())
 +                  .Set("partition", contents->GetPrimaryMainFrame()
 +                                        ->GetStoragePartition()
 +                                        ->GetConfig()
@@ -275,6 +279,8 @@ enabled.
 +                .Set("order_ok", !controller || controller->IsOrderValid())
 +                .Set("order_fixes",
 +                     controller ? controller->order_fix_count() : 0)
++                .Set("partition_fixes",
++                     controller ? controller->partition_fix_count() : 0)
 +                .Set("tabs", std::move(tabs)));
 +        return true;
 +      });
@@ -331,6 +337,9 @@ enabled.
 +        "closeTab", base::BindRepeating(&SpacesInternalsHandler::CloseTab,
 +                                        base::Unretained(this)));
 +    web_ui()->RegisterMessageCallback(
++        "discardTab", base::BindRepeating(&SpacesInternalsHandler::DiscardTab,
++                                          base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
 +        "reopenClosedTab",
 +        base::BindRepeating(&SpacesInternalsHandler::ReopenClosedTab,
 +                            base::Unretained(this)));
@@ -377,6 +386,10 @@ enabled.
 +    web_ui()->RegisterMessageCallback(
 +        "openLink", base::BindRepeating(&SpacesInternalsHandler::OpenLink,
 +                                        base::Unretained(this)));
++    web_ui()->RegisterMessageCallback(
++        "openLinkInNewWindow",
++        base::BindRepeating(&SpacesInternalsHandler::OpenLinkInNewWindow,
++                            base::Unretained(this)));
 +    web_ui()->RegisterMessageCallback(
 +        "addToGroup", base::BindRepeating(&SpacesInternalsHandler::AddToGroup,
 +                                          base::Unretained(this)));
@@ -462,8 +475,8 @@ enabled.
 +    }
 +  }
 +
-+  // setIsolation(space_id or "" for default, isolated): whether the space's
-+  // new and restored tabs use its own storage partition.
++  // setIsolation(space_id or "" for default, isolated): whether the space
++  // keeps its tabs in its own storage partition.
 +  void SetIsolation(const base::ListValue& args) {
 +    SpaceRegistry* registry = SpaceRegistryFactory::GetForProfile(profile_);
 +    const std::string* id = args.size() == 2 ? args[0].GetIfString() : nullptr;
@@ -763,6 +776,26 @@ enabled.
 +                    {});
 +  }
 +
++  // openLinkInNewWindow(window_session_id, url): the active tab opens `url`
++  // in a new window, as "Open Link in New Window" or a Shift-click does.
++  void OpenLinkInNewWindow(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 2 ? args[0].GetIfInt() : std::nullopt;
++    const std::string* url = args.size() == 2 ? args[1].GetIfString() : nullptr;
++    BrowserWindowInterface* browser =
++        window_id ? FindBrowser(profile_, *window_id) : nullptr;
++    content::WebContents* opener =
++        browser ? browser->GetTabStripModel()->GetActiveWebContents() : nullptr;
++    if (!opener || !url) {
++      return;
++    }
++    opener->OpenURL(content::OpenURLParams(GURL(*url), content::Referrer(),
++                                           WindowOpenDisposition::NEW_WINDOW,
++                                           ui::PAGE_TRANSITION_LINK,
++                                           /*is_renderer_initiated=*/false),
++                    {});
++  }
++
 +  // addToGroup(window_session_id, tab_index, index_of_a_tab_in_the_group),
 +  // as "Add tab to group" or an extension's chrome.tabs.group() does.
 +  void AddToGroup(const base::ListValue& args) {
@@ -1023,6 +1056,25 @@ enabled.
 +      tab_strip->CloseWebContentsAt(
 +          *index, TabCloseTypes::CLOSE_USER_GESTURE |
 +                      TabCloseTypes::CLOSE_CREATE_HISTORICAL_TAB);
++    }
++  }
++
++  // discardTab(window_session_id, tab_index): discards the tab, as Memory
++  // Saver does. Helium turns chrome://discards off.
++  void DiscardTab(const base::ListValue& args) {
++    std::optional<int> window_id =
++        args.size() == 2 ? args[0].GetIfInt() : std::nullopt;
++    std::optional<int> index =
++        args.size() == 2 ? args[1].GetIfInt() : std::nullopt;
++    TabStripModel* tab_strip =
++        window_id && index ? FindTabStrip(*window_id, *index) : nullptr;
++    if (!tab_strip) {
++      return;
++    }
++    if (resource_coordinator::TabLifecycleUnitExternal* lifecycle_unit =
++            resource_coordinator::TabLifecycleUnitExternal::FromWebContents(
++                tab_strip->GetWebContentsAt(*index))) {
++      lifecycle_unit->DiscardTab(::mojom::LifecycleUnitDiscardReason::URGENT);
 +    }
 +  }
 +

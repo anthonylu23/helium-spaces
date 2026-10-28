@@ -22,8 +22,11 @@
 //      a space's icon.
 //   9. Flag on: three spaces of ten tabs each, with a favorite, space-pinned
 //      tabs and groups, come back the same after two restarts (Gate 1).
-//  10. Flag on: a space with its own storage (Phase 5 spike) keeps its
-//      cookies from other spaces, through navigations, popups and restarts.
+//  10. Flag on: a space with its own storage keeps its cookies from other
+//      spaces, through navigations, popups, restarts and discards; shows no
+//      favorites; moves tabs that change space, or whose space's storage is
+//      turned on or off, to their new storage; and deletes a removed space's
+//      storage.
 // Needs a global WebSocket: Node 22+, or Node 20.10+ with --experimental-websocket.
 // Exits non-zero on any failed check.
 
@@ -1146,8 +1149,13 @@ function startSite() {
   return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve(server)));
 }
 
-// Phase 5 spike, `docs/spaces/spikes/space-isolation.md`: Work keeps its tabs
-// in its own storage partition, and the default space doesn't.
+// The folder of a space's own storage in `profile`, as
+// chrome/browser/ui/spaces/space_storage_path.cc names it.
+const spaceStorage = (profile, spaceId) => join(profile, 'Default', 'Storage', 'ext', 'heliumspace' +
+  spaceId.replace(/-/g, '').replace(/[0-9a-f]/g, (c) => String.fromCharCode(97 + parseInt(c, 16))));
+
+// `docs/spaces/spikes/space-isolation.md`: Work keeps its tabs in its own
+// storage partition, and the default space doesn't.
 async function checkIsolation() {
   const server = await startSite();
   const port = server.address().port;
@@ -1158,7 +1166,8 @@ async function checkIsolation() {
   try {
     let { cdp, close } = await launch(profile, args);
     let state = await internalsState(cdp);
-    const win = state.windows[0].session_id;
+    // The window's id changes at a restart.
+    let win = state.windows[0].session_id;
     const send = (message, ...rest) => internalsSend(cdp, message, rest);
     const tabs = (state) => state.windows.flatMap((w) => w.tabs.map((t) => ({ ...t, window: w.session_id })));
     // The tab whose /show page has `tag`, once it has loaded, and loaded
@@ -1218,12 +1227,23 @@ async function checkIsolation() {
             `${tab?.partition} ${cookies(tab)}`);
     }
 
+    // A link opened in a new window starts it in the link's space.
+    await send('openLinkInNewWindow', win, `${site}/show?tag=W6`);
+    tab = await waitForShown('W6');
+    const newWindow = state.windows.find((w) => w.session_id === tab?.window);
+    check('a link opened in a new window opens it in its space, in its partition',
+          tab?.window !== win && newWindow?.active_space_id === work && tab.space_id === work &&
+          inWorkPartition(tab) && cookies(tab).includes('w=1') && !cookies(tab).includes('d=1'),
+          `${newWindow?.active_space_id === work} ${tab?.space_id === work} ${tab?.partition} ${cookies(tab)}`);
+    if (newWindow) await send('closeTab', tab.window, tab.index);
+
     // Restore: the tab comes back in Work's partition with the persistent
     // cookie. Session cookies of other partitions aren't kept across a restart
     // (a v1 hook); record what happens without failing.
     const beforeRestart = { W1: shown(state, 'W1'), D1: shown(state, 'D1') };
     await close({ waitForSessionSave: true });
     ({ cdp, close } = await launch(profile, [...args, '--restore-last-session'], undefined, INTERNALS));
+    win = (await internalsState(cdp)).windows[0].session_id;
     // A restored tab loads once it is activated.
     const loadRestored = async (tag) => {
       state = await internalsState(cdp);
@@ -1235,7 +1255,7 @@ async function checkIsolation() {
     check("a restored tab of an isolated space is back in its partition, with its cookies",
           inWorkPartition(tab) && cookies(tab).includes('w=1') && !cookies(tab).includes('d=1'),
           `${tab?.partition} ${cookies(tab)}`);
-    console.log(`NOTE  session cookie after a restart in an isolated space: ${cookies(tab).includes('s=1') ? 'kept' : 'lost'}`);
+    check('a session cookie of an isolated space survives a restart', cookies(tab).includes('s=1'), cookies(tab));
     tab = await loadRestored('D1');
     check('a restored tab of the default space stays in the default partition',
           tab?.partition === '' && cookies(tab) === 'd=1', `${tab?.partition} ${cookies(tab)}`);
@@ -1247,6 +1267,142 @@ async function checkIsolation() {
     await send('reopenClosedTab', tab.window);
     tab = await waitForShown('W2');
     check('a reopened tab of an isolated space is back in its partition', inWorkPartition(tab), tab?.partition);
+
+    // Waits until `predicate` holds for the state and returns what it returns.
+    const waitFor = async (predicate) => {
+      for (let i = 0; i < 40; i++) {
+        state = await internalsState(cdp);
+        const result = predicate(state);
+        if (result) return result;
+        await sleep(250);
+      }
+      return undefined;
+    };
+    const byTag = (state, tag) => tabs(state).find((t) => t.url.endsWith(`/show?tag=${tag}`));
+    const spaceName = (state) => state.spaces.find((s) => s.id === state.windows[0].active_space_id)?.name;
+
+    // A discarded tab comes back in its partition.
+    state = await internalsState(cdp);
+    tab = byTag(state, 'W1');
+    await send('discardTab', tab.window, tab.index);
+    const discarded = await waitFor((state) => byTag(state, 'W1')?.discarded && byTag(state, 'W1'));
+    await send('activateTab', tab.window, tab.index);
+    tab = await waitForShown('W1', tab);
+    check('a discarded tab of an isolated space comes back in its partition, with its cookies',
+          !!discarded && inWorkPartition(tab) && cookies(tab).includes('w=1'),
+          `${!!discarded} ${tab?.partition} ${cookies(tab)}`);
+
+    // Favorites live in the default partition, so an isolated space doesn't
+    // show them, nor offer to add its tabs to them.
+    await send('switchSpace', win, defaultSpace);
+    await open(`${site}/show?tag=F1`);
+    tab = await waitForShown('F1');
+    await send('tabMenuCommand', tab.window, tab.index, 'addToFavorites');
+    tab = await waitFor((state) => tabs(state).find((t) => t.title.startsWith('F1|') && t.favorite));
+    await send('switchSpace', win, work);
+    state = await internalsState(cdp);
+    tab = shown(state, 'F1');
+    check("an isolated space doesn't show the favorites", tab?.favorite && !tab.in_active_space,
+          JSON.stringify({ favorite: tab?.favorite, shown: tab?.in_active_space }));
+    const w1 = byTag(state, 'W1');
+    await send('tabMenu', w1.window, w1.index);
+    const labels = (await internalsState(cdp)).tab_menu.map((item) => item.label);
+    check("an isolated space's tab offers Pin but not Add to Favorites",
+          labels.includes('Pin') && !labels.includes('Add to Favorites'), labels.join());
+    tab = shown(await internalsState(cdp), 'F1');
+    await send('activateTab', tab.window, tab.index);
+    state = await internalsState(cdp);
+    check('activating a favorite from an isolated space switches to a space that shows it',
+          state.windows[0].active_space_id === defaultSpace && shown(state, 'F1')?.in_active_space,
+          spaceName(state));
+
+    // A tab moved to another space reloads in that space's partition, with its
+    // history.
+    tab = byTag(state, 'W2');
+    await send('assignTab', tab.window, tab.index, '');
+    tab = await waitFor((state) => {
+      const t = byTag(state, 'W2');
+      return t?.partition === '' && t;
+    });
+    await send('activateTab', tab.window, tab.index);
+    tab = await waitForShown('W2', shown(state, 'W2'));
+    check('a tab moved out of an isolated space reloads in the default partition, with its cookies',
+          tab?.partition === '' && cookies(tab) === 'd=1', `${tab?.partition} ${cookies(tab)}`);
+    await send('assignTab', tab.window, tab.index, work);
+    tab = await waitFor((state) => {
+      const t = byTag(state, 'W2');
+      return inWorkPartition(t) && t;
+    });
+    await send('activateTab', tab.window, tab.index);
+    tab = await waitForShown('W2', tab);
+    check('a tab moved into an isolated space reloads in its partition, with its cookies',
+          inWorkPartition(tab) && cookies(tab).includes('w=1') && !cookies(tab).includes('d=1'),
+          `${tab?.partition} ${cookies(tab)}`);
+
+    // Turning a space's own storage off and on moves its tabs, and keeps the
+    // storage for when it is turned on again.
+    await send('setIsolation', work, false);
+    const allOut = await waitFor((state) => tabs(state).filter((t) => t.space_id === work)
+      .every((t) => t.partition === '') && tabs(state).filter((t) => t.space_id === work));
+    check("turning an isolated space's storage off moves its tabs to the default partition",
+          allOut?.length > 0, `${allOut?.length} tabs`);
+    tab = byTag(state, 'W2');
+    await send('activateTab', tab.window, tab.index);
+    tab = await waitForShown('W2', tab);
+    check('a space without its own storage sees the default cookies', cookies(tab) === 'd=1', cookies(tab));
+    await send('setIsolation', work, true);
+    const allIn = await waitFor((state) => tabs(state).filter((t) => t.space_id === work)
+      .every(inWorkPartition) && tabs(state).filter((t) => t.space_id === work));
+    tab = byTag(state, 'W2');
+    await send('activateTab', tab.window, tab.index);
+    tab = await waitForShown('W2', tab);
+    check('turning it on again moves them back, to the cookies it had',
+          allIn?.length > 0 && inWorkPartition(tab) && cookies(tab).includes('w=1'),
+          `${allIn?.length} tabs, ${tab?.partition} ${cookies(tab)}`);
+
+    // Removing an isolated space moves its tabs to the default space's
+    // storage, and deletes its own.
+    await send('addSpace', 'Temp');
+    state = await internalsState(cdp);
+    const temp = state.spaces.find((s) => s.name === 'Temp').id;
+    await send('setIsolation', temp, true);
+    await send('switchSpace', win, temp);
+    await open(`${site}/set?c=t=1`);
+    await waitForShown('set t=1');
+    await open(`${site}/show?tag=X1`);
+    tab = await waitForShown('X1');
+    const tempPartition = tab?.partition;
+    await send('removeSpace', temp);
+    tab = await waitFor((state) => {
+      const t = byTag(state, 'X1');
+      return t?.partition === '' && t;
+    });
+    await send('activateTab', tab.window, tab.index);
+    tab = await waitForShown('X1', tab);
+    check("a removed isolated space's tabs move to the default space's storage",
+          tempPartition?.startsWith('heliumspace') && tab?.partition === '' && cookies(tab) === 'd=1',
+          `${tempPartition} -> ${tab?.partition} ${cookies(tab)}`);
+
+    state = await internalsState(cdp);
+    check('no new tab opened outside its space\'s storage',
+          state.windows.every((w) => w.partition_fixes === 0),
+          state.windows.map((w) => w.partition_fixes).join());
+    await close({ waitForSessionSave: true });
+
+    // The removed space's storage is deleted at the next startup, by the
+    // storage garbage collection, which keeps every existing space's.
+    const tempStorage = spaceStorage(profile, temp);
+    const workStorage = spaceStorage(profile, work);
+    const hadStorage = existsSync(tempStorage) && existsSync(workStorage);
+    ({ cdp, close } = await launch(profile, args));
+    let collected = false;
+    for (let i = 0; i < 40 && !collected; i++) {
+      await sleep(250);
+      collected = !existsSync(tempStorage);
+    }
+    check("a removed space's storage is deleted at the next startup, and other spaces' kept",
+          hadStorage && collected && existsSync(workStorage),
+          JSON.stringify({ hadStorage, collected, work: existsSync(workStorage) }));
     await close();
   } finally {
     server.close();
