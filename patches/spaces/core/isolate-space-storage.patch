@@ -65,7 +65,7 @@
        "//chrome/browser/ui/browser_ui_controller",
        "//chrome/browser/ui/browser_window",
        "//chrome/browser/ui/location_bar",
-+      "//chrome/browser/ui/spaces:partition",
++      "//chrome/browser/ui/spaces:controller",
        "//chrome/browser/ui/tabs:tab_strip",
        "//chrome/browser/ui/web_applications",
        "//chrome/browser/ui/web_applications:launch_utils",
@@ -75,7 +75,7 @@
  #include "chrome/browser/ui/navigator/browser_navigator_params.h"
  #include "chrome/browser/ui/navigator/browser_navigator_params_utils.h"
  #include "chrome/browser/ui/singleton_tabs.h"
-+#include "chrome/browser/ui/spaces/space_partition.h"
++#include "chrome/browser/ui/spaces/space_controller.h"
  #include "chrome/browser/ui/status_bubble.h"
  #include "chrome/browser/ui/tab_helpers.h"
  #include "chrome/browser/ui/tabs/split_tab_metrics.h"
@@ -93,14 +93,60 @@
  
    WebContents::CreateParams create_params(
        params.browser->GetProfile(), initial_site_instance_for_new_contents);
+@@ -940,6 +948,9 @@ base::WeakPtr<content::NavigationHandle>
+     params->window_action = NavigateParams::WindowAction::kShowWindow;
+   }
+ 
++  // A window opened from a tab starts in that tab's space.
++  spaces::StartNewWindowInSourceSpace(params->browser, params->source_contents);
++
+   // If we create a popup window from a non user-gesture, don't activate it.
+   if (params->window_action == NavigateParams::WindowAction::kShowWindow &&
+       params->disposition == WindowOpenDisposition::NEW_POPUP &&
 --- a/chrome/browser/ui/spaces/BUILD.gn
 +++ b/chrome/browser/ui/spaces/BUILD.gn
-@@ -109,6 +109,28 @@ source_set("controller") {
+@@ -22,6 +22,8 @@ source_set("model") {
+     "space_list.h",
+     "space_order.cc",
+     "space_order.h",
++    "space_storage_path.cc",
++    "space_storage_path.h",
+   ]
+   public_deps = [
+     "//base",
+@@ -37,6 +39,8 @@ source_set("spaces") {
+     "space_registry.h",
+     "space_registry_factory.cc",
+     "space_registry_factory.h",
++    "space_storage.cc",
++    "space_storage.h",
+   ]
+   public_deps = [
+     ":features",
+@@ -46,8 +50,10 @@ source_set("spaces") {
+   ]
+   deps = [
+     "//chrome/browser/profiles:profile",
++    "//chrome/common:constants",
+     "//components/pref_registry",
+     "//components/prefs",
++    "//content/public/browser",
    ]
  }
  
-+# Per-space storage partitions: which partition a new or restored tab of a
-+# space starts in.
+@@ -99,6 +105,7 @@ source_set("controller") {
+   ]
+   deps = [
+     ":features",
++    ":partition",
+     ":tab_space",
+     "//chrome/browser/profiles:profile",
+     "//chrome/browser/tab_list",
+@@ -109,6 +116,28 @@ source_set("controller") {
+   ]
+ }
+ 
++# Per-space storage partitions: which partition a space's tabs are in.
 +source_set("partition") {
 +  sources = [
 +    "space_partition.cc",
@@ -111,12 +157,13 @@
 +    "//content/public/browser",
 +  ]
 +  deps = [
-+    ":controller",
 +    ":features",
 +    ":spaces",
 +    ":tab_space",
 +    "//chrome/browser/profiles:profile",
-+    "//chrome/browser/ui/browser_window",
++    "//components/sessions",
++    "//content/public/common",
++    "//ui/base",
 +    "//url",
 +  ]
 +}
@@ -124,60 +171,54 @@
  # Spaces items of the tab context menu.
  source_set("menu") {
    sources = [
+@@ -137,6 +166,7 @@ test("spaces_unittests") {
+   sources = [
+     "space_list_unittest.cc",
+     "space_order_unittest.cc",
++    "space_storage_path_unittest.cc",
+   ]
+   deps = [
+     ":model",
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/space_partition.cc
-@@ -0,0 +1,109 @@
+@@ -0,0 +1,165 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
 +
 +#include "chrome/browser/ui/spaces/space_partition.h"
 +
++#include <utility>
++#include <vector>
++
 +#include "chrome/browser/profiles/profile.h"
-+#include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
 +#include "chrome/browser/ui/spaces/space.h"
-+#include "chrome/browser/ui/spaces/space_controller.h"
 +#include "chrome/browser/ui/spaces/space_registry.h"
 +#include "chrome/browser/ui/spaces/space_registry_factory.h"
++#include "chrome/browser/ui/spaces/space_storage_path.h"
 +#include "chrome/browser/ui/spaces/space_tab_helper.h"
 +#include "chrome/browser/ui/spaces/spaces_features.h"
++#include "components/sessions/content/content_serialized_navigation_builder.h"
++#include "components/sessions/core/serialized_navigation_entry.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/navigation_entry.h"
 +#include "content/public/browser/render_frame_host.h"
++#include "content/public/browser/restore_type.h"
 +#include "content/public/browser/site_instance.h"
 +#include "content/public/browser/storage_partition.h"
++#include "content/public/browser/visibility.h"
 +#include "content/public/browser/web_contents.h"
++#include "content/public/common/referrer.h"
++#include "ui/base/page_transition_types.h"
 +#include "url/gurl.h"
 +
 +namespace spaces {
 +
 +namespace {
 +
-+// Each space gets its own partition domain, so that one space's storage can
-+// be deleted as a whole. A domain may only hold [a-z], so the id's hex digits
-+// are spelled with the letters a to p.
-+constexpr char kPartitionDomainPrefix[] = "heliumspace";
-+
-+std::string PartitionDomain(const base::Uuid& space_id) {
-+  std::string domain = kPartitionDomainPrefix;
-+  for (char c : space_id.AsLowercaseString()) {
-+    if (c >= '0' && c <= '9') {
-+      domain += static_cast<char>('a' + (c - '0'));
-+    } else if (c >= 'a' && c <= 'f') {
-+      domain += static_cast<char>('a' + 10 + (c - 'a'));
-+    }
-+  }
-+  return domain;
-+}
-+
-+scoped_refptr<content::SiteInstance> SiteInstanceForSpace(
-+    Profile* profile,
-+    const base::Uuid& space_id) {
-+  std::optional<content::StoragePartitionConfig> config =
-+      GetPartitionConfig(profile, space_id);
-+  if (!config) {
-+    return nullptr;
-+  }
-+  return content::SiteInstance::CreateForFixedStoragePartition(profile, GURL(),
-+                                                               *config);
++const content::StoragePartitionConfig& GetPartitionOf(
++    content::WebContents& contents) {
++  return contents.GetPrimaryMainFrame()->GetStoragePartition()->GetConfig();
 +}
 +
 +}  // namespace
@@ -192,7 +233,6 @@
 +  if (!registry) {
 +    return std::nullopt;
 +  }
-+  // An unknown id is the default space's, as everywhere else.
 +  const Space* space =
 +      space_id.is_valid() ? registry->GetSpace(space_id) : nullptr;
 +  if (!space) {
@@ -202,43 +242,114 @@
 +    return std::nullopt;
 +  }
 +  return content::StoragePartitionConfig::Create(
-+      profile, PartitionDomain(space->id), space->partition,
++      profile, GetSpacePartitionDomain(space->id), space->partition,
 +      /*in_memory=*/profile->IsOffTheRecord());
 +}
 +
-+scoped_refptr<content::SiteInstance> GetSiteInstanceForNewTab(
-+    BrowserWindowInterface* browser) {
-+  // New tabs always join the window's active space.
-+  SpaceController* controller =
-+      browser ? SpaceController::From(browser) : nullptr;
-+  if (!controller) {
++scoped_refptr<content::SiteInstance> CreateSiteInstanceInPartition(
++    Profile* profile,
++    const std::optional<content::StoragePartitionConfig>& partition) {
++  if (!partition) {
 +    return nullptr;
 +  }
-+  return SiteInstanceForSpace(browser->GetProfile(),
-+                              controller->active_space_id());
++  return content::SiteInstance::CreateForFixedStoragePartition(profile, GURL(),
++                                                               *partition);
 +}
 +
 +scoped_refptr<content::SiteInstance> GetSiteInstanceForRestoredTab(
 +    Profile* profile,
 +    const std::map<std::string, std::string>& extra_data) {
 +  auto it = extra_data.find(kSpaceIdExtraDataKey);
-+  return SiteInstanceForSpace(
-+      profile, it != extra_data.end() ? base::Uuid::ParseLowercase(it->second)
-+                                      : base::Uuid());
++  return CreateSiteInstanceInPartition(
++      profile,
++      GetPartitionConfig(profile, it != extra_data.end()
++                                      ? base::Uuid::ParseLowercase(it->second)
++                                      : base::Uuid()));
++}
++
++scoped_refptr<content::SiteInstance> GetSiteInstanceForDiscardedTab(
++    content::WebContents& contents) {
++  if (!IsInSpacePartition(contents)) {
++    return nullptr;
++  }
++  return content::SiteInstance::CreateForFixedStoragePartition(
++      contents.GetBrowserContext(), GURL(), GetPartitionOf(contents));
 +}
 +
 +bool IsInSpacePartition(content::WebContents& contents) {
-+  return contents.GetPrimaryMainFrame()
-+      ->GetStoragePartition()
-+      ->GetConfig()
-+      .partition_domain()
-+      .starts_with(kPartitionDomainPrefix);
++  return IsSpacePartitionDomain(GetPartitionOf(contents).partition_domain());
++}
++
++bool IsInPartition(
++    content::WebContents& contents,
++    const std::optional<content::StoragePartitionConfig>& partition) {
++  const content::StoragePartitionConfig& current = GetPartitionOf(contents);
++  if (!partition) {
++    return current.is_default();
++  }
++  return current.partition_domain() == partition->partition_domain() &&
++         current.partition_name() == partition->partition_name() &&
++         current.in_memory() == partition->in_memory();
++}
++
++std::unique_ptr<content::WebContents> CreateContentsInPartition(
++    content::WebContents& contents,
++    const std::optional<content::StoragePartitionConfig>& partition) {
++  Profile* profile = Profile::FromBrowserContext(contents.GetBrowserContext());
++  content::WebContents::CreateParams create_params(
++      profile, CreateSiteInstanceInPartition(profile, partition));
++  create_params.initially_hidden =
++      contents.GetVisibility() == content::Visibility::HIDDEN;
++  create_params.desired_renderer_state =
++      content::WebContents::CreateParams::kNoRendererProcess;
++  create_params.last_active_time = contents.GetLastActiveTime();
++  create_params.last_active_time_ticks = contents.GetLastActiveTimeTicks();
++  std::unique_ptr<content::WebContents> new_contents =
++      content::WebContents::Create(create_params);
++  new_contents->SetUserAgentOverride(contents.GetUserAgentOverride(),
++                                     /*override_in_new_tabs=*/false);
++
++  // The history goes through the session format, as for a restored tab:
++  // NavigationController::CopyStateFrom() would keep the old partition's
++  // SiteInstances.
++  content::NavigationController& controller = contents.GetController();
++  std::vector<sessions::SerializedNavigationEntry> navigations;
++  int selected = -1;
++  for (int i = 0; i < controller.GetEntryCount(); ++i) {
++    content::NavigationEntry* entry = controller.GetEntryAtIndex(i);
++    if (entry->IsInitialEntry()) {
++      continue;
++    }
++    if (i == controller.GetLastCommittedEntryIndex()) {
++      selected = static_cast<int>(navigations.size());
++    }
++    navigations.push_back(
++        sessions::ContentSerializedNavigationBuilder::FromNavigationEntry(
++            static_cast<int>(navigations.size()), entry));
++  }
++  if (navigations.empty()) {
++    // Nothing committed yet: load what the tab was loading.
++    const GURL url = contents.GetVisibleURL();
++    if (url.is_valid()) {
++      new_contents->GetController().LoadURL(url, content::Referrer(),
++                                            ui::PAGE_TRANSITION_AUTO_TOPLEVEL,
++                                            std::string());
++    }
++    return new_contents;
++  }
++  std::vector<std::unique_ptr<content::NavigationEntry>> entries =
++      sessions::ContentSerializedNavigationBuilder::ToNavigationEntries(
++          navigations, profile);
++  new_contents->GetController().Restore(
++      selected >= 0 ? selected : static_cast<int>(entries.size()) - 1,
++      content::RestoreType::kRestored, &entries);
++  return new_contents;
 +}
 +
 +}  // namespace spaces
 --- /dev/null
 +++ b/chrome/browser/ui/spaces/space_partition.h
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,74 @@
 +// Copyright 2026 The helium-spaces Authors
 +// You can use, redistribute, and/or modify this source code under
 +// the terms of the GPL-3.0 license that can be found in the LICENSE file.
@@ -247,6 +358,7 @@
 +#define CHROME_BROWSER_UI_SPACES_SPACE_PARTITION_H_
 +
 +#include <map>
++#include <memory>
 +#include <optional>
 +#include <string>
 +
@@ -254,7 +366,6 @@
 +#include "base/uuid.h"
 +#include "content/public/browser/storage_partition_config.h"
 +
-+class BrowserWindowInterface;
 +class Profile;
 +
 +namespace content {
@@ -264,22 +375,24 @@
 +
 +namespace spaces {
 +
-+// Per-space isolation (Phase 5 spike, `spikes/space-isolation.md`). A space
-+// with SpaceIsolation::kPartition keeps its tabs in its own StoragePartition:
-+// cookies, cache and site storage. A tab's partition is fixed when it is
-+// created, so it only follows the space a new or restored tab joins.
++// Per-space isolation (`spikes/space-isolation.md`). A space with
++// SpaceIsolation::kPartition keeps its tabs in its own StoragePartition:
++// cookies, cache and site storage. A tab's partition is fixed when its
++// WebContents is created, so a tab that changes partition gets a new one;
++// SpaceController does that.
 +
 +// The partition `space_id`'s tabs use, or nullopt for the profile's default
-+// one. Also nullopt while HeliumSpaces is disabled.
++// one. An invalid or unknown id means the default space, as everywhere else.
++// Also nullopt while HeliumSpaces is disabled.
 +std::optional<content::StoragePartitionConfig> GetPartitionConfig(
 +    Profile* profile,
 +    const base::Uuid& space_id);
 +
-+// The SiteInstance a new tab with no opener starts in when it opens in
-+// `browser`: in the partition of the space it will join, the active one. Null
-+// if that space uses the default partition.
-+scoped_refptr<content::SiteInstance> GetSiteInstanceForNewTab(
-+    BrowserWindowInterface* browser);
++// A SiteInstance for a new WebContents in `partition`, or null for the
++// default partition.
++scoped_refptr<content::SiteInstance> CreateSiteInstanceInPartition(
++    Profile* profile,
++    const std::optional<content::StoragePartitionConfig>& partition);
 +
 +// The SiteInstance for a tab being restored with `extra_data`, in its space's
 +// partition, or null if that space uses the default partition.
@@ -287,8 +400,26 @@
 +    Profile* profile,
 +    const std::map<std::string, std::string>& extra_data);
 +
++// The SiteInstance for the WebContents replacing `contents` when it is
++// discarded, in the space partition `contents` is in, or null if it isn't in
++// one.
++scoped_refptr<content::SiteInstance> GetSiteInstanceForDiscardedTab(
++    content::WebContents& contents);
++
 +// Whether `contents` is in a space's own partition.
 +bool IsInSpacePartition(content::WebContents& contents);
++
++// Whether `contents` is in `partition`, where nullopt is the default one.
++bool IsInPartition(
++    content::WebContents& contents,
++    const std::optional<content::StoragePartitionConfig>& partition);
++
++// A new WebContents in `partition` with the history of `contents`, to
++// replace it. It isn't loaded yet; it loads when shown. Session storage and
++// the page's state aren't carried over.
++std::unique_ptr<content::WebContents> CreateContentsInPartition(
++    content::WebContents& contents,
++    const std::optional<content::StoragePartitionConfig>& partition);
 +
 +}  // namespace spaces
 +
@@ -307,3 +438,1098 @@
      } else {
        site_instance = SiteInstance::Create(GetBrowserContext());
      }
+--- a/chrome/browser/net/BUILD.gn
++++ b/chrome/browser/net/BUILD.gn
+@@ -183,6 +183,7 @@ source_set("impl") {
+     "//chrome/browser/safe_browsing",
+     "//chrome/browser/ssl",
+     "//chrome/browser/task_manager",
++    "//chrome/browser/ui/spaces:model",
+     "//chrome/browser/webid",
+     "//chrome/common:version_header",
+     "//components/certificate_transparency",
+--- a/chrome/browser/net/profile_network_context_service.cc
++++ b/chrome/browser/net/profile_network_context_service.cc
+@@ -172,6 +172,9 @@
+ #include "chrome/browser/metrics/chrome_metrics_service_accessor.h"
+ #include "components/domain_reliability/domain_reliability_prefs.h"
+ 
++// helium-spaces
++#include "chrome/browser/ui/spaces/space_storage_path.h"
++
+ class ChromeDomainReliabilityDelegate
+     : public domain_reliability::DomainReliabilityServiceDelegate {
+  public:
+@@ -1439,7 +1442,10 @@ void ProfileNetworkContextService::Confi
+         base::FilePath(chrome::kReportingAndNelStoreFilename);
+ #endif  // BUILDFLAG(ENABLE_REPORTING)
+ 
+-    if (relative_partition_path.empty()) {  // This is the main partition.
++    // helium-spaces: a space's own storage keeps session cookies as the main
++    // partition does, so its logins last as long.
++    if (relative_partition_path.empty() ||  // This is the main partition.
++        spaces::IsSpaceStoragePath(relative_partition_path)) {
+       network_context_params->restore_old_session_cookies =
+           profile_->ShouldRestoreOldSessionCookies();
+       network_context_params->persist_session_cookies =
+--- a/chrome/browser/resource_coordinator/BUILD.gn
++++ b/chrome/browser/resource_coordinator/BUILD.gn
+@@ -133,6 +133,7 @@ source_set("impl") {
+       "//chrome/browser/ui",
+       "//chrome/browser/ui:browser_window_header",
+       "//chrome/browser/ui/browser_window",
++      "//chrome/browser/ui/spaces:partition",
+       "//chrome/browser/ui/tab_contents",
+       "//chrome/browser/ui/tabs:tab_strip",
+       "//chrome/browser/web_applications",
+--- a/chrome/browser/resource_coordinator/tab_lifecycle_unit.cc
++++ b/chrome/browser/resource_coordinator/tab_lifecycle_unit.cc
+@@ -31,6 +31,7 @@
+ #include "chrome/browser/resource_coordinator/time.h"
+ #include "chrome/browser/resource_coordinator/utils.h"
+ #include "chrome/browser/ui/recently_audible_helper.h"
++#include "chrome/browser/ui/spaces/space_partition.h"
+ #include "chrome/browser/ui/tabs/tab_change_type.h"
+ #include "chrome/browser/ui/tabs/tab_strip_model.h"
+ #include "chrome/browser/web_applications/web_app_tab_helper.h"
+@@ -281,6 +282,9 @@ void TabLifecycleUnitSource::TabLifecycl
+       content::WebContents::CreateParams::kNoRendererProcess;
+   create_params.last_active_time = old_contents->GetLastActiveTime();
+   create_params.last_active_time_ticks = old_contents->GetLastActiveTimeTicks();
++  // helium-spaces: a tab in a space's own storage stays in it.
++  create_params.site_instance =
++      spaces::GetSiteInstanceForDiscardedTab(*old_contents);
+   std::unique_ptr<content::WebContents> null_contents =
+       content::WebContents::Create(create_params);
+   content::WebContents* raw_null_contents = null_contents.get();
+--- a/chrome/browser/ui/spaces/space_controller.cc
++++ b/chrome/browser/ui/spaces/space_controller.cc
+@@ -16,6 +16,8 @@
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/tab_list/tab_removed_reason.h"
+ #include "chrome/browser/ui/browser_window/public/browser_window_interface.h"
++#include "chrome/browser/ui/spaces/space.h"
++#include "chrome/browser/ui/spaces/space_partition.h"
+ #include "chrome/browser/ui/spaces/space_registry_factory.h"
+ #include "chrome/browser/ui/spaces/space_tab_helper.h"
+ #include "chrome/browser/ui/spaces/spaces_features.h"
+@@ -26,6 +28,9 @@
+ #include "components/tabs/public/split_tab_data.h"
+ #include "components/tabs/public/tab_group.h"
+ #include "components/tabs/public/tab_interface.h"
++#include "content/public/browser/navigation_controller.h"
++#include "content/public/browser/site_instance.h"
++#include "content/public/browser/storage_partition_config.h"
+ #include "content/public/browser/web_contents.h"
+ #include "url/gurl.h"
+ 
+@@ -39,6 +44,21 @@ const base::Uuid& GetFavoritesId() {
+   return *id;
+ }
+ 
++namespace {
++
++// The partition of `space_id`'s tabs. Favorites are in the profile's default
++// one.
++std::optional<content::StoragePartitionConfig> GetPartitionOfSpace(
++    Profile* profile,
++    const base::Uuid& space_id) {
++  if (space_id == GetFavoritesId()) {
++    return std::nullopt;
++  }
++  return GetPartitionConfig(profile, space_id);
++}
++
++}  // namespace
++
+ // static
+ std::unique_ptr<SpaceController> SpaceController::MaybeCreate(
+     BrowserWindowInterface* browser) {
+@@ -63,7 +83,8 @@ SpaceController* SpaceController::From(B
+ 
+ SpaceController::SpaceController(BrowserWindowInterface* browser,
+                                  SpaceRegistry* registry)
+-    : tab_strip_model_(browser->GetTabStripModel()),
++    : profile_(browser->GetProfile()),
++      tab_strip_model_(browser->GetTabStripModel()),
+       registry_(registry),
+       window_id_(browser->GetSessionID()),
+       active_space_id_(registry->GetDefaultSpace().id),
+@@ -71,6 +92,12 @@ SpaceController::SpaceController(Browser
+   tab_strip_model_->AddObserver(this);
+   tab_strip_model_->SetSpaceFilter(this);
+   registry_observation_.Observe(registry_);
++  for (const Space& space : registry_->spaces()) {
++    space_ids_.insert(space.id);
++  }
++  isolated_spaces_ = GetIsolatedSpaces();
++  tab_drag_ended_subscription_ = RegisterTabDragEnded(base::BindRepeating(
++      &SpaceController::PostPartitionMoves, weak_factory_.GetWeakPtr()));
+ }
+ 
+ SpaceController::~SpaceController() {
+@@ -90,6 +117,12 @@ void SpaceController::SwitchToSpace(cons
+   ActivateTabInActiveSpace();
+ }
+ 
++void SpaceController::StartInSpace(const base::Uuid& space_id) {
++  CHECK(tab_strip_model_->empty());
++  SetActiveSpace(space_id == GetFavoritesId() ? registry_->GetDefaultSpace().id
++                                              : ResolveSpace(space_id));
++}
++
+ void SpaceController::AddTabsToFavorites(
+     const std::vector<tabs::TabInterface*>& tabs) {
+   for (tabs::TabInterface* tab : tabs) {
+@@ -129,7 +162,7 @@ void SpaceController::MoveTabToSpace(tab
+   const bool was_active =
+       std::ranges::contains(moving, tab_strip_model_->GetActiveTab());
+   for (tabs::TabInterface* moving_tab : moving) {
+-    SetTabSpace(moving_tab->GetContents(), space);
++    SetTabSpace(moving_tab, space);
+   }
+ 
+   // Asking for the end of the tab strip puts them at the end of the space's
+@@ -170,7 +203,7 @@ void SpaceController::MoveGroupToSpace(t
+   const bool was_active =
+       std::ranges::contains(moving, tab_strip_model_->GetActiveTab());
+   for (tabs::TabInterface* tab : moving) {
+-    SetTabSpace(tab->GetContents(), space);
++    SetTabSpace(tab, space);
+   }
+   // As in MoveTabToSpace(), the end of the tab strip is the end of the
+   // space's tabs.
+@@ -236,8 +269,16 @@ bool SpaceController::IsFavorite(const t
+   return GetSpaceOfTab(tab) == GetFavoritesId();
+ }
+ 
++bool SpaceController::IsSpaceIsolated(const base::Uuid& space_id) const {
++  const Space* space = registry_->GetSpace(space_id);
++  return space && space->isolation == SpaceIsolation::kPartition;
++}
++
+ bool SpaceController::IsTabInActiveSpace(const tabs::TabInterface* tab) const {
+-  return IsFavorite(tab) || GetSpaceOfTab(tab) == active_space_id_;
++  if (IsFavorite(tab)) {
++    return !IsSpaceIsolated(active_space_id_);
++  }
++  return GetSpaceOfTab(tab) == active_space_id_;
+ }
+ 
+ bool SpaceController::IsOrderValid() const {
+@@ -264,22 +305,29 @@ int SpaceController::WillInsertTabs(
+     const SessionID last_window_id = SpaceTabHelper::GetLastWindowId(contents);
+     std::optional<base::Uuid> space_before_drag =
+         SpaceTabHelper::GetSpaceBeforeDrag(contents, window_id_);
++    const bool new_tab = !SpaceTabHelper::HasSpace(contents);
+     if (group_space) {
+-      SetTabSpace(contents, *group_space, /*before_insert=*/true);
+-    } else if (!SpaceTabHelper::HasSpace(contents)) {
+-      SetTabSpace(contents, active_space_id_, /*before_insert=*/true);
++      SetTabSpace(tab, *group_space, /*before_insert=*/true);
++    } else if (new_tab) {
++      SetTabSpace(tab, active_space_id_, /*before_insert=*/true);
+     } else if (space_before_drag) {
+       // Dragged back to the window the drag started in, or put back there.
+-      SetTabSpace(contents, ResolveSpace(*space_before_drag),
++      SetTabSpace(tab, ResolveSpace(*space_before_drag),
+                   /*before_insert=*/true);
+     } else if (last_window_id.is_valid() && last_window_id != window_id_ &&
+                window_shows_a_space &&
+                GetSpaceOfTab(tab, pinned) != GetFavoritesId()) {
+       // Moved from another window: it joins the space shown here, where it
+       // was dropped, as in Arc. Favorites stay favorites.
+-      SetTabSpace(contents, active_space_id_, /*before_insert=*/true);
++      SetTabSpace(tab, active_space_id_, /*before_insert=*/true);
+     }
+     SpaceTabHelper::SetLastWindowId(contents, window_id_);
++    // A new tab starts in its space's partition (see GetSiteInstanceForNewTab
++    // and the restore hook), unless a way of making tabs skips those hooks. A
++    // popup keeps its opener's, to stay connected to it.
++    if (new_tab && !contents->HasOpener()) {
++      MoveTabToItsPartitionLater(tab, /*new_tab=*/true);
++    }
+   }
+   if (group_space || fixing_order_) {
+     return index;
+@@ -318,7 +366,7 @@ int SpaceController::ConstrainMoveIndex(
+ 
+ void SpaceController::WillSetTabPinned(tabs::TabInterface* tab, bool pinned) {
+   if (!pinned && IsFavorite(tab)) {
+-    SetTabSpace(tab->GetContents(), active_space_id_);
++    SetTabSpace(tab, active_space_id_);
+   }
+ }
+ 
+@@ -336,15 +384,15 @@ void SpaceController::WillSplitTabs(
+   // favorite and the split joins the favorites.
+   const base::Uuid space = GetSpaceOfTab(pivot);
+   for (tabs::TabInterface* tab : tabs) {
+-    SetTabSpace(tab->GetContents(), space);
++    SetTabSpace(tab, space);
+   }
+ }
+ 
+ void SpaceController::WillSwapTabs(tabs::TabInterface* a,
+                                    tabs::TabInterface* b) {
+   const base::Uuid space_of_a = GetSpaceOfTab(a);
+-  SetTabSpace(a->GetContents(), GetSpaceOfTab(b));
+-  SetTabSpace(b->GetContents(), space_of_a);
++  SetTabSpace(a, GetSpaceOfTab(b));
++  SetTabSpace(b, space_of_a);
+ }
+ 
+ bool SpaceController::AreTabsInSameRun(const tabs::TabInterface* a,
+@@ -375,11 +423,13 @@ void SpaceController::OnTabStripModelCha
+           !HasTabsInSpace(active_space_id_);
+       break;
+     case TabStripModelChange::kReplaced: {
+-      // Discarding a tab replaces its WebContents.
++      // Discarding a tab, or moving it to another partition, replaces its
++      // WebContents.
+       const TabStripModelChange::Replace* replace = change.GetReplace();
+       SetTabSpace(
+-          replace->new_contents,
++          replace->tab,
+           ResolveSpace(SpaceTabHelper::GetSpaceId(replace->old_contents)));
++      SpaceTabHelper::SetLastWindowId(replace->new_contents, window_id_);
+       break;
+     }
+     default:
+@@ -407,6 +457,11 @@ void SpaceController::OnTabStripModelCha
+   if (selection.active_tab_changed() && !IsFavorite(active_tab)) {
+     SetActiveSpace(GetSpaceOfTab(active_tab));
+     last_active_tabs_[active_space_id_] = active_tab->GetHandle();
++  } else if (selection.active_tab_changed() &&
++             IsSpaceIsolated(active_space_id_)) {
++    // A favorite activated by other means than the tab strip, which doesn't
++    // show it here.
++    SetActiveSpace(GetSpaceForActiveTab());
+   } else if (change.type() == TabStripModelChange::kInserted &&
+              IsFavorite(active_tab)) {
+     // While a favorite is active, inserted tabs can change which space was
+@@ -442,7 +497,7 @@ void SpaceController::TabGroupedStateCha
+   if (!group_space || *group_space == GetSpaceOfTab(tab)) {
+     return;
+   }
+-  SetTabSpace(tab->GetContents(), *group_space);
++  SetTabSpace(tab, *group_space);
+   // The tab strip is still notifying observers.
+   base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
+       FROM_HERE, base::BindOnce(&SpaceController::OnTabSpacesChanged,
+@@ -478,6 +533,39 @@ void SpaceController::OnSpacesChanged()
+   if (!registry_->GetSpace(active_space_id_)) {
+     SetActiveSpace(GetSpaceForActiveTab());
+   }
++
++  // Spaces that were removed, or got or lost their own storage: their tabs
++  // move to their space's storage now.
++  std::set<base::Uuid> space_ids;
++  for (const Space& space : registry_->spaces()) {
++    space_ids.insert(space.id);
++  }
++  const std::set<base::Uuid> isolated_spaces = GetIsolatedSpaces();
++  std::set<base::Uuid> changed;
++  std::ranges::set_symmetric_difference(isolated_spaces_, isolated_spaces,
++                                        std::inserter(changed, changed.end()));
++  std::ranges::set_difference(space_ids_, space_ids,
++                              std::inserter(changed, changed.end()));
++  space_ids_ = std::move(space_ids);
++  isolated_spaces_ = isolated_spaces;
++  if (changed.empty()) {
++    return;
++  }
++  for (tabs::TabInterface* tab : *tab_strip_model_) {
++    const base::Uuid stored = SpaceTabHelper::GetSpaceId(tab->GetContents());
++    if (changed.contains(stored.is_valid() ? stored
++                                           : registry_->GetDefaultSpace().id)) {
++      MoveTabToItsPartitionLater(tab, /*new_tab=*/false);
++    }
++  }
++  // Favorites show or hide where a space got or lost its own storage. If the
++  // active tab is a favorite that this space no longer shows, the space stays
++  // and shows one of its own tabs.
++  const tabs::TabInterface* active_tab = tab_strip_model_->GetActiveTab();
++  if (active_tab && !IsTabInActiveSpace(active_tab)) {
++    ActivateTabInActiveSpace();
++  }
++  tab_visibility_changed_callbacks_.Notify();
+ }
+ 
+ void SpaceController::SetActiveSpace(const base::Uuid& space_id) {
+@@ -500,10 +588,16 @@ base::Uuid SpaceController::GetSpaceForA
+   if (active_tab && !IsFavorite(active_tab)) {
+     return GetSpaceOfTab(active_tab);
+   }
++  // A favorite, or nothing, is active: among the spaces that show favorites.
+   const tabs::TabInterface* recent_tab =
+-      FindMostRecentTab([](const tabs::TabInterface*) { return true; });
+-  return recent_tab ? GetSpaceOfTab(recent_tab)
+-                    : ResolveSpace(active_space_id_);
++      FindMostRecentTab([this](const tabs::TabInterface* tab) {
++        return !IsSpaceIsolated(GetSpaceOfTab(tab));
++      });
++  if (recent_tab) {
++    return GetSpaceOfTab(recent_tab);
++  }
++  const base::Uuid space = ResolveSpace(active_space_id_);
++  return IsSpaceIsolated(space) ? registry_->GetDefaultSpace().id : space;
+ }
+ 
+ tabs::TabInterface* SpaceController::FindMostRecentTab(
+@@ -573,16 +667,86 @@ void SpaceController::OpenTabInEmptiedSp
+   ActivateTabInActiveSpace();
+ }
+ 
+-void SpaceController::SetTabSpace(content::WebContents* contents,
++void SpaceController::SetTabSpace(tabs::TabInterface* tab,
+                                   const base::Uuid& space_id,
+                                   bool before_insert) {
++  content::WebContents* contents = tab->GetContents();
+   const base::Uuid stored =
+       space_id == registry_->GetDefaultSpace().id ? base::Uuid() : space_id;
++  const bool changes_space = SpaceTabHelper::HasSpace(contents) &&
++                             SpaceTabHelper::GetSpaceId(contents) != stored;
+   if (before_insert) {
+     SpaceTabHelper::SetSpaceIdBeforeInsert(contents, stored);
+   } else {
+     SpaceTabHelper::SetSpaceId(contents, stored);
+   }
++  if (changes_space) {
++    MoveTabToItsPartitionLater(tab, /*new_tab=*/false);
++  }
++}
++
++void SpaceController::MoveTabToItsPartitionLater(tabs::TabInterface* tab,
++                                                 bool new_tab) {
++  partition_moves_.emplace_back(tab->GetHandle(), new_tab);
++  PostPartitionMoves();
++}
++
++void SpaceController::PostPartitionMoves() {
++  if (partition_moves_posted_ || partition_moves_.empty()) {
++    return;
++  }
++  // The tab strip can't be changed while it notifies observers.
++  partition_moves_posted_ = true;
++  base::SequencedTaskRunner::GetCurrentDefault()->PostTask(
++      FROM_HERE, base::BindOnce(&SpaceController::MoveTabsToTheirPartitions,
++                                weak_factory_.GetWeakPtr()));
++}
++
++void SpaceController::MoveTabsToTheirPartitions() {
++  partition_moves_posted_ = false;
++  // A dragged tab joins the space of every window it passes over; it moves
++  // once it is dropped. RegisterTabDragEnded() posts this again then.
++  if (IsTabDragInProgress() || tab_strip_model_->closing_all()) {
++    return;
++  }
++  const std::vector<std::pair<tabs::TabHandle, bool>> moves =
++      std::exchange(partition_moves_, {});
++  for (const auto& [handle, new_tab] : moves) {
++    tabs::TabInterface* tab = handle.Get();
++    if (!tab || tab_strip_model_->GetIndexOfTab(tab) == TabStripModel::kNoTab) {
++      // Gone, or moved to another window, whose controller moves it.
++      continue;
++    }
++    content::WebContents* contents = tab->GetContents();
++    const std::optional<content::StoragePartitionConfig> partition =
++        GetPartitionOfSpace(profile_, GetSpaceOfTab(tab));
++    if (IsInPartition(*contents, partition)) {
++      continue;
++    }
++    if (new_tab) {
++      // A way of opening tabs the hooks don't cover.
++      LOG(WARNING) << "helium-spaces: moving a new tab to its space's storage";
++      ++partition_fix_count_;
++    }
++    // Like a discard: the tab keeps its place, group and history, and reloads
++    // in the new partition.
++    std::unique_ptr<content::WebContents> old_contents =
++        tab_strip_model_->DiscardWebContents(
++            contents, CreateContentsInPartition(*contents, partition));
++    if (tab == tab_strip_model_->GetActiveTab()) {
++      tab->GetContents()->GetController().LoadIfNecessary();
++    }
++  }
++}
++
++std::set<base::Uuid> SpaceController::GetIsolatedSpaces() const {
++  std::set<base::Uuid> isolated;
++  for (const Space& space : registry_->spaces()) {
++    if (space.isolation == SpaceIsolation::kPartition) {
++      isolated.insert(space.id);
++    }
++  }
++  return isolated;
+ }
+ 
+ void SpaceController::OnTabSpacesChanged() {
+@@ -697,4 +861,39 @@ bool IsTabHiddenBySpace(const tabs::TabI
+   return controller && !controller->IsTabInActiveSpace(tab);
+ }
+ 
++scoped_refptr<content::SiteInstance> GetSiteInstanceForNewTab(
++    BrowserWindowInterface* browser) {
++  // New tabs always join the window's active space.
++  SpaceController* controller =
++      browser ? SpaceController::From(browser) : nullptr;
++  if (!controller) {
++    return nullptr;
++  }
++  return CreateSiteInstanceInPartition(
++      browser->GetProfile(),
++      GetPartitionConfig(browser->GetProfile(), controller->active_space_id()));
++}
++
++void StartNewWindowInSourceSpace(BrowserWindowInterface* browser,
++                                 content::WebContents* source_contents) {
++  SpaceController* controller =
++      browser ? SpaceController::From(browser) : nullptr;
++  tabs::TabInterface* source_tab =
++      source_contents
++          ? tabs::TabInterface::MaybeGetFromContents(source_contents)
++          : nullptr;
++  BrowserWindowInterface* source_browser =
++      source_tab ? source_tab->GetBrowserWindowInterface() : nullptr;
++  SpaceController* source_controller =
++      source_browser ? SpaceController::From(source_browser) : nullptr;
++  if (!controller || !source_controller || source_controller == controller ||
++      !browser->GetTabStripModel()->empty()) {
++    return;
++  }
++  // A favorite shows in the space around it.
++  controller->StartInSpace(source_controller->IsFavorite(source_tab)
++                               ? source_controller->active_space_id()
++                               : source_controller->GetSpaceOfTab(source_tab));
++}
++
+ }  // namespace spaces
+--- a/chrome/browser/ui/spaces/space_controller.h
++++ b/chrome/browser/ui/spaces/space_controller.h
+@@ -8,11 +8,13 @@
+ #include <map>
+ #include <memory>
+ #include <optional>
++#include <set>
+ #include <vector>
+ 
+ #include "base/callback_list.h"
+ #include "base/functional/function_ref.h"
+ #include "base/memory/raw_ptr.h"
++#include "base/memory/scoped_refptr.h"
+ #include "base/memory/weak_ptr.h"
+ #include "base/scoped_observation.h"
+ #include "base/uuid.h"
+@@ -26,11 +28,13 @@
+ #include "ui/base/unowned_user_data/scoped_unowned_user_data.h"
+ 
+ class BrowserWindowInterface;
++class Profile;
+ class TabStripModel;
+ 
+ namespace content {
++class SiteInstance;
+ class WebContents;
+-}
++}  // namespace content
+ 
+ namespace spaces {
+ 
+@@ -45,6 +49,12 @@ const base::Uuid& GetFavoritesId();
+ //   space, by any means, switches to that space.
+ // - Activating a favorite keeps the active space. After a restart, it is the
+ //   space of the most recently active tab that isn't a favorite.
++// - A space with its own storage (SpaceIsolation::kPartition) keeps its tabs
++//   in its own StoragePartition, and shows no favorites, which are in the
++//   profile's default one. Activating a favorite there switches to a space
++//   that shows them. A tab that changes space, or whose space's storage
++//   changes, gets a new WebContents in its space's partition, after any tab
++//   drag ends.
+ // - Switching to a space activates the tab last active there.
+ // - New tabs join the active space. Restored tabs keep the space they had.
+ //   Tabs moved in from another window join the active space, as in Arc,
+@@ -86,6 +96,10 @@ class SpaceController : public TabSpaceF
+   // default space.
+   void SwitchToSpace(const base::Uuid& space_id);
+ 
++  // Shows `space_id` in a window that has no tabs yet, so its first tab joins
++  // that space. An unknown id, or the favorites', means the default space.
++  void StartInSpace(const base::Uuid& space_id);
++
+   // Switches to the space after the active one in the switcher, or before it
+   // if `forward` is false, wrapping around at the ends.
+   void SwitchToAdjacentSpace(bool forward);
+@@ -118,15 +132,22 @@ class SpaceController : public TabSpaceF
+   base::Uuid GetSpaceOfTab(const tabs::TabInterface* tab) const;
+ 
+   // Whether `tab` is a favorite: pinned, stored with GetFavoritesId(), and
+-  // shown in every space.
++  // shown in every space that doesn't have its own storage.
+   bool IsFavorite(const tabs::TabInterface* tab) const;
+ 
++  // Whether `space_id` has its own storage, and so shows no favorites.
++  bool IsSpaceIsolated(const base::Uuid& space_id) const;
++
+   // Whether the window's tabs follow the order rule.
+   bool IsOrderValid() const;
+ 
+   // How many times the order broke the rule and was fixed afterwards.
+   int order_fix_count() const { return order_fix_count_; }
+ 
++  // How many new tabs opened in another partition than their space's and
++  // were moved to it afterwards.
++  int partition_fix_count() const { return partition_fix_count_; }
++
+   // TabSpaceFilter:
+   bool IsTabInActiveSpace(const tabs::TabInterface* tab) const override;
+   void WillCloseTabs(const std::vector<tabs::TabInterface*>& tabs) override;
+@@ -196,13 +217,24 @@ class SpaceController : public TabSpaceF
+   // nothing else has been shown there since.
+   void OpenTabInEmptiedSpace();
+ 
+-  // Stores `space_id` on `contents`, where the default space is stored as no
+-  // id, so it stays out of the session file. Set `before_insert` for a tab
+-  // about to be inserted into this window.
+-  void SetTabSpace(content::WebContents* contents,
++  // Stores `space_id` on `tab`, where the default space is stored as no id,
++  // so it stays out of the session file. Set `before_insert` for a tab about
++  // to be inserted into this window. Every change of a tab's space goes
++  // through here, so a tab that had a space and leaves it for one with other
++  // storage moves to that storage.
++  void SetTabSpace(tabs::TabInterface* tab,
+                    const base::Uuid& space_id,
+                    bool before_insert = false);
+ 
++  // Moves `tab` to its space's partition in a posted task, if it isn't in it
++  // by then. `new_tab` counts it in partition_fix_count().
++  void MoveTabToItsPartitionLater(tabs::TabInterface* tab, bool new_tab);
++  void PostPartitionMoves();
++  void MoveTabsToTheirPartitions();
++
++  // The ids of the spaces with their own storage.
++  std::set<base::Uuid> GetIsolatedSpaces() const;
++
+   // Switches to the active tab's space if the active tab was moved out of the
+   // active space, and tells the tab strips that tabs may have moved between
+   // spaces.
+@@ -225,6 +257,7 @@ class SpaceController : public TabSpaceF
+   // Moves tabs, groups and split views so the order follows the rule.
+   void FixOrder();
+ 
++  const raw_ptr<Profile> profile_;
+   const raw_ptr<TabStripModel> tab_strip_model_;
+   const raw_ptr<SpaceRegistry> registry_;
+   const SessionID window_id_;
+@@ -236,6 +269,15 @@ class SpaceController : public TabSpaceF
+   bool fixing_order_ = false;
+   bool fix_order_posted_ = false;
+   int order_fix_count_ = 0;
++  // Tabs to move to their space's partition, and whether each is new.
++  std::vector<std::pair<tabs::TabHandle, bool>> partition_moves_;
++  bool partition_moves_posted_ = false;
++  int partition_fix_count_ = 0;
++  // The registry's spaces, and those with their own storage, as of the last
++  // OnSpacesChanged(), to tell which tabs it moves to other storage.
++  std::set<base::Uuid> space_ids_;
++  std::set<base::Uuid> isolated_spaces_;
++  base::CallbackListSubscription tab_drag_ended_subscription_;
+ 
+   base::ScopedObservation<SpaceRegistry, SpaceRegistry::Observer>
+       registry_observation_{this};
+@@ -247,6 +289,19 @@ class SpaceController : public TabSpaceF
+ // it. False while Spaces are off, and for tabs that aren't in a window.
+ bool IsTabHiddenBySpace(const tabs::TabInterface* tab);
+ 
++// The SiteInstance a new tab with no opener starts in when it opens in
++// `browser`: in the partition of the space it will join, the active one. Null
++// if that space uses the default partition.
++scoped_refptr<content::SiteInstance> GetSiteInstanceForNewTab(
++    BrowserWindowInterface* browser);
++
++// Starts `browser`, a window with no tabs yet that opens for a navigation from
++// `source_contents` in another window, in the space `source_contents` shows,
++// so a link opened in a new window keeps its space and logins. Does nothing
++// otherwise.
++void StartNewWindowInSourceSpace(BrowserWindowInterface* browser,
++                                 content::WebContents* source_contents);
++
+ }  // namespace spaces
+ 
+ #endif  // CHROME_BROWSER_UI_SPACES_SPACE_CONTROLLER_H_
+--- a/chrome/browser/ui/spaces/space_menu_model.cc
++++ b/chrome/browser/ui/spaces/space_menu_model.cc
+@@ -80,8 +80,13 @@ std::optional<int> GetPinMenuItemStringI
+ 
+ bool ShouldShowAddToFavorites(TabStripModel* tab_strip, int context_index) {
+   SpaceController* controller = GetController(tab_strip);
+-  return controller && tab_strip->ContainsIndex(context_index) &&
+-         !controller->IsFavorite(tab_strip->GetTabAtIndex(context_index));
++  if (!controller || !tab_strip->ContainsIndex(context_index)) {
++    return false;
++  }
++  // Favorites aren't shown in a space with its own storage; Pin is.
++  const tabs::TabInterface* tab = tab_strip->GetTabAtIndex(context_index);
++  return !controller->IsFavorite(tab) &&
++         !controller->IsSpaceIsolated(controller->GetSpaceOfTab(tab));
+ }
+ 
+ // static
+--- a/chrome/browser/ui/spaces/space_menu_model.h
++++ b/chrome/browser/ui/spaces/space_menu_model.h
+@@ -38,7 +38,8 @@ std::optional<int> GetPinMenuItemStringI
+                                           bool will_pin);
+ 
+ // Whether the tab menu offers "Add to Favorites" next to Pin, which keeps a
+-// tab in its space: for tabs that aren't favorites.
++// tab in its space: for tabs that aren't favorites, of a space that shows
++// favorites.
+ bool ShouldShowAddToFavorites(TabStripModel* tab_strip, int context_index);
+ 
+ // The "Move to space" submenu: the spaces other than the context tab's, in
+--- a/chrome/browser/ui/spaces/space_registry.cc
++++ b/chrome/browser/ui/spaces/space_registry.cc
+@@ -12,8 +12,11 @@
+ 
+ namespace spaces {
+ 
+-SpaceRegistry::SpaceRegistry(PrefService* prefs)
++SpaceRegistry::SpaceRegistry(
++    PrefService* prefs,
++    base::RepeatingCallback<void(const base::Uuid&)> on_space_removed)
+     : prefs_(prefs),
++      on_space_removed_(std::move(on_space_removed)),
+       list_(SpaceList::FromValue(prefs->GetList(prefs::kSpaces))) {
+   // Write back anything FromValue() repaired, most importantly a newly created
+   // default space, so its id stays the same across restarts.
+@@ -64,6 +67,9 @@ bool SpaceRegistry::RemoveSpace(const ba
+     return false;
+   }
+   SaveAndNotify();
++  if (on_space_removed_) {
++    on_space_removed_.Run(id);
++  }
+   return true;
+ }
+ 
+--- a/chrome/browser/ui/spaces/space_registry.h
++++ b/chrome/browser/ui/spaces/space_registry.h
+@@ -8,6 +8,7 @@
+ #include <string>
+ #include <vector>
+ 
++#include "base/functional/callback.h"
+ #include "base/memory/raw_ptr.h"
+ #include "base/observer_list.h"
+ #include "base/observer_list_types.h"
+@@ -37,7 +38,11 @@ class SpaceRegistry : public KeyedServic
+     virtual void OnSpacesChanged() {}
+   };
+ 
+-  explicit SpaceRegistry(PrefService* prefs);
++  // `on_space_removed` runs with the id of each space removed, after
++  // observers are told.
++  explicit SpaceRegistry(
++      PrefService* prefs,
++      base::RepeatingCallback<void(const base::Uuid&)> on_space_removed = {});
+   SpaceRegistry(const SpaceRegistry&) = delete;
+   SpaceRegistry& operator=(const SpaceRegistry&) = delete;
+   ~SpaceRegistry() override;
+@@ -64,6 +69,7 @@ class SpaceRegistry : public KeyedServic
+   void SaveAndNotify();
+ 
+   raw_ptr<PrefService> prefs_;
++  base::RepeatingCallback<void(const base::Uuid&)> on_space_removed_;
+   SpaceList list_;
+   base::ObserverList<Observer> observers_;
+ };
+--- a/chrome/browser/ui/spaces/space_registry_factory.cc
++++ b/chrome/browser/ui/spaces/space_registry_factory.cc
+@@ -6,10 +6,12 @@
+ 
+ #include <memory>
+ 
++#include "base/functional/bind.h"
+ #include "base/no_destructor.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/profiles/profile_selections.h"
+ #include "chrome/browser/ui/spaces/space_registry.h"
++#include "chrome/browser/ui/spaces/space_storage.h"
+ #include "chrome/browser/ui/spaces/spaces_features.h"
+ #include "components/pref_registry/pref_registry_syncable.h"
+ 
+@@ -46,7 +48,10 @@ SpaceRegistryFactory::BuildServiceInstan
+     return nullptr;
+   }
+   Profile* profile = Profile::FromBrowserContext(context);
+-  return std::make_unique<SpaceRegistry>(profile->GetPrefs());
++  // A removed space's own storage goes with it.
++  return std::make_unique<SpaceRegistry>(
++      profile->GetPrefs(),
++      base::BindRepeating(&ClearSpaceStorage, base::Unretained(profile)));
+ }
+ 
+ // Created with the profile so the default space, and its id, exist before any
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_storage.cc
+@@ -0,0 +1,54 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/spaces/space_storage.h"
++
++#include "base/functional/bind.h"
++#include "base/functional/callback_helpers.h"
++#include "base/memory/weak_ptr.h"
++#include "base/uuid.h"
++#include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/spaces/space.h"
++#include "chrome/browser/ui/spaces/space_registry.h"
++#include "chrome/browser/ui/spaces/space_registry_factory.h"
++#include "chrome/browser/ui/spaces/space_storage_path.h"
++#include "chrome/common/pref_names.h"
++#include "components/prefs/pref_service.h"
++
++namespace spaces {
++
++namespace {
++
++// As chrome/browser/extensions/data_deleter.cc does for an extension's storage:
++// folders still in use are deleted by the garbage collection at the next
++// startup.
++void GarbageCollectAtNextStartup(base::WeakPtr<Profile> profile) {
++  if (profile) {
++    profile->GetPrefs()->SetBoolean(
++        ::prefs::kShouldGarbageCollectStoragePartitions, true);
++  }
++}
++
++}  // namespace
++
++void ClearSpaceStorage(Profile* profile, const base::Uuid& space_id) {
++  profile->AsyncObliterateStoragePartition(
++      GetSpacePartitionDomain(space_id),
++      base::BindOnce(&GarbageCollectAtNextStartup, profile->GetWeakPtr()),
++      base::DoNothing());
++}
++
++std::unordered_set<base::FilePath> GetSpaceStoragePaths(Profile* profile) {
++  std::unordered_set<base::FilePath> paths;
++  SpaceRegistry* registry = SpaceRegistryFactory::GetForProfile(profile);
++  if (!registry) {
++    return paths;
++  }
++  for (const Space& space : registry->spaces()) {
++    paths.insert(profile->GetPath().Append(GetSpaceStoragePath(space.id)));
++  }
++  return paths;
++}
++
++}  // namespace spaces
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_storage.h
+@@ -0,0 +1,33 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_SPACES_SPACE_STORAGE_H_
++#define CHROME_BROWSER_UI_SPACES_SPACE_STORAGE_H_
++
++#include <unordered_set>
++
++#include "base/files/file_path.h"
++
++class Profile;
++
++namespace base {
++class Uuid;
++}
++
++namespace spaces {
++
++// Deletes the storage `space_id` kept while it had its own: cookies, cache and
++// site storage. What its open tabs still hold is cleared now, and their
++// folder is deleted at the next startup.
++void ClearSpaceStorage(Profile* profile, const base::Uuid& space_id);
++
++// The folders holding the storage of `profile`'s spaces, which Chromium's
++// storage garbage collection must keep. Every space's is listed, since one
++// keeps its storage while its own storage is turned off, to have it back if
++// it is turned on again.
++std::unordered_set<base::FilePath> GetSpaceStoragePaths(Profile* profile);
++
++}  // namespace spaces
++
++#endif  // CHROME_BROWSER_UI_SPACES_SPACE_STORAGE_H_
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_storage_path.cc
+@@ -0,0 +1,56 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/spaces/space_storage_path.h"
++
++#include <vector>
++
++namespace spaces {
++
++namespace {
++
++constexpr char kPartitionDomainPrefix[] = "heliumspace";
++
++// content/browser/storage_partition_impl_map.cc keeps a partition with a
++// domain in `Storage/ext/<domain>`.
++constexpr base::FilePath::CharType kStoragePartitionDirname[] =
++    FILE_PATH_LITERAL("Storage");
++constexpr base::FilePath::CharType kExtensionsDirname[] =
++    FILE_PATH_LITERAL("ext");
++
++}  // namespace
++
++std::string GetSpacePartitionDomain(const base::Uuid& space_id) {
++  // A domain may only hold [a-z], so the id's hex digits are spelled with the
++  // letters a to p.
++  std::string domain = kPartitionDomainPrefix;
++  for (char c : space_id.AsLowercaseString()) {
++    if (c >= '0' && c <= '9') {
++      domain += static_cast<char>('a' + (c - '0'));
++    } else if (c >= 'a' && c <= 'f') {
++      domain += static_cast<char>('a' + 10 + (c - 'a'));
++    }
++  }
++  return domain;
++}
++
++bool IsSpacePartitionDomain(std::string_view partition_domain) {
++  return partition_domain.starts_with(kPartitionDomainPrefix);
++}
++
++base::FilePath GetSpaceStoragePath(const base::Uuid& space_id) {
++  return base::FilePath(kStoragePartitionDirname)
++      .Append(kExtensionsDirname)
++      .AppendASCII(GetSpacePartitionDomain(space_id));
++}
++
++bool IsSpaceStoragePath(const base::FilePath& relative_path) {
++  const std::vector<base::FilePath::StringType> components =
++      relative_path.GetComponents();
++  return components.size() >= 3 && components[0] == kStoragePartitionDirname &&
++         components[1] == kExtensionsDirname &&
++         IsSpacePartitionDomain(base::FilePath(components[2]).AsUTF8Unsafe());
++}
++
++}  // namespace spaces
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_storage_path.h
+@@ -0,0 +1,36 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#ifndef CHROME_BROWSER_UI_SPACES_SPACE_STORAGE_PATH_H_
++#define CHROME_BROWSER_UI_SPACES_SPACE_STORAGE_PATH_H_
++
++#include <string>
++#include <string_view>
++
++#include "base/files/file_path.h"
++#include "base/uuid.h"
++
++namespace spaces {
++
++// Where a space with its own storage keeps it. Each space gets its own
++// StoragePartition domain, so that one space's storage can be deleted as a
++// whole. On disk it is under the profile's `Storage/ext/<domain>`, next to
++// extensions' and apps' own storage.
++
++// The partition domain of `space_id`'s storage.
++std::string GetSpacePartitionDomain(const base::Uuid& space_id);
++
++// Whether `partition_domain` belongs to a space.
++bool IsSpacePartitionDomain(std::string_view partition_domain);
++
++// The folder holding `space_id`'s storage, relative to the profile's folder.
++base::FilePath GetSpaceStoragePath(const base::Uuid& space_id);
++
++// Whether `relative_path`, a StoragePartition's folder relative to the
++// profile's, is inside a space's storage.
++bool IsSpaceStoragePath(const base::FilePath& relative_path);
++
++}  // namespace spaces
++
++#endif  // CHROME_BROWSER_UI_SPACES_SPACE_STORAGE_PATH_H_
+--- /dev/null
++++ b/chrome/browser/ui/spaces/space_storage_path_unittest.cc
+@@ -0,0 +1,56 @@
++// Copyright 2026 The helium-spaces Authors
++// You can use, redistribute, and/or modify this source code under
++// the terms of the GPL-3.0 license that can be found in the LICENSE file.
++
++#include "chrome/browser/ui/spaces/space_storage_path.h"
++
++#include "base/files/file_path.h"
++#include "base/uuid.h"
++#include "testing/gtest/include/gtest/gtest.h"
++
++namespace spaces {
++
++namespace {
++
++base::Uuid SpaceId() {
++  return base::Uuid::ParseLowercase("0123abcd-4567-89ef-0a1b-2c3d4e5f6789");
++}
++
++TEST(SpaceStoragePathTest, DomainSpellsTheIdInLetters) {
++  EXPECT_EQ(GetSpacePartitionDomain(SpaceId()),
++            "heliumspaceabcdklmnefghijopakblcmdneofpghij");
++  EXPECT_TRUE(IsSpacePartitionDomain(GetSpacePartitionDomain(SpaceId())));
++  for (char c : GetSpacePartitionDomain(base::Uuid::GenerateRandomV4())) {
++    EXPECT_TRUE(c >= 'a' && c <= 'z') << c;
++  }
++}
++
++TEST(SpaceStoragePathTest, OtherDomainsAreNoSpaces) {
++  EXPECT_FALSE(IsSpacePartitionDomain(""));
++  EXPECT_FALSE(IsSpacePartitionDomain("aapaabbbccddeeffgghh"));
++  EXPECT_FALSE(IsSpacePartitionDomain("helium"));
++}
++
++TEST(SpaceStoragePathTest, StoragePath) {
++  const base::FilePath path = GetSpaceStoragePath(SpaceId());
++  EXPECT_EQ(path, base::FilePath(FILE_PATH_LITERAL("Storage"))
++                      .Append(FILE_PATH_LITERAL("ext"))
++                      .AppendASCII(GetSpacePartitionDomain(SpaceId())));
++  // A partition's own folder is one level down, named `def` or by a hash.
++  EXPECT_TRUE(IsSpaceStoragePath(path.Append(FILE_PATH_LITERAL("def"))));
++  EXPECT_TRUE(IsSpaceStoragePath(path));
++}
++
++TEST(SpaceStoragePathTest, OtherPathsAreNoSpaces) {
++  EXPECT_FALSE(IsSpaceStoragePath(base::FilePath()));
++  EXPECT_FALSE(IsSpaceStoragePath(
++      base::FilePath(FILE_PATH_LITERAL("Storage/ext/aapaabbbcc/def"))));
++  EXPECT_FALSE(IsSpaceStoragePath(
++      base::FilePath(FILE_PATH_LITERAL("Other/ext/heliumspaceab/def"))));
++  EXPECT_FALSE(IsSpaceStoragePath(
++      base::FilePath(FILE_PATH_LITERAL("Storage/heliumspaceab/def"))));
++}
++
++}  // namespace
++
++}  // namespace spaces
+--- a/chrome/browser/ui/spaces/space_tab_helper.cc
++++ b/chrome/browser/ui/spaces/space_tab_helper.cc
+@@ -4,6 +4,9 @@
+ 
+ #include "chrome/browser/ui/spaces/space_tab_helper.h"
+ 
++#include <utility>
++
++#include "base/no_destructor.h"
+ #include "chrome/browser/profiles/profile.h"
+ #include "chrome/browser/sessions/session_service.h"
+ #include "chrome/browser/sessions/session_service_factory.h"
+@@ -21,6 +24,11 @@ namespace {
+ int g_tab_drag = 0;
+ int g_last_tab_drag = 0;
+ 
++base::RepeatingClosureList& GetTabDragEndedCallbacks() {
++  static base::NoDestructor<base::RepeatingClosureList> callbacks;
++  return *callbacks;
++}
++
+ }  // namespace
+ 
+ SpaceTabHelper::SpaceTabHelper(content::WebContents* contents)
+@@ -133,6 +141,16 @@ void WillDragTabs(const std::vector<cont
+ 
+ void DidEndTabDrag() {
+   g_tab_drag = 0;
++  GetTabDragEndedCallbacks().Notify();
++}
++
++bool IsTabDragInProgress() {
++  return g_tab_drag != 0;
++}
++
++base::CallbackListSubscription RegisterTabDragEnded(
++    base::RepeatingClosure callback) {
++  return GetTabDragEndedCallbacks().Add(std::move(callback));
+ }
+ 
+ std::unique_ptr<sessions::SessionCommand> CreateSpaceIdSessionCommand(
+--- a/chrome/browser/ui/spaces/space_tab_helper.h
++++ b/chrome/browser/ui/spaces/space_tab_helper.h
+@@ -11,6 +11,8 @@
+ #include <string>
+ #include <vector>
+ 
++#include "base/callback_list.h"
++#include "base/functional/callback_forward.h"
+ #include "base/uuid.h"
+ #include "components/sessions/core/session_id.h"
+ #include "content/public/browser/web_contents_user_data.h"
+@@ -106,6 +108,11 @@ class SpaceTabHelper : public content::W
+ void WillDragTabs(const std::vector<content::WebContents*>& contents);
+ void DidEndTabDrag();
+ 
++// Whether a tab drag is going on, and `callback` to run when one ends.
++bool IsTabDragInProgress();
++base::CallbackListSubscription RegisterTabDragEnded(
++    base::RepeatingClosure callback);
++
+ // Session glue, called from hooks in Chromium's session code. Each does
+ // nothing while HeliumSpaces is disabled.
+ 
+--- a/chrome/browser/web_applications/BUILD.gn
++++ b/chrome/browser/web_applications/BUILD.gn
+@@ -569,6 +569,7 @@ source_set("web_applications") {
+     "//chrome/browser/sync:factories",
+     "//chrome/browser/task_manager",
+     "//chrome/browser/ui/browser_window",
++    "//chrome/browser/ui/spaces",
+     "//chrome/browser/web_applications/locks:partitioned_lock_manager",
+     "//chrome/common",
+     "//chrome/common:chrome_features",
+--- a/chrome/browser/web_applications/commands/garbage_collect_storage_partitions_command.cc
++++ b/chrome/browser/web_applications/commands/garbage_collect_storage_partitions_command.cc
+@@ -15,6 +15,7 @@
+ #include "base/memory/weak_ptr.h"
+ #include "base/values.h"
+ #include "chrome/browser/profiles/profile.h"
++#include "chrome/browser/ui/spaces/space_storage.h"
+ #include "chrome/browser/web_applications/extensions_manager.h"
+ #include "chrome/browser/web_applications/locks/all_apps_lock.h"
+ #include "chrome/browser/web_applications/web_app_isolation_delegate.h"
+@@ -74,6 +75,9 @@ void GarbageCollectStoragePartitionsComm
+   // Get all paths from Web App system.
+   allowlist.merge(lock_->isolation_delegate().GetIsolatedStoragePaths());
+ 
++  // helium-spaces: spaces' own storage.
++  allowlist.merge(spaces::GetSpaceStoragePaths(profile_));
++
+   base::ListValue* debug_paths =
+       GetMutableDebugValue().EnsureList("allow_list_paths");
+   for (const auto& path : allowlist) {
+--- a/extensions/browser/api/web_request/web_request_api.cc
++++ b/extensions/browser/api/web_request/web_request_api.cc
+@@ -1148,6 +1148,16 @@ bool WebRequestAPI::HasExtraHeadersListe
+ 
+ void WebRequestAPI::ResetURLLoaderFactories() {
+   browser_context_->GetDefaultStoragePartition()->ResetURLLoaderFactories();
++  // helium-spaces: and those of spaces' own storage (see
++  // chrome/browser/ui/spaces/space_storage_path.h), so their open tabs see
++  // the change too.
++  browser_context_->ForEachLoadedStoragePartition(
++      [](content::StoragePartition* partition) {
++        if (partition->GetConfig().partition_domain().starts_with(
++                "heliumspace")) {
++          partition->ResetURLLoaderFactories();
++        }
++      });
+   if (g_test_observer) {
+     g_test_observer->OnDidResetURLLoaderFactories();
+   }
